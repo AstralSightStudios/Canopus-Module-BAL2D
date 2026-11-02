@@ -28,6 +28,8 @@ const EV_SELECT: &str = "action:pack.select.";
 const EV_DELETE: &str = "action:pack.delete.";
 const EV_OVERLAY: &str = "action:overlay";
 const EV_FLUENT: &str = "action:fluent";
+const EV_DIRECT: &str = "action:direct";
+const EV_SINGLE: &str = "action:single";
 const EV_FACE_PICK: &str = "action:face.pick";
 const EV_FACE_Z: &str = "input:face.z";
 const EV_FACE_PATCH: &str = "action:face.patch";
@@ -258,6 +260,14 @@ pub async fn on_event(event: &str, payload: &str) {
         EV_FLUENT => {
             let current = state::snapshot().hello.map(|h| h.options).unwrap_or(0);
             watch::set_options(current ^ bal2d_proto::options::FLUENT).await;
+        }
+        EV_DIRECT => {
+            let current = state::snapshot().hello.map(|h| h.options).unwrap_or(0);
+            watch::set_options(current ^ bal2d_proto::options::CLASSIC).await;
+        }
+        EV_SINGLE => {
+            let current = state::snapshot().hello.map(|h| h.options).unwrap_or(0);
+            watch::set_options(current ^ bal2d_proto::options::SINGLE).await;
         }
         EV_FACE_PICK => pick_face().await,
         EV_FACE_Z => state::with_state(|s| {
@@ -815,14 +825,17 @@ fn watch_tab(s: &UiState) -> View {
         },
         Some(st) if st.flags & 8 != 0 => "正在加载角色…".into(),
         Some(st) if st.frames > 0 && st.fps_x10 > 0 => format!(
-            "{}.{} fps · 动画 {} ms · 绘制 {} ms（其中驱动 {} ms）· GPU {} ms{} · {} 个三角形 · {} 次绘制{} · 手表剩余内存 {:.1} MB{}",
+            "{}.{} fps（{}）· 动画 {} ms · 绘制 {} ms（其中驱动 {} ms、等 GPU {} ms）· GPU 收尾 {} ms{}{} · {} 个三角形 · {} 次绘制{} · 手表剩余内存 {:.1} MB{}",
             st.fps_x10 / 10,
             st.fps_x10 % 10,
+            if st.flags & 32 != 0 { "直接绘制" } else { "缓冲绘制" },
             st.update_ms,
             st.draw_ms,
             st.driver_ms,
+            st.flush_ms,
             st.gpu_ms,
             if st.ui_ms > 0 { format!(" · 屏幕刷新 {} ms", st.ui_ms) } else { String::new() },
+            if st.idle_ms + st.late_ms > 0 { format!(" · 空闲 {} ms · 迟到 {} ms", st.idle_ms, st.late_ms) } else { String::new() },
             st.triangles,
             st.calls,
             if st.flags & 16 != 0 {
@@ -841,6 +854,8 @@ fn watch_tab(s: &UiState) -> View {
     };
     let overlay = h.options & bal2d_proto::options::OVERLAY != 0;
     let fluent = h.options & bal2d_proto::options::FLUENT != 0;
+    let direct = h.options & bal2d_proto::options::CLASSIC == 0;
+    let batched = h.options & bal2d_proto::options::SINGLE == 0;
     stack(16)
         .child(card().child(row().child(heading("手表上的角色").grow()).child(button("刷新", EV_CONNECT, "ghost"))).child(list))
         .child(
@@ -852,9 +867,9 @@ fn watch_tab(s: &UiState) -> View {
                         .child(
                             text(
                                 if fluent {
-                                    "流畅优先：开。每帧只留约十分之一的时间给手表系统，动画更快；如果蓝牙连接变慢、断开或手表操作卡顿，请关闭。"
+                                    "流畅优先：开。每帧只留约十二分之一的时间给手表系统，动画更快；如果蓝牙连接变慢、断开或手表操作卡顿，请关闭。"
                                 } else {
-                                    "流畅优先：关。每帧留约三分之一的时间给手表系统和蓝牙（默认，最稳）。"
+                                    "流畅优先：关。每帧留约六分之一的时间给手表系统和蓝牙（默认）。"
                                 },
                                 13,
                                 tone::TEXT,
@@ -862,6 +877,38 @@ fn watch_tab(s: &UiState) -> View {
                             .grow(),
                         )
                         .child(button(if fluent { "关闭" } else { "开启" }, EV_FLUENT, "soft")),
+                )
+                .child(
+                    row()
+                        .child(
+                            text(
+                                if direct {
+                                    "直接绘制：开。角色直接画进系统的屏幕缓冲区（片上内存），省去一次整屏拷贝（默认）。"
+                                } else {
+                                    "直接绘制：关。角色先画进模块自己的缓冲区，再由系统拷到屏幕（旧方式，用于对比）。"
+                                },
+                                13,
+                                tone::TEXT,
+                            )
+                            .grow(),
+                        )
+                        .child(button(if direct { "关闭" } else { "开启" }, EV_DIRECT, "soft")),
+                )
+                .child(
+                    row()
+                        .child(
+                            text(
+                                if batched {
+                                    "批量绘制：开。同一张贴图的一串绘制只调用一次 GPU 驱动（默认）。"
+                                } else {
+                                    "批量绘制：关。每次绘制单独调用 GPU 驱动（旧方式，用于对比）。"
+                                },
+                                13,
+                                tone::TEXT,
+                            )
+                            .grow(),
+                        )
+                        .child(button(if batched { "关闭" } else { "开启" }, EV_SINGLE, "soft")),
                 ),
         )
         .child(
@@ -923,7 +970,7 @@ fn face_tab(s: &UiState) -> View {
 
 /// What the watch's GPU self-test changed (Stats flags bits 16..23), for the performance card.
 /// The GPU self-test probes (module selftest.rs `probe`), bit by bit.
-const PROBES: [&str; 17] = [
+const PROBES: [&str; 19] = [
     "FP32 路径",
     "S16 路径",
     "大贴图",
@@ -941,11 +988,13 @@ const PROBES: [&str; 17] = [
     "大贴图直写",
     "越界检查",
     "区域贴图",
+    "批量绘制 1",
+    "批量绘制 2",
 ];
 
 fn selftest_note(flags: u32, passed: u32) -> String {
     let base = selftest_flags_note(flags);
-    if passed == 0 || flags & (0x7F << 17) == 0 {
+    if passed == 0 || flags & (0xFF << 17) == 0 {
         return base;
     }
     let failed: Vec<&str> = PROBES.iter().enumerate().filter(|(i, _)| passed & (1 << i) == 0).map(|(_, n)| *n).collect();
@@ -967,6 +1016,7 @@ fn selftest_flags_note(flags: u32) -> String {
         (21, "边缘填充异常，已改用透明边缘"),
         (22, "混合模式结果有偏差"),
         (23, "绘制结果异常"),
+        (24, "批量绘制异常，已改为逐次绘制"),
     ]
     .iter()
     .filter(|(bit, _)| flags & (1 << bit) != 0)

@@ -18,7 +18,9 @@ use super::gpu::{self, GpuMem, VgBuffer};
 
 /// Development file in the module's data directory: probes to treat as failed (hex mask).
 const FORCE_FILE: &str = "selftest-force";
-const W: u32 = 128;
+const W: u32 = 160;
+/// Probe cells across the target (8 pixels each).
+const CELLS: u32 = W / 8;
 const H: u32 = 8;
 const BG: [u8; 3] = [0x40, 0x40, 0x40];
 /// The probe colour (premultiplied, opaque): 565-exact in every format it is stored in.
@@ -45,7 +47,12 @@ pub mod probe {
     pub const OUTSIDE: u32 = 1 << 15;
     /// An atlas rectangle blitted rotated, scaled, tinted and blended (`Call::rect` draws).
     pub const BLIT_REGION: u32 = 1 << 16;
-    pub const ALL: u32 = (1 << 17) - 1;
+    /// Two draws batched into one command stream (`gpu::Stream`), each with its own texture
+    /// placement and tint: the first, and the second (wrong when the stream's states do not
+    /// take).
+    pub const STREAM: u32 = 1 << 17;
+    pub const STREAM2: u32 = 1 << 18;
+    pub const ALL: u32 = (1 << 19) - 1;
 }
 
 /// Summary bits for `Stats::flags` (bits 16..23).
@@ -59,6 +66,8 @@ pub mod flag {
     pub const NO_PAD: u32 = 1 << 21;
     pub const BLENDS: u32 = 1 << 22;
     pub const OTHER: u32 = 1 << 23;
+    /// Batched draws came out wrong: every draw goes through the driver.
+    pub const NO_STREAM: u32 = 1 << 24;
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -317,12 +326,35 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
             d(&mut rc, fw::vg_blit_rect(target.ptr(), rb.ptr(), rect.as_ptr(), m.as_ptr(), src_over, 0xFF40_80FF, 0x2000));
             wants.push((probe::BLIT_REGION, 15, exp([0xF8, 0x40, 0x10]), 6));
         }
+        // Two draws in one command stream, carried by one driver call: cells 16 and 17 sample
+        // the region texture's inside (texels 6..10) through their own matrices; the second
+        // with the first's would sample texels 14..18 (blue, the edge).
+        let mut stream = gpu::Stream::new(1024);
+        if let (Some(st), Some((_, rb))) = (stream.as_mut(), region.as_mut()) {
+            let s = bal2d_render::PATH_SCALE as i16;
+            let (mv, ln, cl) = (bal2d_render::PATH_MOVE as i16, bal2d_render::PATH_LINE as i16, bal2d_render::PATH_CLOSE as i16);
+            for (cell, color) in [(16u32, 0xFF40_80FFu32), (17, white)] {
+                let (x0, x1, y0, y1) = ((cell * 8 + 2) as i16, (cell * 8 + 6) as i16, 2i16, 6i16);
+                let path = [mv, x0 * s, y0 * s, ln, x1 * s, y0 * s, ln, x1 * s, y1 * s, ln, x0 * s, y1 * s, cl, 0];
+                let m = [1.0f32, 0.0, (cell * 8 - 4) as f32, 0.0, 1.0, -4.0];
+                if let Some(g) = gpu::generator(&m, 16.0, 16.0) {
+                    st.draw(0, bal2d_spine::BlendMode::Normal, &m, &g, color, [x0 as i32 - 2, 0, 8, 8], [x0 * s, y0 * s, x1 * s, y1 * s], &path);
+                }
+            }
+            if let Some((path, _, _, m, color)) = st.close() {
+                *sq.image_matrix = [m[0], m[1], m[2], m[3], m[4], m[5], 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+                d(&mut rc, fw::vg_draw_pattern(target.ptr(), path, 0x1901, sq.path_matrix.as_ptr(), rb.ptr(), sq.image_matrix.as_ptr(), src_over, pad, 0, color, 0x2000));
+                wants.push((probe::STREAM, 16, exp([0xF8, 0x40, 0x10]), 6));
+                wants.push((probe::STREAM2, 17, exp(A), 0));
+            }
+        }
         // Kept alive until the GPU is done.
         d(&mut rc, sq.draw(&mut target, 13, &mut msmall, false, 0.0, src_over, pad, white));
         wants.push((probe::MIRROR_SMALL, 13, exp(A), 0));
         d(&mut rc, sq.draw(&mut target, 14, &mut mlarge, false, 0.0, src_over, pad, white));
         wants.push((probe::MIRROR_LARGE, 14, exp(A), 0));
         d(&mut rc, fw::vg_finish());
+        drop(stream);
         drop(region);
         drop(bb);
         drop(bm);
@@ -336,7 +368,7 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
         }
     }
     let bgx = exp(BG);
-    let outside_ok = (0..16).all(|c| near(pixel(nc, c * 8, 0), bgx, 0) && near(pixel(nc, c * 8 + 7, 7), bgx, 0) && near(pixel(nc, c * 8 + 6, 4), bgx, 0));
+    let outside_ok = (0..CELLS).all(|c| near(pixel(nc, c * 8, 0), bgx, 0) && near(pixel(nc, c * 8 + 7, 7), bgx, 0) && near(pixel(nc, c * 8 + 6, 4), bgx, 0));
     if outside_ok {
         passed |= probe::OUTSIDE;
     }
@@ -371,6 +403,12 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
     // what a path does), and the first real watch reported its draw results off. The probe still
     // runs and reports.
     let _ = &renderer.paths.blits;
+    // Batched draws need both stream probes right (and their textures were cleaned, not
+    // mirrored, like the S16 probe's).
+    if passed & (probe::STREAM | probe::STREAM2) != probe::STREAM | probe::STREAM2 || gpu::MIRROR_NC.load(Ordering::Relaxed) {
+        gpu::STREAM_OFF.store(true, Ordering::Relaxed);
+        out.flags |= flag::NO_STREAM;
+    }
     let s16_ok = passed & probe::S16 != 0 || (passed & probe::MIRROR_SMALL != 0);
     if !s16_ok && passed & probe::FP32 != 0 {
         renderer.use_fp32_paths();

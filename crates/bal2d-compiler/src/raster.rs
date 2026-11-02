@@ -181,6 +181,16 @@ pub fn draw_call(fb: &mut Framebuffer, call: &bal2d_render::Call, tex: &Texture)
     let alpha = if call.blend == BlendMode::Additive { 0.0 } else { a };
     let tint = Tint { light: [r * a, g * a, bl * a, alpha], dark: None };
     let k = 1.0 / bal2d_render::PATH_SCALE;
+    if !is_triangles(call.path) {
+        // Outlines (the baked idle's polygons): filled non-zero, like the GPU.
+        let mut n = 0;
+        fill_polygons(&polygons(call.path), (fb.width, fb.height), |x, y| {
+            let [u, v] = to_uv(x as f32 + 0.5, y as f32 + 0.5);
+            shade(fb, x, y, tex.sample(u, v), &tint, call.blend);
+            n += 1;
+        });
+        return n;
+    }
     let mut n = 0;
     for t in call.path.chunks_exact(10) {
         if t[0] != bal2d_render::PATH_MOVE as i16 {
@@ -190,6 +200,137 @@ pub fn draw_call(fb: &mut Framebuffer, call: &bal2d_render::Call, tex: &Texture)
         n += raster_triangle(fb, &p, &[[0.0; 2]; 3], Some(&to_uv), tex, &tint, call.blend);
     }
     n
+}
+
+/// Whether a path is triangles only (MOVE, LINE, LINE, CLOSE each), as live calls are.
+fn is_triangles(path: &[i16]) -> bool {
+    let (m, l, c) = (bal2d_render::PATH_MOVE as i16, bal2d_render::PATH_LINE as i16, bal2d_render::PATH_CLOSE as i16);
+    let mut it = path.chunks(10);
+    for t in &mut it {
+        if t[0] == 0 {
+            return true;
+        }
+        if t.len() < 10 || t[0] != m || t[3] != l || t[6] != l || t[9] != c {
+            return false;
+        }
+    }
+    true
+}
+
+/// A path's subpaths as closed polygons (target pixels).
+pub fn polygons(path: &[i16]) -> Vec<Vec<[f32; 2]>> {
+    let k = 1.0 / bal2d_render::PATH_SCALE;
+    let (mut out, mut cur): (Vec<Vec<[f32; 2]>>, Vec<[f32; 2]>) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < path.len() {
+        let op = path[i] as u32;
+        match op {
+            bal2d_render::PATH_MOVE | bal2d_render::PATH_LINE if i + 2 < path.len() => {
+                if op == bal2d_render::PATH_MOVE && cur.len() > 2 {
+                    out.push(core::mem::take(&mut cur));
+                }
+                if op == bal2d_render::PATH_MOVE {
+                    cur.clear();
+                }
+                cur.push([path[i + 1] as f32 * k, path[i + 2] as f32 * k]);
+                i += 3;
+            }
+            bal2d_render::PATH_CLOSE => {
+                if cur.len() > 2 {
+                    out.push(core::mem::take(&mut cur));
+                }
+                cur.clear();
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    if cur.len() > 2 {
+        out.push(cur);
+    }
+    out
+}
+
+/// Calls `f(x, y)` for every pixel of a `size` target whose centre the polygons cover with a
+/// non-zero winding number (left-closed spans: neighbours sharing an edge never both draw).
+pub fn fill_polygons(polys: &[Vec<[f32; 2]>], size: (usize, usize), mut f: impl FnMut(usize, usize)) {
+    let (mut y0, mut y1) = (f32::MAX, f32::MIN);
+    for p in polys {
+        for q in p {
+            y0 = y0.min(q[1]);
+            y1 = y1.max(q[1]);
+        }
+    }
+    if y0 > y1 {
+        return;
+    }
+    let ys = (y0 - 0.5).ceil().max(0.0) as usize;
+    let ye = ((y1 - 0.5).ceil().max(0.0) as usize).min(size.1);
+    let mut xs: Vec<(f32, i32)> = Vec::new();
+    for y in ys..ye {
+        let yc = y as f32 + 0.5;
+        xs.clear();
+        for p in polys {
+            for i in 0..p.len() {
+                let (a, b) = (p[i], p[(i + 1) % p.len()]);
+                let dir = if a[1] <= yc && yc < b[1] {
+                    1
+                } else if b[1] <= yc && yc < a[1] {
+                    -1
+                } else {
+                    continue;
+                };
+                xs.push((a[0] + (yc - a[1]) * (b[0] - a[0]) / (b[1] - a[1]), dir));
+            }
+        }
+        xs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut wind = 0;
+        for i in 0..xs.len() {
+            wind += xs[i].1;
+            if wind != 0 && i + 1 < xs.len() {
+                let xa = (xs[i].0 - 0.5).ceil().max(0.0) as usize;
+                let xb = ((xs[i + 1].0 - 0.5).ceil().max(0.0) as usize).min(size.0);
+                for x in xa..xb {
+                    f(x, y);
+                }
+            }
+        }
+    }
+}
+
+/// Blends a texel (premultiplied) tinted into a pixel.
+fn shade(fb: &mut Framebuffer, x: usize, y: usize, t: [f32; 4], tint: &Tint, blend: BlendMode) {
+    let src = match tint.dark {
+        None => [t[0] * tint.light[0], t[1] * tint.light[1], t[2] * tint.light[2], t[3] * tint.light[3]],
+        Some(dark) => {
+            let mut o = [0f32; 4];
+            for k in 0..3 {
+                o[k] = ((t[3] - 1.0) + 1.0 - t[k]) * dark[k] * tint.light[3].max(1e-6).min(1.0) + t[k] * tint.light[k];
+            }
+            o[3] = t[3] * tint.light[3];
+            o
+        }
+    };
+    let d = &mut fb.pixels[y * fb.width + x];
+    match blend {
+        BlendMode::Normal | BlendMode::Additive => {
+            for k in 0..4 {
+                d[k] = src[k] + d[k] * (1.0 - src[3]);
+            }
+        }
+        BlendMode::Multiply => {
+            for k in 0..3 {
+                d[k] = src[k] * d[k] + d[k] * (1.0 - src[3]);
+            }
+            d[3] = src[3] + d[3] * (1.0 - src[3]);
+        }
+        BlendMode::Screen => {
+            for k in 0..3 {
+                d[k] = src[k] + d[k] * (1.0 - src[k]);
+            }
+            d[3] = src[3] + d[3] * (1.0 - src[3]);
+        }
+    }
 }
 
 /// Pixels a call covers on a target of `size` and the least alpha its texture gives them (tint
@@ -204,6 +345,15 @@ pub fn call_coverage(size: (usize, usize), call: &bal2d_render::Call, tex: &Text
     let inv = [m[4] / det / pw, -m[1] / det / pw, -m[3] / det / ph, m[0] / det / ph];
     let k = 1.0 / bal2d_render::PATH_SCALE;
     let (mut n, mut lo) = (0usize, 1.0f32);
+    if !is_triangles(call.path) {
+        fill_polygons(&polygons(call.path), size, |x, y| {
+            let (dx, dy) = (x as f32 + 0.5 - m[2], y as f32 + 0.5 - m[5]);
+            let a = tex.sample(inv[0] * dx + inv[1] * dy, inv[2] * dx + inv[3] * dy)[3] * call.color[3];
+            lo = lo.min(a);
+            n += 1;
+        });
+        return (n, lo);
+    }
     for t in call.path.chunks_exact(10) {
         if t[0] != bal2d_render::PATH_MOVE as i16 {
             break;

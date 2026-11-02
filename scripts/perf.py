@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FIELDS = ["frames", "fps_x10", "update_ms", "draw_ms", "driver_ms", "gpu_ms", "triangles", "calls", "errors",
-          "heap_free_kib", "pack", "flags", "ui_ms", "idle_ms", "late_ms"]
+          "heap_free_kib", "pack", "flags", "ui_ms", "idle_ms", "late_ms", "flush_ms", "redraws"]
 
 
 def link(*args, tries=3):
@@ -64,7 +64,7 @@ def main():
     a = ap.parse_args()
     ids = packs()
     names = sorted(n for n in ids if n.endswith("_home")) if a.all else a.names
-    lines = [f"{'pack':14} {'fps':>5} {'upd':>5} {'draw':>5} {'drv':>5} {'gpu':>5} {'ui':>5} {'idle':>5} {'late':>5} {'tris':>6} {'calls':>5} {'err':>4} baked"]
+    lines = [f"{'pack':14} {'fps':>5} {'upd':>5} {'draw':>5} {'drv':>5} {'flush':>5} {'gpu':>5} {'ui':>5} {'idle':>5} {'late':>5} {'tris':>6} {'calls':>5} {'err':>4} baked mode"]
     print(lines[0], flush=True)
     for name in names:
         if name not in ids:
@@ -92,8 +92,8 @@ def main():
             continue
         avg = {k: sum(g[k] for g in got) / len(got) for k in FIELDS}
         line = (f"{name:14} {avg['fps_x10'] / 10:5.1f} {avg['update_ms']:5.1f} {avg['draw_ms']:5.1f} "
-                f"{avg['driver_ms']:5.1f} {avg['gpu_ms']:5.1f} {avg['ui_ms']:5.1f} {avg['idle_ms']:5.1f} {avg['late_ms']:5.1f} "
-                f"{avg['triangles']:6.0f} {avg['calls']:5.0f} {got[-1]['errors']:4d} {'yes' if got[-1]['flags'] & 16 else 'no'}")
+                f"{avg['driver_ms']:5.1f} {avg['flush_ms']:5.1f} {avg['gpu_ms']:5.1f} {avg['ui_ms']:5.1f} {avg['idle_ms']:5.1f} {avg['late_ms']:5.1f} "
+                f"{avg['triangles']:6.0f} {avg['calls']:5.0f} {got[-1]['errors']:4d} {'yes' if got[-1]['flags'] & 16 else 'no':5} {'direct' if got[-1]['flags'] & 32 else 'own'}")
         lines.append(line)
         print(line, flush=True)
     if a.label:

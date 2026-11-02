@@ -54,11 +54,21 @@ const LINK_SETTLE_MS: u32 = 10_000;
 /// The frame timer fires a few milliseconds late (the UI loop's own granularity): it is asked for
 /// this much less, and the frame rate cap allows for the lateness measured.
 const TIMER_EARLY_MS: u32 = 3;
-/// Frame + redraw (ms) above which half of it, not a third, stays idle.
-const HEAVY_BUSY_MS: u32 = 80;
+/// The idle share between frames (frame + redraw / this), and its floor (ms). A third (half
+/// for heavy frames) cost the real watch as much frame rate as Mirage showed it was not needed
+/// for: the phone connects and the UI answers with a sixth.
+const IDLE_DIV: u32 = 6;
+const IDLE_MIN_MS: u32 = 4;
 /// "Smoothness first" (`options::FLUENT`): the idle share between frames, and its floor (ms).
-const FLUENT_IDLE_DIV: u32 = 10;
+const FLUENT_IDLE_DIV: u32 = 12;
 const FLUENT_IDLE_MIN_MS: u32 = 2;
+/// Breathers only within this long of the module starting or the link changing state: a watch
+/// without a phone (or whose Supervisor never reports the link) otherwise paused every 2 s.
+const BREATHER_WINDOW_MS: u32 = 30_000;
+/// After LVGL drew the layer somewhere else than it was framed for (a page or home swipe
+/// scrolling it), frames go through the module's own buffer this long: LVGL then redraws the
+/// moving layer from it at its own rate instead of having the scene drawn again each time.
+const DIRECT_SETTLE_MS: u32 = 400;
 
 unsafe extern "C" fn on_bt_state(_ctx: *const canopus_abi::ContextV1, _topic: *const core::ffi::c_char, payload: *const c_void, len: u32, _user: *mut c_void) {
     if len >= 2 && !payload.is_null() {
@@ -97,6 +107,15 @@ pub struct Perf {
     /// Left idle on purpose after a frame, and how late the timer then fired.
     pub idle_ms: u32,
     pub late_ms: u32,
+    /// Part of `draw_ms` waiting in `vg_lite_flush` for the GPU (it was that far behind).
+    pub flush_ms: u32,
+    /// Frames drawn (those LVGL drew: in direct mode the draw happens in its redraw), and
+    /// redraws of an unchanged frame (LVGL refreshing part of the screen) with their time.
+    pub drawn: u32,
+    pub redraws: u32,
+    pub redraw_ms: u32,
+    /// The frames were drawn straight into LVGL's layer (`direct`), not the module's buffer.
+    pub direct: bool,
 }
 
 pub struct Runtime {
@@ -161,6 +180,38 @@ pub struct Runtime {
     /// clustering tolerance last changed (see `adapt_quality`).
     busy_ms: u32,
     quality_changed: u32,
+    /// Layers drawn from their baked idle in the current frame (`Lobby::update_with`).
+    baked_mask: u32,
+    /// The current frame is drawn by LVGL's DRAW_MAIN of the view straight into its layer
+    /// (LVGL's frame buffer in SRAM): no buffer of the module's own, no copy of it by LVGL.
+    pub direct: bool,
+    /// `options::CLASSIC`: always draw into the module's buffer.
+    direct_off: bool,
+    /// `options::SINGLE`: every draw through the driver.
+    single: bool,
+    /// The next DRAW_MAIN draws a new frame (its cost is the frame's), not a redraw.
+    direct_pending: bool,
+    /// The current frame was drawn over the whole layer at its first DRAW_MAIN (LVGL refreshes
+    /// the screen in two halves: the second finds it done), and the parts LVGL has refreshed
+    /// since (absolute clips): a part refreshed again is a new refresh (a widget above changed),
+    /// which finds only the widget's old pixels there and must draw.
+    direct_whole: bool,
+    direct_passed: Vec<[i32; 4]>,
+    /// When LVGL last drew the layer away from where it was framed (scrolling), and the time the
+    /// current frame's direct draw took (it happens inside LVGL's redraw).
+    direct_moved_at: u32,
+    direct_frame_ms: u32,
+    /// DRAW_MAIN calls that could not draw (no usable layer buffer), in a row.
+    direct_failures: u32,
+    /// Development: DRAW_MAIN calls traced so far.
+    direct_traced: u32,
+    /// LVGL's layer, wrapped for the GPU.
+    layer_buffer: Option<gpu::VgBuffer>,
+    /// When the module started and when the phone link last changed (breathers).
+    started_at: u32,
+    link_changed_at: u32,
+    /// The previous drawn frame (a gap ends the stats window: hidden time is no frame rate).
+    last_frame_at: u32,
 }
 
 static mut RUNTIME: Option<Runtime> = None;
@@ -210,6 +261,21 @@ pub fn rt() -> &'static mut Runtime {
                 pace_traced: false,
                 quality_changed: 0,
                 pressed: false,
+                baked_mask: 0,
+                direct: false,
+                direct_off: false,
+                single: false,
+                direct_pending: false,
+                direct_whole: false,
+                direct_passed: Vec::new(),
+                direct_moved_at: 0,
+                direct_frame_ms: 0,
+                direct_failures: 0,
+                direct_traced: 0,
+                layer_buffer: None,
+                started_at: 0,
+                link_changed_at: 0,
+                last_frame_at: 0,
             });
         }
         slot.as_mut().unwrap()
@@ -250,6 +316,7 @@ pub fn stats() -> bal2d_proto::Stats {
         pack: r.pack.as_str().split('/').next_back().map(connect::file_id).filter(|_| !r.pack.is_empty()).unwrap_or(0),
         flags: r.bake_active as u32
             | (r.idle_active as u32) << 4
+            | (p.direct as u32) << 5
             | (v.attached() as u32) << 1
             | (v.visible() as u32) << 2
             | (r.loader.is_some() as u32) << 3
@@ -259,6 +326,8 @@ pub fn stats() -> bal2d_proto::Stats {
         selftest: r.selftest.map_or(0, |t| t.passed),
         idle_ms: p.idle_ms,
         late_ms: p.late_ms,
+        flush_ms: p.flush_ms,
+        redraws: p.redraws,
     }
 }
 
@@ -295,6 +364,18 @@ pub fn overlay_on() -> bool {
 
 pub fn fluent_on() -> bool {
     options() & bal2d_proto::options::FLUENT != 0
+}
+
+pub fn direct_on() -> bool {
+    options() & bal2d_proto::options::CLASSIC == 0
+}
+
+/// Flips direct drawing (app page button).
+pub fn toggle_direct() {
+    let o = options() ^ bal2d_proto::options::CLASSIC;
+    if Fs::write(OPTIONS_FILE, &[o]) {
+        options_changed();
+    }
 }
 
 /// Flips "smoothness first" (app page button).
@@ -341,30 +422,44 @@ pub fn status_text() -> String {
             1 => "均衡",
             _ => "流畅优先",
         };
+        // Where a frame's time goes, in the order it passes: animation, drawing (of which the
+        // driver and waiting for the GPU to catch up), the GPU finishing, LVGL's redraw, the
+        // pause the pacing keeps, and how late the timer fired after it.
         text += &alloc::format!(
-            "{}.{} fps · 画质{}\n动画 {} ms · 绘制 {} ms\n驱动 {} ms · GPU {} ms\n屏幕刷新 {} ms{}\n{} 三角形 · {} 次绘制\n",
+            "{}.{} fps · 画质{} · {}\n动画 {} · 绘制 {}（驱动 {} 等GPU {}）\nGPU收尾 {} · 屏幕刷新 {} · 空闲 {} · 迟到 {} ms\n{} 三角形 · {} 次绘制{}\n",
             r.perf.fps_x10 / 10,
             r.perf.fps_x10 % 10,
             quality,
+            if r.perf.direct { "直接绘制" } else { "缓冲绘制" },
             r.perf.update_ms,
             r.perf.draw_ms,
             r.perf.submit_ms,
+            r.perf.flush_ms,
             r.perf.gpu_ms,
             r.refresh_ms,
+            r.perf.idle_ms,
+            r.perf.late_ms,
+            r.perf.triangles,
+            r.perf.calls,
             match (r.bake_active, r.idle_active) {
                 (_, true) => " · 待机已预烘焙",
                 (true, false) => " · 背景已烘焙",
                 _ => "",
             },
-            r.perf.triangles,
-            r.perf.calls,
         );
+        if r.perf.redraws > 1 {
+            text += &alloc::format!("重绘 {} 次/秒（{} ms）\n", r.perf.redraws, r.perf.redraw_ms);
+        }
     }
     if r.loader.is_some() {
         text += "正在加载角色…\n";
     }
     if let Some(t) = r.selftest {
         text += &selftest_text(t.flags);
+        let failed = probe_names(selftest::probe::ALL & !t.passed);
+        if t.flags & selftest::flag::RAN != 0 && !failed.is_empty() {
+            text += &alloc::format!("未通过：{failed}\n");
+        }
     }
     match r.boot_error {
         0 => {}
@@ -409,6 +504,27 @@ pub fn selftest_text(flags: u32) -> String {
     }
     if flags & flag::OTHER != 0 {
         t += "GPU 自检：绘制结果异常\n";
+    }
+    if flags & flag::NO_STREAM != 0 {
+        t += "GPU 自检：批量绘制异常，已改为逐次绘制\n";
+    }
+    t
+}
+
+/// The self-test probes in `mask`, by short name (for the status page and its screenshots).
+pub fn probe_names(mask: u32) -> String {
+    const NAMES: [&str; 19] = [
+        "FP32", "S16", "大纹理", "4444", "8565", "索引色", "边缘", "着色", "叠加", "正片叠底", "滤色", "透明度", "贴图",
+        "直写小", "直写大", "越界", "区域贴图", "批量1", "批量2",
+    ];
+    let mut t = String::new();
+    for (i, n) in NAMES.iter().enumerate() {
+        if mask & (1 << i) != 0 {
+            if !t.is_empty() {
+                t += " ";
+            }
+            t += n;
+        }
     }
     t
 }
@@ -637,6 +753,8 @@ pub fn start() -> i32 {
     ensure_layer_file();
     r.last_ms = lv::now_ms();
     r.window_start = r.last_ms;
+    r.started_at = r.last_ms;
+    r.link_changed_at = r.last_ms;
     if Fs::stat(KEEPAWAKE_FLAG).is_some() {
         let ctx = crate::module::context();
         let lock = canopus_runtime::display::acquire_wake_lock(ctx, canopus_abi::WAKELOCK_SCREEN);
@@ -669,6 +787,17 @@ fn ensure_attached(now: u32) {
             if r.fluent != (o & bal2d_proto::options::FLUENT != 0) {
                 r.fluent = !r.fluent;
                 trace(&alloc::format!("smoothness first: {}", r.fluent));
+            }
+            let single = o & bal2d_proto::options::SINGLE != 0;
+            r.renderer.want_stream(!single, r.lobby.is_some());
+            if single != r.single {
+                r.single = single;
+                trace(&alloc::format!("draws one by one: {single}"));
+            }
+            let classic = o & bal2d_proto::options::CLASSIC != 0 || Fs::stat("dev-classic").is_some();
+            if r.direct_off != classic {
+                r.direct_off = classic;
+                trace(&alloc::format!("own buffer (no direct drawing): {classic}"));
             }
             if !r.overlay && v.mode == view::Mode::Overlay {
                 v.detach();
@@ -775,27 +904,24 @@ extern "C" fn frame(timer: *mut c_void) {
     }
     // Duty-cycle limit. The first call after a frame comes right after LVGL has redrawn the
     // screen with it (the timer then runs every millisecond): that measures what a frame costs
-    // beyond its own work (mostly waiting for the panel's TE pulse and transfer). A third of frame
-    // + redraw then stays idle (at least 4 ms), so the watch's own UI and Bluetooth always get
-    // their turn, however heavy the character is. Less (a third of the frame alone, or of the
-    // frame + the redraw's CPU part) lets the phone fail to connect with a heavy lobby drawn
-    // full-screen over an animated face on Mirage: scripts/btstress.py is that test. "Smoothness
-    // first" (options::FLUENT) keeps a tenth instead, to find out on a real watch whether its
-    // Bluetooth and UI need that much; the breathers while the phone connects stay either way.
+    // beyond its own work (mostly waiting for the panel's TE pulse and transfer; in direct mode
+    // the frame's drawing too, measured apart). A sixth of frame + redraw then stays idle (at
+    // least 4 ms), so the watch's own UI and Bluetooth always get their turn, however heavy the
+    // character is; "smoothness first" (options::FLUENT) keeps a twelfth. While the phone may be
+    // connecting, breathers leave longer gaps now and then (scripts/btstress.py is the test).
     if r.settling {
         r.settling = false;
-        let refresh = now.wrapping_sub(r.frame_end).min(1000);
+        // A direct frame is drawn inside LVGL's redraw: that part is the frame's own.
+        let refresh = now.wrapping_sub(r.frame_end).min(1000).saturating_sub(r.direct_frame_ms);
         r.refresh_ms = (r.refresh_ms * 3 + refresh) / 4;
-        let own = r.frame_end.wrapping_sub(r.frame_start);
+        let own = r.frame_end.wrapping_sub(r.frame_start) + r.direct_frame_ms;
         let busy = own + refresh;
         r.busy_ms = (r.busy_ms * 7 + busy) / 8;
         adapt_quality(now);
-        // Very heavy frames (under about 9 fps) leave half as much idle again: a heavy lobby
-        // full-screen over an animated face still starved the phone link on Mirage with a third.
         let mut rest = if r.fluent {
             (busy / FLUENT_IDLE_DIV).max(FLUENT_IDLE_MIN_MS)
         } else {
-            (if busy > HEAVY_BUSY_MS { busy / 2 } else { busy / 3 }).max(4)
+            (busy / IDLE_DIV).max(IDLE_MIN_MS)
         };
         let link = BT_LINK.load(Ordering::Relaxed);
         if link == 1 && r.bt_was != 1 {
@@ -803,10 +929,12 @@ extern "C" fn frame(timer: *mut c_void) {
         }
         if link != r.bt_was {
             trace(&alloc::format!("phone link {link}"));
+            r.link_changed_at = now;
         }
         r.bt_was = link;
         let settled = link == 1 && now.wrapping_sub(r.bt_up_at) >= LINK_SETTLE_MS;
-        if !settled && r.busy_ms >= BREATHER_BUSY_MS && now.wrapping_sub(r.breather_at) >= BREATHER_EVERY_MS {
+        let connecting = now.wrapping_sub(r.started_at) < BREATHER_WINDOW_MS || now.wrapping_sub(r.link_changed_at) < BREATHER_WINDOW_MS;
+        if !settled && connecting && r.busy_ms >= BREATHER_BUSY_MS && now.wrapping_sub(r.breather_at) >= BREATHER_EVERY_MS {
             r.breather_at = now;
             rest = rest.max(BREATHER_MS);
         }
@@ -843,8 +971,11 @@ extern "C" fn frame(timer: *mut c_void) {
     if r.selftest.is_none() {
         let t = selftest::run(&mut r.renderer);
         r.idle_off = Fs::read("dev-noidle", 4).is_some();
+        if Fs::read("dev-nostream", 4).is_some() {
+            gpu::STREAM_OFF.store(true, Ordering::Relaxed);
+        }
         r.pace_traced = Fs::read("dev-pacetrace", 4).is_none();
-        trace(&alloc::format!("self-test flags {:#x}, region blits {}, baked idle off {}", t.flags, r.renderer.paths.blits, r.idle_off));
+        trace(&alloc::format!("self-test flags {:#x}, region blits {}, baked idle off {}, batched draws {}", t.flags, r.renderer.paths.blits, r.idle_off, !gpu::STREAM_OFF.load(Ordering::Relaxed)));
         r.selftest = Some(t);
         return;
     }
@@ -865,7 +996,9 @@ extern "C" fn frame(timer: *mut c_void) {
     ensure_attached(now);
     let r = rt();
     let v = view::view();
-    let (Some(lobby), Some(target)) = (r.lobby.as_mut(), r.target.as_mut()) else { return };
+    if r.lobby.is_none() || r.target.is_none() {
+        return;
+    }
     let (shown, paged, covered) = (v.visible(), v.paged_over(), v.covered(now));
     let gate = !shown as u8 | (paged as u8) << 1 | (covered as u8) << 2;
     if gate != r.gate_was {
@@ -876,8 +1009,23 @@ extern "C" fn frame(timer: *mut c_void) {
         // Pressed state belongs to the screen that went away.
         v.touches.len = 0;
         r.last_ms = now;
+        // A page sliding over makes LVGL redraw the layer at its own rate: from the buffer, not
+        // by drawing the scene again each time.
+        if r.direct {
+            r.direct = false;
+            draw_own(r, v.rect);
+            v.set_direct(false);
+            trace("own buffer while away");
+        }
         return;
     }
+    // A gap (the layer away, the screen off) is no frame rate: the stats window starts over.
+    if now.wrapping_sub(r.last_frame_at) > 500 {
+        r.window = Perf::default();
+        r.window_start = now;
+    }
+    r.last_frame_at = now;
+    let Some(lobby) = r.lobby.as_mut() else { return };
     // Touches, in layer pixels. A finger ends the baked idle: the skeletons catch up first.
     let q = core::mem::take(&mut v.touches);
     if q.len > 0 {
@@ -901,46 +1049,33 @@ extern "C" fn frame(timer: *mut c_void) {
     // Layers that only play their idle loop are drawn from their bakes, not animated.
     let baked = lobby.update_with(dt_ms as f32 / 1000.0, !r.idle_off);
     r.idle_active = baked != 0;
+    r.baked_mask = baked;
     lobby.notices.clear();
     let t1 = lv::now_ms();
-    let (fw_w, fw_h) = (lobby.width, lobby.height);
-    // The baked bottom replaces its slots (and the clear, when it covers the whole target).
-    let bake = r.bake.as_mut().filter(|_| lobby.bake_active());
-    r.bake_active = bake.is_some();
-    let covers = bake.as_ref().is_some_and(|b| {
-        b.x <= v.rect.0
-            && b.y <= v.rect.1
-            && b.x + b.buffer.width as i32 >= v.rect.0 + target.buffer.width as i32
-            && b.y + b.buffer.height as i32 >= v.rect.1 + target.buffer.height as i32
-    });
-    r.renderer.begin(target, (!covers).then_some(0xFF00_0000));
-    if let Some(b) = bake {
-        r.renderer.draw_bake(target, b, (v.rect.0, v.rect.1));
-        // The GPU copies the background while the CPU builds the paths.
-        r.renderer.flush();
-    }
-    // The pack frames the whole screen; the layer shows its own rectangle of it.
-    let cam = lobby.camera;
-    let (ox, oy) = (v.rect.0 as f32, v.rect.1 as f32);
-    let cx = cam.cx + (ox + target.buffer.width as f32 * 0.5 - fw_w * 0.5) / cam.scale;
-    let cy = cam.cy - (oy + target.buffer.height as f32 * 0.5 - fw_h * 0.5) / cam.scale;
-    let size = (target.buffer.width as f32, target.buffer.height as f32);
-    for li in 0..lobby.layers.len() {
-        if baked & (1 << li.min(31)) != 0 {
-            r.renderer.draw_calls(target, &mut r.pages[li], |sizes, emit| lobby.draw_idle(li, (ox, oy), size, sizes, emit));
-            continue;
+    // Straight into LVGL's layer while it stays where it is framed (it is drawn there in the
+    // redraw this frame asks for); through the module's buffer while it scrolls.
+    let direct = !r.direct_off && r.direct_failures < DIRECT_FAILURES && now.wrapping_sub(r.direct_moved_at) >= DIRECT_SETTLE_MS;
+    let t3 = if direct {
+        if !r.direct {
+            trace("direct drawing");
         }
-        lobby.draw_list(li, &mut r.list);
-        r.renderer.draw(target, li, &r.list, &mut r.pages[li], (cx, cy, cam.scale));
-    }
-    let t2 = lv::now_ms();
-    r.renderer.finish();
-    // Whatever reads the frame with the CPU (LVGL's software path) must not see cached lines of
-    // an earlier one: the GPU writes memory behind the cache.
-    fw::cache_flush_invalidate(target.pixels, target.buffer.stride as usize * target.buffer.height as usize);
-    let t3 = lv::now_ms();
+        r.direct = true;
+        r.direct_pending = true;
+        v.set_direct(true);
+        t1
+    } else {
+        if r.direct {
+            r.direct = false;
+            trace(if r.direct_failures >= DIRECT_FAILURES { "own buffer: no usable layer" } else { "own buffer" });
+        }
+        let (draw, gpu) = draw_own(r, v.rect);
+        v.set_direct(false);
+        count_draw(r, draw, gpu);
+        t1.wrapping_add(draw + gpu)
+    };
     r.frame_start = now;
     r.frame_end = t3;
+    r.direct_frame_ms = 0;
     // Development: trace the pacing of 90 frames once the lobby has played a while.
     if !r.pace_traced && r.perf.frames > 900 {
         r.pace_traced = true;
@@ -954,26 +1089,19 @@ extern "C" fn frame(timer: *mut c_void) {
     let w = &mut r.window;
     w.frames += 1;
     w.update_ms += t1.wrapping_sub(t0);
-    w.draw_ms += t2.wrapping_sub(t1);
-    w.gpu_ms += t3.wrapping_sub(t2);
-    // Triangles drawn (on screen), not the whole draw list.
-    w.triangles = r.renderer.stats.triangles;
-    w.calls = r.renderer.stats.calls;
-    w.submit_ms += r.renderer.stats.submit_ms;
     w.late_ms += late;
-    w.errors += r.renderer.stats.errors;
-    if r.renderer.stats.errors != 0 {
-        w.last_error = r.renderer.stats.last_error;
-    }
+    w.direct = r.direct;
     let span = now.wrapping_sub(r.window_start);
     if span >= 1000 {
         let n = w.frames.max(1);
+        let d = w.drawn.max(1);
         r.perf = Perf {
             frames: r.perf.frames + w.frames,
             update_ms: w.update_ms / n,
-            draw_ms: w.draw_ms / n,
-            gpu_ms: w.gpu_ms / n,
-            submit_ms: w.submit_ms / n,
+            draw_ms: w.draw_ms / d,
+            gpu_ms: w.gpu_ms / d,
+            submit_ms: w.submit_ms / d,
+            flush_ms: w.flush_ms / d,
             triangles: w.triangles,
             calls: w.calls,
             errors: r.perf.errors + w.errors,
@@ -981,25 +1109,206 @@ extern "C" fn frame(timer: *mut c_void) {
             fps_x10: w.frames * 10_000 / span,
             idle_ms: w.idle_ms / n,
             late_ms: w.late_ms / n,
+            drawn: w.drawn,
+            redraws: w.redraws,
+            redraw_ms: w.redraw_ms / w.redraws.max(1),
+            direct: w.direct,
         };
         if r.perf.frames < 400 || r.perf.frames % 300 < 31 {
             trace(&alloc::format!(
-                "perf fps {}.{} update {} draw {} (driver {}) gpu {} ui {} tris {} calls {} (blits so far {}) errors {} last {}",
+                "perf fps {}.{} update {} draw {} (driver {} flush {}) gpu {} ui {} idle {} late {} tris {} calls {} direct {} redraws {} errors {} last {}",
                 r.perf.fps_x10 / 10,
                 r.perf.fps_x10 % 10,
                 r.perf.update_ms,
                 r.perf.draw_ms,
                 r.perf.submit_ms,
+                r.perf.flush_ms,
                 r.perf.gpu_ms,
                 r.refresh_ms,
+                r.perf.idle_ms,
+                r.perf.late_ms,
                 r.perf.triangles,
                 r.perf.calls,
-                r.renderer.paths.rects,
+                r.perf.direct,
+                r.perf.redraws,
                 r.perf.errors,
                 r.perf.last_error
             ));
         }
         r.window = Perf::default();
         r.window_start = now;
+    }
+}
+
+/// Direct DRAW_MAIN calls that may fail in a row before frames go through the module's buffer.
+const DIRECT_FAILURES: u32 = 8;
+
+/// Adds a drawn frame's cost to the stats window (`draw`: building and submitting, `gpu`:
+/// waiting for the GPU to finish).
+fn count_draw(r: &mut Runtime, draw: u32, gpu: u32) {
+    let s = r.renderer.stats;
+    let w = &mut r.window;
+    w.drawn += 1;
+    w.draw_ms += draw;
+    w.gpu_ms += gpu;
+    w.submit_ms += s.submit_ms;
+    w.flush_ms += s.flush_ms;
+    // Triangles drawn (on screen), not the whole draw list.
+    w.triangles = s.triangles;
+    w.calls = s.calls;
+    w.errors += s.errors;
+    if s.errors != 0 {
+        w.last_error = s.last_error;
+    }
+}
+
+/// Draws the frame into the module's buffer (LVGL copies it to the screen) and waits for it.
+/// Returns the time drawing and the time waiting for the GPU (ms).
+fn draw_own(r: &mut Runtime, rect: (i32, i32, i32, i32)) -> (u32, u32) {
+    let Some(mut target) = r.target.take() else { return (0, 0) };
+    let t1 = lv::now_ms();
+    let (w, h) = (target.buffer.width as i32, target.buffer.height as i32);
+    render(r, &mut target.buffer, (0, 0), [0, 0, w, h], rect);
+    let t2 = lv::now_ms();
+    r.renderer.finish();
+    // Whatever reads the frame with the CPU (LVGL's software path) must not see cached lines of
+    // an earlier one: the GPU writes memory behind the cache.
+    fw::cache_flush_invalidate(target.pixels, target.buffer.stride as usize * target.buffer.height as usize);
+    let t3 = lv::now_ms();
+    r.target = Some(target);
+    (t2.wrapping_sub(t1), t3.wrapping_sub(t2))
+}
+
+/// Draws the lobby as it is now into `target`: the layer framed at `rect` (pack screen
+/// pixels) has its top-left corner at target pixel `offset`, and only `clip` (target pixels:
+/// x, y, right, bottom) is drawn.
+fn render(r: &mut Runtime, target: &mut gpu::VgBuffer, offset: (i32, i32), clip: [i32; 4], rect: (i32, i32, i32, i32)) {
+    let Runtime { lobby, pages, bake, renderer, list, baked_mask, bake_active, .. } = r;
+    let Some(lobby) = lobby.as_mut() else { return };
+    let (w, h) = (rect.2, rect.3);
+    let (fw_w, fw_h) = (lobby.width, lobby.height);
+    // The baked bottom replaces its slots (and the clear, when it covers the whole layer).
+    let bake = bake.as_mut().filter(|_| lobby.bake_active());
+    *bake_active = bake.is_some();
+    let covers = bake.as_ref().is_some_and(|b| {
+        b.x <= rect.0 && b.y <= rect.1 && b.x + b.buffer.width as i32 >= rect.0 + w && b.y + b.buffer.height as i32 >= rect.1 + h
+    });
+    let clear = [clip[0], clip[1], clip[2] - clip[0], clip[3] - clip[1]];
+    renderer.begin(target, offset, clip, (!covers).then_some((clear, 0xFF00_0000)));
+    if let Some(b) = bake {
+        renderer.draw_bake(target, b, (rect.0, rect.1), clip);
+        // The GPU copies the background while the CPU builds the paths.
+        renderer.flush();
+    }
+    // The pack frames the whole screen; the layer shows its own rectangle of it.
+    let cam = lobby.camera;
+    let (ox, oy) = (rect.0 as f32, rect.1 as f32);
+    let cx = cam.cx + (ox + w as f32 * 0.5 - fw_w * 0.5) / cam.scale;
+    let cy = cam.cy - (oy + h as f32 * 0.5 - fw_h * 0.5) / cam.scale;
+    let size = (w as f32, h as f32);
+    for li in 0..lobby.layers.len() {
+        let Some(pages) = pages.get_mut(li) else { break };
+        if *baked_mask & (1 << li.min(31)) != 0 {
+            renderer.draw_calls(target, pages, |sizes, emit| lobby.draw_idle(li, (ox, oy), size, sizes, emit));
+            continue;
+        }
+        lobby.draw_list(li, list);
+        renderer.draw(target, size, li, list, pages, (cx, cy, cam.scale));
+    }
+}
+
+/// LVGL draws the view (its DRAW_MAIN, after the image's own, which draws nothing in direct
+/// mode): the frame goes straight into LVGL's layer, in the order LVGL draws (the watchface
+/// under the layer is already in the GPU's queue, what is above comes after).
+pub fn on_draw_main(e: *mut c_void) {
+    let r = rt();
+    if !r.direct || r.lobby.is_none() {
+        return;
+    }
+    let v = view::view();
+    let Some(layer) = (unsafe { lv::draw_layer(e) }) else {
+        r.direct_failures += 1;
+        return;
+    };
+    let format = match layer.cf {
+        lv::cf::ARGB8888 => gpu::VG_FMT_BGRA8888,
+        lv::cf::XRGB8888 => gpu::VG_FMT_BGRX8888,
+        lv::cf::RGB565 => gpu::VG_FMT_BGR565,
+        lv::cf::RGB888 => gpu::VG_FMT_BGR888,
+        _ => {
+            r.direct_failures += 1;
+            return;
+        }
+    };
+    let rect = v.rect;
+    let (x, y, _, _) = unsafe { lv::measured(v.obj) };
+    if (x, y) != (rect.0, rect.1) {
+        // Scrolling: drawn right this time, through the buffer from the next frame on.
+        r.direct_moved_at = lv::now_ms();
+    }
+    let offset = (x - layer.area[0], y - layer.area[1]);
+    // LVGL draws this area from the layer up (it answered COVER for it): nothing under it is
+    // drawn in this pass, so what the frame drew there earlier still stands. LVGL refreshes the
+    // screen in parts (two halves): the first part draws the whole layer, the others skip it.
+    let c = layer.clip;
+    let from_here = v.covered_area.take().is_some_and(|a| c[0] >= a[0] && c[1] >= a[1] && c[2] <= a[2] && c[3] <= a[3]);
+    if !r.direct_pending && r.direct_whole {
+        let again = r.direct_passed.iter().any(|p| c[0] <= p[2] && p[0] <= c[2] && c[1] <= p[3] && p[1] <= c[3]);
+        if from_here && !again && r.direct_passed.len() < 8 {
+            r.direct_passed.push(c);
+            return;
+        }
+        r.direct_whole = false;
+    }
+    let whole = r.direct_pending && from_here;
+    let area = if whole { [i32::MIN / 2, i32::MIN / 2, i32::MAX / 2, i32::MAX / 2] } else { layer.clip };
+    let clip = [
+        (area[0] - layer.area[0]).max(offset.0).max(0),
+        (area[1] - layer.area[1]).max(offset.1).max(0),
+        (area[2] + 1 - layer.area[0]).min(offset.0 + rect.2).min(layer.width as i32),
+        (area[3] + 1 - layer.area[1]).min(offset.1 + rect.3).min(layer.height as i32),
+    ];
+    if r.direct_traced < 24 {
+        r.direct_traced += 1;
+        trace(&alloc::format!(
+            "direct draw: area {:?} clip {:?} cf {:#x} stride {} obj ({x}, {y}) pending {} at {}",
+            layer.area,
+            layer.clip,
+            layer.cf,
+            layer.stride,
+            r.direct_pending,
+            lv::now_ms()
+        ));
+    }
+    if clip[2] <= clip[0] || clip[3] <= clip[1] {
+        return;
+    }
+    let mut buffer = match r.layer_buffer.take() {
+        Some(mut b) => {
+            b.rebind(layer.data, layer.width, layer.height, layer.stride, format);
+            b
+        }
+        None => gpu::VgBuffer::wrap(layer.data, layer.width, layer.height, layer.stride, format),
+    };
+    let t1 = lv::now_ms();
+    render(r, &mut buffer, offset, clip, rect);
+    r.renderer.end_scissor(&buffer);
+    let t2 = lv::now_ms();
+    // Done before LVGL goes on: what it draws above comes after in the GPU's queue anyway, but
+    // it must not flush the screen with the frame half drawn.
+    r.renderer.finish();
+    let t3 = lv::now_ms();
+    r.layer_buffer = Some(buffer);
+    r.direct_failures = 0;
+    if r.direct_pending {
+        r.direct_pending = false;
+        r.direct_whole = whole;
+        r.direct_passed.clear();
+        r.direct_passed.push(c);
+        r.direct_frame_ms = t3.wrapping_sub(t1);
+        count_draw(r, t2.wrapping_sub(t1), t3.wrapping_sub(t2));
+    } else {
+        r.window.redraws += 1;
+        r.window.redraw_ms += t3.wrapping_sub(t1);
     }
 }

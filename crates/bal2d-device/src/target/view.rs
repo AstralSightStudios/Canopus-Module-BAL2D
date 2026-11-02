@@ -11,6 +11,11 @@
 //!
 //! The source is an in-memory LVGL 9 image descriptor over the render target. Two descriptors
 //! alternate so each frame is a new source for LVGL (and its cache entry is dropped).
+//!
+//! Direct mode: the image is made fully transparent (LVGL draws nothing of it) and the frame is
+//! drawn by the module in the object's DRAW_MAIN, straight into LVGL's layer (the frame buffer,
+//! in SRAM) between what is under the object and what is above it. The object still counts as
+//! covering its area (COVER_CHECK), as the opaque image did.
 
 use alloc::boxed::Box;
 use core::ffi::c_void;
@@ -23,7 +28,7 @@ use super::lv::{self, Obj, event, flag};
 /// LVGL's DELETE event.
 const EVENT_DELETE: u32 = 36;
 /// LVGL's DRAW_MAIN event (twelve before DELETE in LVGL 9.2's list): LVGL drew the object.
-const EVENT_DRAW_MAIN: u32 = 24;
+const EVENT_DRAW_MAIN: u32 = lv::EVENT_DRAW_MAIN;
 /// After a frame is handed over, LVGL must draw the object within this long (ms), or it counts
 /// as covered (another page or window drawn over the watchface).
 const COVER_GRACE_MS: u32 = 300;
@@ -98,6 +103,11 @@ pub struct View {
     touch_rect: (i32, i32, i32, i32),
     /// Hidden while no pack is loaded (the last frame would otherwise stay up).
     hidden: bool,
+    /// Direct mode: the image is transparent, the module draws in DRAW_MAIN.
+    direct: bool,
+    /// The last area this object answered COVER for (absolute, inclusive): LVGL draws that
+    /// area from this object up, nothing under it.
+    pub covered_area: Option<[i32; 4]>,
 }
 
 /// A tiny fixed queue of touch events (filled by LVGL callbacks, drained by the frame).
@@ -165,6 +175,8 @@ pub fn view() -> &'static mut View {
                 touch: lv::NULL,
                 touch_rect: (0, 0, 0, 0),
                 hidden: false,
+                direct: false,
+                covered_area: None,
             });
         }
         slot.as_mut().unwrap()
@@ -292,6 +304,15 @@ impl View {
         x < sw && y < sh && x + w > 0 && y + h > 0
     }
 
+    /// Direct mode on or off (see the module docs): the image's opacity.
+    pub fn set_direct(&mut self, on: bool) {
+        if self.direct == on || self.obj.is_null() {
+            return;
+        }
+        self.direct = on;
+        unsafe { lv::set_style(self.obj, lv::prop::IMAGE_OPA, if on { 0 } else { 255 }) };
+    }
+
     pub fn set_hidden(&mut self, hidden: bool) {
         self.hidden = hidden;
         if self.obj.is_null() {
@@ -315,6 +336,8 @@ impl View {
             self.set_hidden(false);
         }
         self.flip ^= 1;
+        // A new frame: what LVGL was asked about before is no answer for its refresh.
+        self.covered_area = None;
         let src = &*self.dsc[self.flip] as *const ImageDsc as *const c_void;
         unsafe { lvx_image_set_src(self.obj, src) };
         self.presented_at = lv::now_ms();
@@ -448,9 +471,12 @@ impl View {
             }
             lv::on_event(obj, deleted, EVENT_DELETE, 0);
             lv::on_event(obj, drawn, EVENT_DRAW_MAIN, 0);
+            lv::on_event(obj, cover_check, lv::EVENT_COVER_CHECK, 0);
         }
         self.drawn_at = 0;
         self.presented_at = 0;
+        // A watchface's own image starts opaque; the next frame sets the mode again.
+        self.direct = false;
     }
 
     /// The full-screen layer on top of a watchface without one (see the module docs).
@@ -618,8 +644,30 @@ extern "C" fn proxy_deleted(_e: *mut c_void) {
     v.touch_rect = (0, 0, 0, 0);
 }
 
-extern "C" fn drawn(_e: *mut c_void) {
+extern "C" fn drawn(e: *mut c_void) {
     view().drawn_at = lv::now_ms();
+    super::on_draw_main(e);
+}
+
+/// In direct mode the object covers what it is asked about within its rectangle, as the opaque
+/// image did (the frame is cleared or the baked background is drawn first): LVGL then skips what
+/// is under it. Masked areas (rounded clips) stay masked.
+extern "C" fn cover_check(e: *mut c_void) {
+    let v = view();
+    if !v.direct || v.obj.is_null() {
+        return;
+    }
+    let Some((res, area)) = (unsafe { lv::cover_check(e) }) else { return };
+    let (x, y, w, h) = unsafe { lv::measured(v.obj) };
+    let inside = area[0] >= x && area[1] >= y && area[2] < x + w && area[3] < y + h;
+    unsafe {
+        if inside && core::ptr::read_volatile(res) != lv::COVER_RES_MASKED {
+            core::ptr::write_volatile(res, lv::COVER_RES_COVER);
+            v.covered_area = Some(area);
+        } else {
+            v.covered_area = None;
+        }
+    }
 }
 
 extern "C" fn deleted(_e: *mut c_void) {
@@ -627,6 +675,7 @@ extern "C" fn deleted(_e: *mut c_void) {
     v.grabbed = false;
     v.obj = lv::NULL;
     v.mode = Mode::None;
+    v.direct = false;
 }
 
 extern "C" fn touch_event(e: *mut c_void) {

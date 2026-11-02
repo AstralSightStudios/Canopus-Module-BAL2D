@@ -18,6 +18,9 @@ use super::fw;
 
 pub const VG_FMT_BGR565: u16 = 5;
 pub const VG_FMT_BGRA8888: u16 = 1;
+/// LVGL's XRGB8888 / RGB888 layers.
+pub const VG_FMT_BGRX8888: u16 = 3;
+pub const VG_FMT_BGR888: u16 = 119;
 /// VGLite names components from the least significant bits: our 16-bit pixels (A high, B low)
 /// are its BGRA4444, the format LVGL maps its own ARGB4444 to.
 pub const VG_FMT_ARGB4444: u16 = 7;
@@ -46,6 +49,12 @@ pub const PATTERN_COLOR: u32 = 0x1D00;
 /// Set by the self-test when the cache clean did not reach memory: buffers are also written
 /// through the non-cached PSRAM alias.
 pub static MIRROR_NC: AtomicBool = AtomicBool::new(false);
+/// Set by the self-test when draws batched into a command stream (`Stream`) came out wrong:
+/// every draw goes through the driver then.
+pub static STREAM_OFF: AtomicBool = AtomicBool::new(false);
+/// Bytes of the per-frame command stream (a heavy baked frame takes ~35 KB, a live one with
+/// triangle paths ~80 KB; when full the GPU is waited for and it starts over).
+const STREAM_BYTES: usize = 96 * 1024;
 /// Page formats the self-test found drawn wrong (bit = `PageFormat as u8`): converted to
 /// BGRA8888 on upload.
 pub static BAD_FORMATS: AtomicU32 = AtomicU32::new(0);
@@ -146,6 +155,28 @@ impl VgBuffer {
         // Normal image mode until set; opaque transparency mode 0.
         raw[80..82].copy_from_slice(&0x1F00u16.to_le_bytes());
         VgBuffer { raw, width, height, stride }
+    }
+
+    /// A buffer over memory someone else owns (LVGL's layer): no `GpuMem`, nothing to free.
+    pub fn wrap(data: *mut u8, width: u32, height: u32, stride: u32, format: u16) -> VgBuffer {
+        let mut b = VgBuffer { raw: Box::new([0u8; 176]), width: 0, height: 0, stride: 0 };
+        b.rebind(data, width, height, stride, format);
+        b
+    }
+
+    /// Points the buffer at other memory (a wrapped layer that moved or changed size).
+    pub fn rebind(&mut self, data: *mut u8, width: u32, height: u32, stride: u32, format: u16) {
+        let raw = &mut self.raw;
+        raw.fill(0);
+        raw[0..4].copy_from_slice(&(width as i32).to_le_bytes());
+        raw[4..8].copy_from_slice(&(height as i32).to_le_bytes());
+        raw[8..12].copy_from_slice(&(stride as i32).to_le_bytes());
+        raw[14..16].copy_from_slice(&format.to_le_bytes());
+        let p = data as usize as u32;
+        raw[20..24].copy_from_slice(&p.to_le_bytes());
+        raw[24..28].copy_from_slice(&p.to_le_bytes());
+        raw[80..82].copy_from_slice(&0x1F00u16.to_le_bytes());
+        (self.width, self.height, self.stride) = (width, height, stride);
     }
 
     pub fn set_image_mode(&mut self, mode: u16) {
@@ -292,6 +323,170 @@ impl Target {
 
 }
 
+/// Draws batched into a command stream of our own, run by the GPU through one driver call.
+///
+/// The driver programs some 34 state registers and copies the path for every draw
+/// (`vg_lite_draw_pattern`), into a command buffer in uncached memory, and takes a critical
+/// section and reports power-management activity each time: on the watch that was ~150 µs a call,
+/// a third of a heavy frame. Here a run of draws with one page and blend goes to the driver as
+/// a single draw whose path is "uploaded" (`uploaded.property` bit 0): the driver sets the
+/// page, blend, path matrix and the rest up for it and then CALLs our stream, which per draw
+/// only reprograms what differs (the image coordinate generator, the colour, the tessellation
+/// window) and passes the path, as the driver would (registers and values as Mirage's
+/// captures of the driver show them; the generator math is the driver's own, see `generator`).
+pub struct Stream {
+    mem: GpuMem,
+    /// Bytes written; where the current batch starts; its draws.
+    at: usize,
+    batch: usize,
+    n: u32,
+    page: u32,
+    blend: BlendMode,
+    /// The batch's first draw (the carrier draws with it) and the union of the bounds (path units).
+    matrix: [f32; 6],
+    color: u32,
+    lo: [i32; 2],
+    hi: [i32; 2],
+    carrier: Box<[u8; 72]>,
+}
+
+const ST_COLOR: u32 = 0x0A02;
+const ST_IMAGE_C: u32 = 0x0A18;
+const ST_FLUSH: u32 = 0x0A1B;
+const ST_IMAGE_X: u32 = 0x0A1C;
+const ST_TESS_WINDOW: u32 = 0x0A39;
+/// What the driver writes to 0x0A1B before each path's window, and the generator's 0x0A1F.
+const FLUSH_BEFORE_PATH: u32 = 0x0001_1000;
+const GENERATOR_ON: u32 = 1;
+/// Bytes a draw takes besides its path: states 16 + 32 + 8 + 8 + 16, data header 8; and the end.
+const DRAW_OVERHEAD: usize = 88;
+const STREAM_END: usize = 8;
+
+impl Stream {
+    pub fn new(bytes: usize) -> Option<Stream> {
+        let mem = GpuMem::new(bytes)?;
+        let mut carrier = Box::new([0u8; 72]);
+        carrier[16] = QUALITY_LOW;
+        carrier[17] = PATH_S16;
+        carrier[50] = 2; // fill path
+        Some(Stream { mem, at: 0, batch: 0, n: 0, page: 0, blend: BlendMode::Normal, matrix: [0.0; 6], color: 0, lo: [0; 2], hi: [0; 2], carrier })
+    }
+
+    /// Starts over at the beginning (the GPU is done with what was there).
+    pub fn reset(&mut self) {
+        (self.at, self.batch, self.n) = (0, 0, 0);
+    }
+
+    pub fn pending(&self) -> u32 {
+        self.n
+    }
+
+    pub fn fits(&self, path_i16: usize) -> bool {
+        self.at + DRAW_OVERHEAD + (path_i16 * 2).div_ceil(8) * 8 + STREAM_END <= self.mem.len
+    }
+
+    fn put(&mut self, w: u32) {
+        let at = self.at;
+        self.mem.slice()[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        self.at += 4;
+    }
+
+    fn states(&mut self, reg: u32, values: &[u32]) {
+        self.put(0x3000_0000 | (values.len() as u32) << 16 | reg);
+        for &v in values {
+            self.put(v);
+        }
+        if values.len() % 2 == 0 {
+            self.put(0);
+        }
+    }
+
+    /// Appends a draw of `path` (S16, END-terminated) with the image coordinate generator
+    /// `generator`, colour `color` and tessellation window `window` ((x, y, w, h) in target
+    /// pixels). The first draw of a batch also sets what the carrier draws with.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&mut self, page: u32, blend: BlendMode, matrix: &[f32; 6], generator: &[u32; 9], color: u32, window: [i32; 4], bounds: [i16; 4], path: &[i16]) {
+        if self.n == 0 {
+            self.batch = self.at;
+            (self.page, self.blend, self.matrix, self.color) = (page, blend, *matrix, color);
+            self.lo = [bounds[0] as i32, bounds[1] as i32];
+            self.hi = [bounds[2] as i32, bounds[3] as i32];
+        } else {
+            self.lo = [self.lo[0].min(bounds[0] as i32), self.lo[1].min(bounds[1] as i32)];
+            self.hi = [self.hi[0].max(bounds[2] as i32), self.hi[1].max(bounds[3] as i32)];
+        }
+        let g = generator;
+        self.states(ST_IMAGE_C, &[g[0], g[1], g[2]]);
+        self.states(ST_IMAGE_X, &[g[3], g[4], g[5], GENERATOR_ON, g[6], g[7], g[8]]);
+        self.states(ST_COLOR, &[color]);
+        self.states(ST_FLUSH, &[FLUSH_BEFORE_PATH]);
+        self.states(ST_TESS_WINDOW, &[(window[0] as u32) | (window[1] as u32) << 16, (window[2] as u32) | (window[3] as u32) << 16]);
+        let bytes = path.len() * 2;
+        let units = bytes.div_ceil(8);
+        self.put(0x4000_0000 | units as u32);
+        self.put(0);
+        let at = self.at;
+        let dst = &mut self.mem.slice()[at..at + units * 8];
+        for (d, v) in dst.chunks_exact_mut(2).zip(path) {
+            d.copy_from_slice(&v.to_le_bytes());
+        }
+        dst[bytes..].fill(0);
+        self.at += units * 8;
+        self.n += 1;
+    }
+
+    /// Ends the batch and prepares the carrier path: returns it with the batch's page, blend,
+    /// first matrix and colour (None when the batch is empty). The stream is cleaned out of the
+    /// cache for the GPU.
+    pub fn close(&mut self) -> Option<(*mut u8, u32, BlendMode, [f32; 6], u32)> {
+        if self.n == 0 {
+            return None;
+        }
+        self.put(0x7000_0000);
+        self.put(0);
+        let start = self.batch;
+        let len = self.at - start;
+        let addr = self.mem.ptr() as usize + start;
+        fw::cache_clean(addr as *const u8, len);
+        let c = &mut self.carrier;
+        for (k, v) in [self.lo[0], self.lo[1], self.hi[0], self.hi[1]].iter().enumerate() {
+            c[k * 4..k * 4 + 4].copy_from_slice(&(*v as f32).to_le_bytes());
+        }
+        // uploaded: handle, memory, address, bytes, property (bit 0: uploaded, CALL it).
+        c[20..24].copy_from_slice(&0u32.to_le_bytes());
+        c[24..28].copy_from_slice(&(addr as u32).to_le_bytes());
+        c[28..32].copy_from_slice(&(addr as u32).to_le_bytes());
+        c[32..36].copy_from_slice(&(len as u32).to_le_bytes());
+        c[36..40].copy_from_slice(&1u32.to_le_bytes());
+        c[40..44].copy_from_slice(&(len as u32).to_le_bytes());
+        c[44..48].copy_from_slice(&(addr as u32).to_le_bytes());
+        // Not changed: the driver would free the "upload" and copy the path anew.
+        c[48] = 0;
+        self.n = 0;
+        Some((c.as_mut_ptr(), self.page, self.blend, self.matrix, self.color))
+    }
+}
+
+/// The image coordinate generator the driver programs (0x0A18-0x0A1A, 0x0A1C-0x0A1E,
+/// 0x0A20-0x0A22) for an affine texel -> target matrix `m` and a `w` x `h` image, bilinear:
+/// the inverse matrix sampled at pixel centres, half a texel back, in image units (as
+/// `vg_lite_draw_pattern` computes it in 4.0.47). None for a singular matrix.
+pub fn generator(m: &[f32; 6], w: f32, h: f32) -> Option<[u32; 9]> {
+    let det = m[0] * m[4] - m[1] * m[3];
+    if det == 0.0 || !det.is_finite() {
+        return None;
+    }
+    let a = m[4] / det;
+    let b = -m[1] / det;
+    let c = (m[1] * m[5] - m[4] * m[2]) / det;
+    let d = -m[3] / det;
+    let e = m[0] / det;
+    let f = (m[3] * m[2] - m[0] * m[5]) / det;
+    let c0 = ((a + b) * 0.5 + c - 0.5) / w;
+    let c1 = ((d + e) * 0.5 + f - 0.5) / h;
+    Some([c0, c1, 1.0, a / w, d / h, 0.0, b / w, e / h, 0.0].map(f32::to_bits))
+}
+
 #[derive(Default, Clone, Copy)]
 pub struct Stats {
     pub triangles: u32,
@@ -299,6 +494,11 @@ pub struct Stats {
     /// Milliseconds spent inside `vg_lite_draw_pattern` (the driver; on Mirage also the model's
     /// rasterisation), summed over calls.
     pub submit_ms: u32,
+    /// Milliseconds inside `vg_lite_flush` within the frame: the CPU waiting for the GPU to free
+    /// a command buffer (it is that far behind).
+    pub flush_ms: u32,
+    /// Driver calls that carried a batch of draws (`Stream`).
+    pub batches: u32,
     pub errors: u32,
     pub last_error: i32,
 }
@@ -315,6 +515,13 @@ pub struct Renderer {
     /// FP32 path data (the self-test's fallback): each call's path converted here.
     fp32: Option<Vec<u32>>,
     pattern_mode: u32,
+    /// Layer pixels -> target pixels for this frame (`begin`).
+    offset: (f32, f32),
+    /// The frame's clip (target pixels: x, y, right, bottom).
+    clip: [i32; 4],
+    /// Draws batched for the GPU (None: each through the driver), and whether they are wanted.
+    pub stream: Option<Stream>,
+    stream_wanted: bool,
 }
 
 fn page_sizes(pages: &[Page]) -> [(f32, f32); 16] {
@@ -331,11 +538,20 @@ struct Sink<'a> {
     pattern_mode: u32,
     /// The page whose palette is loaded.
     clut_page: usize,
+    /// Layer pixels -> target pixels (where the layer's top-left corner is in the target).
+    offset: (f32, f32),
+    clip: [i32; 4],
+    stream: &'a mut Option<Stream>,
 }
 
 impl Sink<'_> {
-    fn submit(&mut self, target: &mut Target, pages: &mut [Page], call: &bal2d_render::Call) {
-        let Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode, clut_page } = self;
+    fn submit(&mut self, target: &mut VgBuffer, pages: &mut [Page], call: &bal2d_render::Call) {
+        if call.rect.is_none() && self.fp32.is_none() && self.stream.is_some() {
+            self.batch(target, pages, call);
+            return;
+        }
+        self.carry(target, pages);
+        let Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode, clut_page, offset, .. } = self;
         let pattern_mode = *pattern_mode;
         let Some(page) = pages.get_mut(call.page as usize) else { return };
         if let Some(c) = &page.clut {
@@ -345,7 +561,7 @@ impl Sink<'_> {
             }
         }
         let m = &mut ***image_matrix;
-        *m = [call.matrix[0], call.matrix[1], call.matrix[2], call.matrix[3], call.matrix[4], call.matrix[5], 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+        *m = [call.matrix[0], call.matrix[1], call.matrix[2] + offset.0, call.matrix[3], call.matrix[4], call.matrix[5] + offset.1, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
         if let Some(rect) = &call.rect {
             // An atlas rectangle drawn rigidly: an image blit (no path). The rectangle is
             // the image for the GPU, so the matrix takes rectangle-relative texels.
@@ -354,17 +570,13 @@ impl Sink<'_> {
             m[5] += m[3] * rx + m[4] * ry;
             let timed = stats.calls % 8 == 0;
             let t0 = if timed { super::lv::now_ms() } else { 0 };
-            let rc = fw::vg_blit_rect(target.buffer.ptr(), page.buffer.ptr(), rect.as_ptr(), m.as_ptr(), blend(call.blend), tint(call.color), FILTER_BILINEAR);
+            let rc = fw::vg_blit_rect(target.ptr(), page.buffer.ptr(), rect.as_ptr(), m.as_ptr(), blend(call.blend), tint(call.color), FILTER_BILINEAR);
             if timed {
                 stats.submit_ms += super::lv::now_ms().wrapping_sub(t0) * 8;
             }
             stats.calls += 1;
             if stats.calls % FLUSH_EVERY == 0 {
-                let rc = fw::vg_flush();
-                if rc != 0 {
-                    stats.errors += 1;
-                    stats.last_error = rc;
-                }
+                timed_flush(stats);
             }
             if rc != 0 {
                 stats.errors += 1;
@@ -393,7 +605,7 @@ impl Sink<'_> {
         let timed = stats.calls % 8 == 0;
         let t0 = if timed { super::lv::now_ms() } else { 0 };
         let rc = fw::vg_draw_pattern(
-            target.buffer.ptr(),
+            target.ptr(),
             p.as_mut_ptr(),
             FILL_NON_ZERO,
             path_matrix.as_ptr(),
@@ -412,16 +624,110 @@ impl Sink<'_> {
         // Hand the GPU work as it accumulates, so it rasterizes while the CPU builds the
         // next paths (it would otherwise start only at `finish`).
         if stats.calls % FLUSH_EVERY == 0 {
-            let rc = fw::vg_flush();
-            if rc != 0 {
-                stats.errors += 1;
-                stats.last_error = rc;
-            }
+            timed_flush(stats);
         }
         if rc != 0 {
             stats.errors += 1;
             stats.last_error = rc;
         }
+    }
+}
+
+impl Sink<'_> {
+    /// Adds a path draw to the stream's batch (a new batch for another page or blend, or after
+    /// `FLUSH_EVERY` draws, handing the GPU what it has).
+    fn batch(&mut self, target: &mut VgBuffer, pages: &mut [Page], call: &bal2d_render::Call) {
+        let Some(page) = pages.get(call.page as usize) else { return };
+        let (pw, ph) = (page.buffer.width as f32, page.buffer.height as f32);
+        let (ox, oy) = self.offset;
+        let m = [call.matrix[0], call.matrix[1], call.matrix[2] + ox, call.matrix[3], call.matrix[4], call.matrix[5] + oy];
+        let Some(g) = generator(&m, pw, ph) else { return };
+        // The tessellation window: the bounds in target pixels (a pixel of margin either way: a
+        // larger window only costs time), cut to the clip.
+        let k = 1.0 / bal2d_render::PATH_SCALE;
+        let b = call.bounds;
+        let c = self.clip;
+        let x0 = ((b[0] as f32 * k + ox) as i32 - 2).max(c[0]);
+        let y0 = ((b[1] as f32 * k + oy) as i32 - 2).max(c[1]);
+        let x1 = ((b[2] as f32 * k + ox) as i32 + 2).min(c[2]);
+        let y1 = ((b[3] as f32 * k + oy) as i32 + 2).min(c[3]);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (pending, same, fits) = match self.stream.as_ref() {
+            Some(st) => (st.pending(), st.page == call.page && st.blend == call.blend, st.fits(call.path.len())),
+            None => return,
+        };
+        if pending > 0 && (!same || pending >= FLUSH_EVERY || !fits) {
+            self.carry(target, pages);
+        }
+        if !fits {
+            // Full: the GPU runs what is there before it is written over.
+            let rc = fw::vg_finish();
+            if rc != 0 {
+                self.stats.errors += 1;
+                self.stats.last_error = rc;
+            }
+            if let Some(st) = self.stream.as_mut() {
+                st.reset();
+                if !st.fits(call.path.len()) {
+                    return;
+                }
+            }
+        }
+        if let Some(cl) = &pages[call.page as usize].clut {
+            if self.clut_page != call.page as usize {
+                fw::vg_set_clut(256, cl.as_ptr());
+                self.clut_page = call.page as usize;
+            }
+        }
+        if let Some(st) = self.stream.as_mut() {
+            st.draw(call.page, call.blend, &m, &g, tint(call.color), [x0, y0, x1 - x0, y1 - y0], call.bounds, call.path);
+        }
+        self.stats.calls += 1;
+    }
+
+    /// Hands the open batch to the driver: one draw with the batch's page, blend and first
+    /// matrix whose path CALLs the stream.
+    fn carry(&mut self, target: &mut VgBuffer, pages: &mut [Page]) {
+        let Some(st) = self.stream.as_mut() else { return };
+        let Some((path, page, blend_mode, matrix, color)) = st.close() else { return };
+        let Some(page) = pages.get_mut(page as usize) else { return };
+        let m = &mut **self.image_matrix;
+        *m = [matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5], 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+        let t0 = super::lv::now_ms();
+        let rc = fw::vg_draw_pattern(
+            target.ptr(),
+            path,
+            FILL_NON_ZERO,
+            self.path_matrix.as_ptr(),
+            page.buffer.ptr(),
+            m.as_ptr(),
+            blend(blend_mode),
+            self.pattern_mode,
+            0,
+            color,
+            FILTER_BILINEAR,
+        );
+        self.stats.submit_ms += super::lv::now_ms().wrapping_sub(t0);
+        self.stats.batches += 1;
+        if rc != 0 {
+            self.stats.errors += 1;
+            self.stats.last_error = rc;
+        }
+        timed_flush(self.stats);
+    }
+}
+
+/// `vg_lite_flush`, timed: it returns once the GPU has freed the other command buffer, so its
+/// time is the CPU waiting for the GPU.
+fn timed_flush(stats: &mut Stats) {
+    let t0 = super::lv::now_ms();
+    let rc = fw::vg_flush();
+    stats.flush_ms += super::lv::now_ms().wrapping_sub(t0);
+    if rc != 0 {
+        stats.errors += 1;
+        stats.last_error = rc;
     }
 }
 
@@ -458,7 +764,22 @@ impl Renderer {
             Some(v) => v.try_reserve_exact((max_triangles * 10 + 2).saturating_sub(v.capacity())).is_ok(),
             None => true,
         };
+        if self.stream.is_none() && self.stream_wanted && !STREAM_OFF.load(Ordering::Relaxed) {
+            // Fallible: without it every draw goes through the driver.
+            self.stream = Stream::new(STREAM_BYTES);
+        }
         fp32_ok && self.paths.reserve(max_triangles)
+    }
+
+    /// Batched draws on or off (`options::SINGLE`; the self-test can rule them out anyway).
+    /// Turned on, the stream is allocated `now` (a pack is shown) or with the next pack.
+    pub fn want_stream(&mut self, on: bool, now: bool) {
+        self.stream_wanted = on;
+        if !on {
+            self.stream = None;
+        } else if now && self.stream.is_none() && !STREAM_OFF.load(Ordering::Relaxed) {
+            self.stream = Stream::new(STREAM_BYTES);
+        }
     }
 
     /// Draws FP32 paths instead of S16 ones from now on.
@@ -493,18 +814,31 @@ impl Renderer {
             stats: Stats::default(),
             fp32: None,
             pattern_mode: PATTERN_PAD,
+            offset: (0.0, 0.0),
+            clip: [0; 4],
+            stream: None,
+            stream_wanted: true,
         }
     }
 
-    /// Starts a frame: scissor to the target (LVGL leaves its own clip enabled), clear unless the
-    /// frame is covered anyway.
-    pub fn begin(&mut self, target: &mut Target, clear_abgr: Option<u32>) {
+    /// Starts a frame into `target`, whose pixel (`offset`) is the layer's top-left corner:
+    /// scissor to `clip` (target pixels: x, y, right, bottom; LVGL leaves its own clip
+    /// enabled), and clear the layer's `clear` rectangle (target pixels: x, y, w, h) unless the
+    /// frame covers it anyway.
+    pub fn begin(&mut self, target: &mut VgBuffer, offset: (i32, i32), clip: [i32; 4], clear: Option<([i32; 4], u32)>) {
         self.stats = Stats::default();
-        let (w, h) = (target.buffer.width as i32, target.buffer.height as i32);
-        fw::vg_set_scissor(0, 0, w, h);
+        self.offset = (offset.0 as f32, offset.1 as f32);
+        self.path_matrix[2] = self.offset.0;
+        self.path_matrix[5] = self.offset.1;
+        self.clip = clip;
+        // The GPU finished the last frame: the stream starts over.
+        if let Some(st) = self.stream.as_mut() {
+            st.reset();
+        }
+        fw::vg_set_scissor(clip[0], clip[1], clip[2], clip[3]);
         fw::vg_enable_scissor();
-        if let Some(color) = clear_abgr {
-            let rc = fw::vg_clear(target.buffer.ptr(), core::ptr::null(), color);
+        if let Some((rect, color)) = clear {
+            let rc = fw::vg_clear(target.ptr(), rect.as_ptr(), color);
             if rc != 0 {
                 self.stats.errors += 1;
                 self.stats.last_error = rc;
@@ -512,13 +846,26 @@ impl Renderer {
         }
     }
 
-    /// Copies the baked bottom of the scene in (no blending: it is opaque and drawn first).
-    /// `origin` is where the target's top-left corner sits on the pack's screen.
-    pub fn draw_bake(&mut self, target: &mut Target, bake: &mut BakeImage, origin: (i32, i32)) {
-        let rect = [0i32, 0, bake.buffer.width as i32, bake.buffer.height as i32];
+    /// Leaves the scissor over the whole of `target` (a layer LVGL goes on drawing into).
+    pub fn end_scissor(&mut self, target: &VgBuffer) {
+        fw::vg_set_scissor(0, 0, target.width as i32, target.height as i32);
+    }
+
+    /// Copies the baked bottom of the scene in (no blending: it is opaque and drawn first), the
+    /// part of it inside `clip` (target pixels: x, y, right, bottom; the copy is a rectangle of
+    /// the image, so nothing outside is written whatever the scissor). `origin` is where the
+    /// layer's top-left corner sits on the pack's screen.
+    pub fn draw_bake(&mut self, target: &mut VgBuffer, bake: &mut BakeImage, origin: (i32, i32), clip: [i32; 4]) {
+        let (bx, by) = (bake.x - origin.0 + self.offset.0 as i32, bake.y - origin.1 + self.offset.1 as i32);
+        let (x0, y0) = (clip[0].max(bx), clip[1].max(by));
+        let (x1, y1) = (clip[2].min(bx + bake.buffer.width as i32), clip[3].min(by + bake.buffer.height as i32));
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let rect = [x0 - bx, y0 - by, x1 - x0, y1 - y0];
         let m = &mut self.image_matrix;
-        **m = [1.0, 0.0, (bake.x - origin.0) as f32, 0.0, 1.0, (bake.y - origin.1) as f32, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
-        let rc = fw::vg_blit_rect(target.buffer.ptr(), bake.buffer.ptr(), rect.as_ptr(), m.as_ptr(), BLEND_NONE, 0, FILTER_POINT);
+        **m = [1.0, 0.0, x0 as f32, 0.0, 1.0, y0 as f32, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+        let rc = fw::vg_blit_rect(target.ptr(), bake.buffer.ptr(), rect.as_ptr(), m.as_ptr(), BLEND_NONE, 0, FILTER_POINT);
         self.stats.calls += 1;
         if rc != 0 {
             self.stats.errors += 1;
@@ -526,38 +873,36 @@ impl Renderer {
         }
     }
 
-    /// Draws a list. `cam` maps skeleton to target pixels: x' = (x - cx) * s + w/2,
-    /// y' = h/2 - (y - cy) * s.
-    pub fn draw(&mut self, target: &mut Target, layer: usize, list: &DrawList, pages: &mut [Page], cam: (f32, f32, f32)) {
-        let size = (target.buffer.width as f32, target.buffer.height as f32);
+    /// Draws a list into a layer of `size` pixels. `cam` maps skeleton to layer pixels:
+    /// x' = (x - cx) * s + w/2, y' = h/2 - (y - cy) * s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&mut self, target: &mut VgBuffer, size: (f32, f32), layer: usize, list: &DrawList, pages: &mut [Page], cam: (f32, f32, f32)) {
         let sizes = page_sizes(pages);
         let page_count = pages.len();
-        let Renderer { path, paths, path_matrix, image_matrix, stats, fp32, pattern_mode } = self;
-        let mut sink = Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode: *pattern_mode, clut_page: usize::MAX };
+        let Renderer { path, paths, path_matrix, image_matrix, stats, fp32, pattern_mode, offset, clip, stream, .. } = self;
+        let mut sink = Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode: *pattern_mode, clut_page: usize::MAX, offset: *offset, clip: *clip, stream };
         let triangles = paths.triangles;
         paths.draw(layer, list, cam, size, |p| ((p as usize) < page_count.min(16)).then(|| sizes[p as usize]), |call| sink.submit(target, pages, call));
+        sink.carry(target, pages);
         sink.stats.triangles += paths.triangles - triangles;
     }
 
     /// Draws calls made elsewhere (the baked idle): `produce` gets the page sizes and the
     /// callback that submits a call, and returns the triangles it drew.
-    pub fn draw_calls(&mut self, target: &mut Target, pages: &mut [Page], produce: impl FnOnce(&dyn Fn(u32) -> Option<(f32, f32)>, &mut dyn FnMut(&bal2d_render::Call)) -> u32) {
+    pub fn draw_calls(&mut self, target: &mut VgBuffer, pages: &mut [Page], produce: impl FnOnce(&dyn Fn(u32) -> Option<(f32, f32)>, &mut dyn FnMut(&bal2d_render::Call)) -> u32) {
         let sizes = page_sizes(pages);
         let page_count = pages.len();
-        let Renderer { path, path_matrix, image_matrix, stats, fp32, pattern_mode, .. } = self;
-        let mut sink = Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode: *pattern_mode, clut_page: usize::MAX };
+        let Renderer { path, path_matrix, image_matrix, stats, fp32, pattern_mode, offset, clip, stream, .. } = self;
+        let mut sink = Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode: *pattern_mode, clut_page: usize::MAX, offset: *offset, clip: *clip, stream };
         let size = |p: u32| ((p as usize) < page_count.min(16)).then(|| sizes[p as usize]);
         let triangles = produce(&size, &mut |call| sink.submit(target, pages, call));
+        sink.carry(target, pages);
         sink.stats.triangles += triangles;
     }
 
-    /// Submits what is queued without waiting.
+    /// Submits what is queued (waiting only for a free command buffer).
     pub fn flush(&mut self) {
-        let rc = fw::vg_flush();
-        if rc != 0 {
-            self.stats.errors += 1;
-            self.stats.last_error = rc;
-        }
+        timed_flush(&mut self.stats);
     }
 
     pub fn finish(&mut self) {

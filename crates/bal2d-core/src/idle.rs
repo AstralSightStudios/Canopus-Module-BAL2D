@@ -24,9 +24,16 @@ pub struct IdleLayer {
     /// Per shape: the page and blend it draws with, and its attachment's triangles are
     /// `shapes[s].tris` of the attachment (checked at load).
     geo: Vec<(u32, BlendMode)>,
-    /// Per shape: the distinct vertices its triangles use (`verts[vert_at[s]..vert_at[s + 1]]`).
+    /// Per shape: the vertices it is drawn with (`verts[vert_at[s]..vert_at[s + 1]]`): those of
+    /// its outline, or of all its triangles when it has none.
     verts: Vec<u16>,
     vert_at: Vec<u32>,
+    /// Per shape: the outline of its triangles (`outline[outline_at[s]..outline_at[s + 1]]`,
+    /// closed loops of vertices, `u16::MAX` after each), empty when it is drawn as triangles. One
+    /// polygon is far less path data than its triangles (the driver copies every byte into an
+    /// uncached command buffer), fewer edges for the GPU, and no seams inside it.
+    outline: Vec<u16>,
+    outline_at: Vec<u32>,
     path: Vec<i16>,
     /// Per vertex of the attachment being drawn: summed positions (path units) and count, then
     /// the averaged position.
@@ -46,12 +53,15 @@ impl IdleLayer {
         let n = bake.shapes.len();
         let total: usize = bake.shapes.iter().map(|s| s.tris.len() * 3).sum();
         // Fallible: the watch loads this last, into whatever memory is left.
-        let (mut geo, mut all, mut vert_at) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut geo, mut all, mut vert_at, mut outline, mut outline_at) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         geo.try_reserve_exact(n).ok()?;
         all.try_reserve_exact(total).ok()?;
         vert_at.try_reserve_exact(n + 1).ok()?;
+        outline_at.try_reserve_exact(n + 1).ok()?;
         let mut used: Vec<u16> = Vec::new();
+        let mut scratch = OutlineScratch::default();
         vert_at.push(0u32);
+        outline_at.push(0u32);
         for s in &bake.shapes {
             let slot = data.slots.get(s.slot as usize)?;
             let (page, tris, verts) = geometry(data, s.attachment)?;
@@ -60,15 +70,23 @@ impl IdleLayer {
             }
             geo.push((page, slot.blend));
             used.clear();
-            for &t in &s.tris {
-                used.extend_from_slice(&tris[t as usize * 3..t as usize * 3 + 3]);
+            let start = outline.len();
+            if outline_of(tris, &s.tris, &mut scratch, &mut outline) {
+                used.extend(outline[start..].iter().copied().filter(|&v| v != u16::MAX));
+            } else {
+                outline.truncate(start);
+                for &t in &s.tris {
+                    used.extend_from_slice(&tris[t as usize * 3..t as usize * 3 + 3]);
+                }
             }
+            outline_at.push(outline.len() as u32);
             used.sort_unstable();
             used.dedup();
             all.extend_from_slice(&used);
             vert_at.push(all.len() as u32);
         }
         all.shrink_to_fit();
+        outline.shrink_to_fit();
         let live_skip: Vec<Vec<bool>> = bake
             .live
             .iter()
@@ -91,6 +109,8 @@ impl IdleLayer {
             geo,
             verts: all,
             vert_at,
+            outline,
+            outline_at,
             path: Vec::new(),
             acc: Vec::new(),
             fixed: Vec::new(),
@@ -264,7 +284,8 @@ impl IdleLayer {
                 let shape = &self.bake.shapes[c.shape as usize];
                 let path = &mut self.path;
                 path.clear();
-                path.reserve(shape.tris.len() * 10 + 2);
+                let loops = &self.outline[self.outline_at[c.shape as usize] as usize..self.outline_at[c.shape as usize + 1] as usize];
+                path.reserve(if loops.is_empty() { shape.tris.len() * 10 + 2 } else { loops.len() * 3 + 2 });
                 let (mut lo, mut hi) = ([i16::MAX; 2], [i16::MIN; 2]);
                 for &v in &self.verts[self.vert_at[c.shape as usize] as usize..self.vert_at[c.shape as usize + 1] as usize] {
                     let q = self.fixed[v as usize];
@@ -274,10 +295,24 @@ impl IdleLayer {
                 if hi[0] < 0 || hi[1] < 0 || lo[0] > lx || lo[1] > ly {
                     continue;
                 }
-                for &t in &shape.tris {
-                    let t = t as usize * 3;
-                    let (p, q, r) = (self.fixed[tris[t] as usize], self.fixed[tris[t + 1] as usize], self.fixed[tris[t + 2] as usize]);
-                    path.extend_from_slice(&[PATH_MOVE as i16, p[0], p[1], PATH_LINE as i16, q[0], q[1], PATH_LINE as i16, r[0], r[1], PATH_CLOSE as i16]);
+                if loops.is_empty() {
+                    for &t in &shape.tris {
+                        let t = t as usize * 3;
+                        let (p, q, r) = (self.fixed[tris[t] as usize], self.fixed[tris[t + 1] as usize], self.fixed[tris[t + 2] as usize]);
+                        path.extend_from_slice(&[PATH_MOVE as i16, p[0], p[1], PATH_LINE as i16, q[0], q[1], PATH_LINE as i16, r[0], r[1], PATH_CLOSE as i16]);
+                    }
+                } else {
+                    let mut first = true;
+                    for &v in loops {
+                        if v == u16::MAX {
+                            path.push(PATH_CLOSE as i16);
+                            first = true;
+                            continue;
+                        }
+                        let q = self.fixed[v as usize];
+                        path.extend_from_slice(&[if first { PATH_MOVE } else { PATH_LINE } as i16, q[0], q[1]]);
+                        first = false;
+                    }
                 }
                 if hi[0] < 0 || hi[1] < 0 || lo[0] > lx || lo[1] > ly || path.is_empty() {
                     continue;
@@ -295,6 +330,80 @@ impl IdleLayer {
         }
         triangles
     }
+}
+
+/// Reused buffers for `outline_of`.
+#[derive(Default)]
+struct OutlineScratch {
+    edges: Vec<(u16, u16, bool)>,
+    boundary: Vec<(u16, u16)>,
+    used: Vec<bool>,
+}
+
+/// Appends to `out` the outline of the triangles `sel` (indices into `tris`, an attachment's
+/// triangles): closed loops of vertices, `u16::MAX` after each, every edge directed as in its
+/// triangle, so the loops filled non-zero cover exactly the triangles' union (holes included,
+/// mirrored or not). False (and `out` partly written) when the triangles do not make one: an edge
+/// shared the same way round or by more than two (folded or inconsistently wound), or loops
+/// that do not close.
+fn outline_of(tris: &[u16], sel: &[u16], s: &mut OutlineScratch, out: &mut Vec<u16>) -> bool {
+    s.edges.clear();
+    for &t in sel {
+        let t = t as usize * 3;
+        let v = [tris[t], tris[t + 1], tris[t + 2]];
+        for k in 0..3 {
+            let (a, b) = (v[k], v[(k + 1) % 3]);
+            if a == b {
+                return false;
+            }
+            s.edges.push((a.min(b), a.max(b), a < b));
+        }
+    }
+    s.edges.sort_unstable();
+    s.boundary.clear();
+    let mut i = 0;
+    while i < s.edges.len() {
+        let mut j = i + 1;
+        while j < s.edges.len() && (s.edges[j].0, s.edges[j].1) == (s.edges[i].0, s.edges[i].1) {
+            j += 1;
+        }
+        match j - i {
+            1 => {
+                let (lo, hi, up) = s.edges[i];
+                s.boundary.push(if up { (lo, hi) } else { (hi, lo) });
+            }
+            2 if s.edges[i].2 != s.edges[i + 1].2 => {}
+            _ => return false,
+        }
+        i = j;
+    }
+    // Chain the directed boundary edges into loops (sorted by start: the next edge out of a
+    // vertex is found by binary search).
+    s.boundary.sort_unstable();
+    s.used.clear();
+    s.used.resize(s.boundary.len(), false);
+    for e in 0..s.boundary.len() {
+        if s.used[e] {
+            continue;
+        }
+        let (start, mut at) = s.boundary[e];
+        s.used[e] = true;
+        out.push(start);
+        let mut steps = 0;
+        while at != start {
+            let k = s.boundary.partition_point(|x| x.0 < at);
+            let Some(n) = (k..s.boundary.len()).take_while(|&n| s.boundary[n].0 == at).find(|&n| !s.used[n]) else { return false };
+            s.used[n] = true;
+            out.push(at);
+            at = s.boundary[n].1;
+            steps += 1;
+            if steps > s.boundary.len() {
+                return false;
+            }
+        }
+        out.push(u16::MAX);
+    }
+    !s.boundary.is_empty()
 }
 
 fn clamp16(v: f32) -> i16 {
@@ -331,4 +440,68 @@ pub fn wrap(x: f32, p: f32) -> f32 {
         t += p;
     }
     if t >= p { 0.0 } else { t }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Triangles of a `n` x `n` grid of quads (vertices row-major, (n + 1)^2), all one way round.
+    fn grid(n: u16, skip: &[(u16, u16)]) -> Vec<u16> {
+        let w = n + 1;
+        let mut t = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                if skip.contains(&(x, y)) {
+                    continue;
+                }
+                let (a, b, c, d) = (y * w + x, y * w + x + 1, (y + 1) * w + x + 1, (y + 1) * w + x);
+                t.extend_from_slice(&[a, b, c, a, c, d]);
+            }
+        }
+        t
+    }
+
+    fn loops(tris: &[u16]) -> Option<Vec<Vec<u16>>> {
+        let sel: Vec<u16> = (0..(tris.len() / 3) as u16).collect();
+        let mut out = Vec::new();
+        if !outline_of(tris, &sel, &mut OutlineScratch::default(), &mut out) {
+            return None;
+        }
+        Some(out.split(|&v| v == u16::MAX).filter(|l| !l.is_empty()).map(|l| l.to_vec()).collect())
+    }
+
+    #[test]
+    fn a_grid_has_one_outline_around_its_border() {
+        let l = loops(&grid(2, &[])).unwrap();
+        assert_eq!(l.len(), 1);
+        let mut v = l[0].clone();
+        v.sort_unstable();
+        // The 8 border vertices of a 3 x 3 vertex grid; the centre (4) is inside.
+        assert_eq!(v, [0, 1, 2, 3, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn a_hole_is_a_second_loop_the_other_way_round() {
+        let l = loops(&grid(3, &[(1, 1)])).unwrap();
+        assert_eq!(l.len(), 2);
+        let area = |l: &[u16]| -> i32 {
+            let p = |v: u16| ((v % 4) as i32, (v / 4) as i32);
+            (0..l.len()).map(|i| {
+                let (a, b) = (p(l[i]), p(l[(i + 1) % l.len()]));
+                a.0 * b.1 - b.0 * a.1
+            }).sum()
+        };
+        let (a0, a1) = (area(&l[0]), area(&l[1]));
+        assert!(a0.signum() == -a1.signum(), "outer and hole wind opposite ways: {a0} {a1}");
+        assert_eq!(a0.abs() + a1.abs(), 2 * (9 + 1));
+    }
+
+    #[test]
+    fn inconsistent_or_folded_triangles_have_no_outline() {
+        // The same edge used the same way round twice (one triangle flipped).
+        assert!(loops(&[0, 1, 2, 0, 2, 3, 0, 3, 2]).is_none());
+        // A degenerate triangle.
+        assert!(loops(&[0, 0, 1]).is_none());
+    }
 }

@@ -62,6 +62,11 @@ pub mod options {
     /// half for very heavy frames). Faster animation; whether the phone link and the watch's own
     /// UI stay responsive with that little is what it is for finding out on a real watch.
     pub const FLUENT: u8 = 2;
+    /// Draw every frame into the module's own buffer, which LVGL then copies to the screen (the
+    /// way before direct drawing): for comparing the two on a real watch.
+    pub const CLASSIC: u8 = 4;
+    /// Every draw through the driver one by one (no batched command streams): for comparing.
+    pub const SINGLE: u8 = 8;
 }
 
 /// The firmware a module build runs on (`HELLO`): the phone compiles packs for it.

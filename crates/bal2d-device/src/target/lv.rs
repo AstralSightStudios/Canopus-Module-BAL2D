@@ -295,3 +295,94 @@ pub fn now_ms() -> u32 {
     let ctx = crate::module::context();
     unsafe { ((*(*ctx).time).monotonic_ms)(ctx as *const _) }
 }
+
+/// LVGL 9 colour formats (`lv_color_format_t`) of draw buffers.
+pub mod cf {
+    pub const RGB888: u8 = 0x0F;
+    pub const ARGB8888: u8 = 0x10;
+    pub const XRGB8888: u8 = 0x11;
+    pub const RGB565: u8 = 0x12;
+}
+
+/// LVGL's DRAW_MAIN event code (twelve before DELETE in LVGL 9.2's list) and COVER_CHECK.
+pub const EVENT_COVER_CHECK: u32 = 21;
+pub const EVENT_DRAW_MAIN: u32 = 24;
+/// `lv_cover_res_t`.
+pub const COVER_RES_COVER: i32 = 0;
+pub const COVER_RES_MASKED: i32 = 2;
+
+/// The layer a DRAW_MAIN event draws into: its buffer and where it is on the screen.
+pub struct DrawLayer {
+    pub data: *mut u8,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub cf: u8,
+    /// `buf_area` and the current clip area, absolute coordinates (x1, y1, x2, y2 inclusive).
+    pub area: [i32; 4],
+    pub clip: [i32; 4],
+}
+
+/// `lv_event_t` (LVGL 9): current_target, original_target, code, user_data, param.
+const EVENT_CODE: usize = 8;
+const EVENT_PARAM: usize = 16;
+
+/// The draw layer of a DRAW_MAIN event (`lv_event_get_layer`), when it has a buffer that
+/// looks like one. `lv_layer_t`: draw_buf, buf_area (4 x i32), color_format (u8), _clip_area
+/// (4 x i32 at +24). `lv_draw_buf_t`: header {magic 0x19, cf, flags | w, h | stride, _},
+/// data_size, data (+16).
+pub unsafe fn draw_layer(e: *mut c_void) -> Option<DrawLayer> {
+    if e.is_null() {
+        return None;
+    }
+    let e = e as *const u8;
+    let code = unsafe { core::ptr::read_volatile(e.add(EVENT_CODE) as *const u32) } & 0xFF;
+    if code != EVENT_DRAW_MAIN {
+        return None;
+    }
+    let layer = unsafe { core::ptr::read_volatile(e.add(EVENT_PARAM) as *const *const u8) };
+    if layer.is_null() {
+        return None;
+    }
+    let buf = unsafe { core::ptr::read_volatile(layer as *const *const u8) };
+    if buf.is_null() {
+        return None;
+    }
+    let word = |base: *const u8, at: usize| unsafe { core::ptr::read_volatile(base.add(at) as *const u32) };
+    let h0 = word(buf, 0);
+    if h0 & 0xFF != 0x19 {
+        return None;
+    }
+    let (w, h, stride) = (word(buf, 4) & 0xFFFF, word(buf, 4) >> 16, word(buf, 8) & 0xFFFF);
+    let data = word(buf, 16) as usize as *mut u8;
+    let i = |at: usize| word(layer, at) as i32;
+    let area = [i(4), i(8), i(12), i(16)];
+    let clip = [i(24), i(28), i(32), i(36)];
+    // The buffer is the area's size (a layer that is not would be read wrong).
+    if data.is_null() || w == 0 || h == 0 || area[2] - area[0] + 1 != w as i32 || area[3] - area[1] + 1 != h as i32 {
+        return None;
+    }
+    Some(DrawLayer { data, width: w, height: h, stride, cf: ((h0 >> 8) & 0xFF) as u8, area, clip })
+}
+
+/// `lv_cover_check_info_t` of a COVER_CHECK event: {res, area}.
+pub unsafe fn cover_check(e: *mut c_void) -> Option<(*mut i32, [i32; 4])> {
+    if e.is_null() {
+        return None;
+    }
+    let e = e as *const u8;
+    let code = unsafe { core::ptr::read_volatile(e.add(EVENT_CODE) as *const u32) } & 0xFF;
+    if code != EVENT_COVER_CHECK {
+        return None;
+    }
+    let info = unsafe { core::ptr::read_volatile(e.add(EVENT_PARAM) as *const *mut u8) };
+    if info.is_null() {
+        return None;
+    }
+    let area = unsafe { core::ptr::read_volatile(info.add(4) as *const *const i32) };
+    if area.is_null() {
+        return None;
+    }
+    let a = unsafe { [*area, *area.add(1), *area.add(2), *area.add(3)] };
+    Some((info as *mut i32, a))
+}

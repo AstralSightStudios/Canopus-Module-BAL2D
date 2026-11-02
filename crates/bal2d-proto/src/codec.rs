@@ -122,7 +122,8 @@ pub struct Stats {
     /// The shown pack, 0 for none.
     pub pack: u32,
     /// Bit 0: the baked background is in use; bit 1: the view is attached; bit 2: visible;
-    /// bit 3: a pack is loading; bits 8..15: why the last load failed (errno-like, 0: it did
+    /// bit 3: a pack is loading; bit 4: the baked idle is playing; bit 5: frames are drawn
+    /// straight into LVGL's layer (direct mode); bits 8..15: why the last load failed (errno-like, 0: it did
     /// not: 2 no pack, 5 / 22 unreadable, 12 out of memory); bits 16..23: the GPU self-test
     /// (16 ran, 17 could not check, 18 FP32 paths, 19 non-cached writes, 20 32-bit pages,
     /// 21 no PAD edges, 22 blend results off, 23 other results off).
@@ -137,10 +138,15 @@ pub struct Stats {
     /// timer fired past that (0 from older modules).
     pub idle_ms: u32,
     pub late_ms: u32,
+    /// Part of `draw_ms` the CPU waited in `vg_lite_flush` for the GPU (it was that far
+    /// behind), and LVGL's redraws of an unchanged frame in the last second (direct mode: each
+    /// draws the scene again). 0 from older modules.
+    pub flush_ms: u32,
+    pub redraws: u32,
 }
 
 impl Stats {
-    const WORDS: usize = 16;
+    const WORDS: usize = 18;
     /// Words every reply has (`ui_ms` came later).
     const REQUIRED: usize = 12;
 
@@ -162,6 +168,8 @@ impl Stats {
             self.selftest,
             self.idle_ms,
             self.late_ms,
+            self.flush_ms,
+            self.redraws,
         ]
     }
 
@@ -183,6 +191,8 @@ impl Stats {
             selftest: w[13],
             idle_ms: w[14],
             late_ms: w[15],
+            flush_ms: w[16],
+            redraws: w[17],
         }
     }
 }

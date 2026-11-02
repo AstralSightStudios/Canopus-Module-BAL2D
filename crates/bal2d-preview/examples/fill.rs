@@ -19,7 +19,9 @@ fn main() {
         let mut slots = Vec::new();
         let mut blends = Vec::new();
         let mut opaque = 0usize;
+        let mut path_bytes = 0usize;
         pv.idle_calls(li, |call, tex| {
+            path_bytes += call.path.len() * 2;
             slots.push(bal2d_preview::raster::draw_call(&mut fb, call, tex));
             blends.push((call.blend, call.color[3]));
             let (n, lo) = bal2d_preview::raster::call_coverage((w, h), call, tex);
@@ -42,7 +44,7 @@ fn main() {
         }
         let sum: usize = slots.iter().sum();
         total += sum;
-        println!("layer {li}: {} calls, {} pixels ({:.1} screens)", slots.len(), sum, sum as f32 / (w * h) as f32);
+        println!("layer {li}: {} calls, {} pixels ({:.1} screens), {} bytes of path data", slots.len(), sum, sum as f32 / (w * h) as f32, path_bytes);
 
     }
     let mut v: Vec<_> = by_slot.into_iter().collect();
