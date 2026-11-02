@@ -101,6 +101,12 @@ pub struct UiState {
     /// While compiling: what it is doing and the percent done.
     pub progress: Option<(String, u32)>,
     pub transfer: Option<Transfer>,
+    /// The framing editor: the scene overview, a camera per phase, the phase shown, and a drag
+    /// on the box (resizing, last pointer position in CSS pixels).
+    pub overview: Option<crate::framing::Overview>,
+    pub framing: Option<crate::framing::Framing>,
+    pub frame_phase: u8,
+    pub frame_drag: Option<(bool, f32, f32)>,
     pub status: String,
     pub error: bool,
     pub face: FaceState,

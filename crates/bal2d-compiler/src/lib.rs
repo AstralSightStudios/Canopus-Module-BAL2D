@@ -101,6 +101,9 @@ pub struct Options {
     pub name: String,
     /// Composite the static bottom of the scene into one image (see `bake`).
     pub bake: bool,
+    /// Keep every layer: no probe compile to find layers that never show (faster; for
+    /// overviews of the whole scene).
+    pub keep_layers: bool,
 }
 
 impl Default for Options {
@@ -120,6 +123,7 @@ impl Default for Options {
             intro_weight: 0.4,
             name: String::new(),
             bake: true,
+            keep_layers: false,
         }
     }
 }
@@ -644,7 +648,7 @@ pub fn compile_progress(
     interactions: Option<Interactions>,
     report: &mut dyn FnMut(Stage, f32),
 ) -> Result<(Vec<u8>, Report), String> {
-    if inputs.len() < 2 || std::env::var("BAL2D_KEEP_LAYERS").is_ok() {
+    if inputs.len() < 2 || opts.keep_layers || std::env::var("BAL2D_KEEP_LAYERS").is_ok() {
         return compile_once(inputs, opts, interactions, &mut Progress { report, lo: 0.0, hi: 1.0 });
     }
     // A probe compile finds the layers that never show; the final one leaves them out.

@@ -32,6 +32,19 @@ const EV_FACE_Z: &str = "input:face.z";
 const EV_FACE_PATCH: &str = "action:face.patch";
 const EV_FACE_QUEUE: &str = "action:face.queue";
 const EV_FACE_SAVE: &str = "action:face.save";
+const EV_FRAME_OPEN: &str = "action:frame.open";
+const EV_FRAME_PHASE: &str = "action:frame.phase.";
+const EV_FRAME_OWN: &str = "action:frame.own";
+const EV_FRAME_RESET: &str = "action:frame.reset";
+const EV_FRAME_MOVE: &str = "pointer:frame.move";
+const EV_FRAME_RESIZE: &str = "pointer:frame.resize";
+const EV_FRAME_DRAG: &str = "pointer:frame.drag";
+const EV_FRAME_UP: &str = "pointer:frame.up";
+const EV_FRAME_ZOOM: &str = "input:frame.zoom";
+const EV_FRAME_X: &str = "input:frame.x";
+const EV_FRAME_Y: &str = "input:frame.y";
+/// The box is redrawn at most this often while dragged (ms): each redraw sends the whole page.
+const FRAME_REDRAW_MS: u128 = 40;
 
 mod tone {
     pub const TEXT: &str = "var(--gray-12)";
@@ -47,6 +60,61 @@ mod tone {
 struct Payload {
     #[serde(default)]
     value: Option<String>,
+    #[serde(default, rename = "clientX")]
+    client_x: Option<f64>,
+    #[serde(default, rename = "clientY")]
+    client_y: Option<f64>,
+}
+
+static FRAME_DRAWN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// The camera of the phase shown (its own, else the idle one).
+fn frame_camera(s: &UiState) -> Option<bal2d_compiler::Camera> {
+    let f = s.framing?;
+    f[s.frame_phase as usize].or(f[bal2d_pack::phase::IDLE as usize])
+}
+
+/// Sets the shown phase's camera (giving the phase its own framing).
+fn set_frame_camera(s: &mut UiState, c: bal2d_compiler::Camera) {
+    if let Some(f) = &mut s.framing {
+        f[s.frame_phase as usize] = Some(c);
+        s.built = None;
+    }
+}
+
+/// Pointer events of the framing box. Returns whether to redraw now.
+fn frame_pointer(event: &str, p: &Payload) -> bool {
+    let (Some(x), Some(y)) = (p.client_x, p.client_y) else { return event == EV_FRAME_UP };
+    let (x, y) = (x as f32, y as f32);
+    match event {
+        // The handle sits inside the box: its press arrives first, then the box's (same point).
+        EV_FRAME_RESIZE => state::with_state(|s| s.frame_drag = Some((true, x, y))),
+        EV_FRAME_MOVE => state::with_state(|s| {
+            if !matches!(s.frame_drag, Some((true, px, py)) if px == x && py == y) {
+                s.frame_drag = Some((false, x, y));
+            }
+        }),
+        EV_FRAME_DRAG => {
+            let moved = state::with_state(|s| {
+                let (Some((resize, lx, ly)), Some(o), Some(c)) = (s.frame_drag, s.overview.clone(), frame_camera(s)) else { return false };
+                let next = if resize { crate::framing::resized(&o, c, x - lx, y - ly) } else { crate::framing::moved(&o, c, x - lx, y - ly) };
+                set_frame_camera(s, next);
+                s.frame_drag = Some((resize, x, y));
+                true
+            });
+            if !moved {
+                return false;
+            }
+            let mut last = FRAME_DRAWN.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|t| t.elapsed().as_millis() < FRAME_REDRAW_MS) {
+                return false;
+            }
+            *last = Some(std::time::Instant::now());
+            return true;
+        }
+        _ => state::with_state(|s| s.frame_drag = None),
+    }
+    true
 }
 
 pub fn render_main_ui(root: &str) {
@@ -67,8 +135,45 @@ fn screen(s: &UiState) -> Option<(u32, u32)> {
 }
 
 pub async fn on_event(event: &str, payload: &str) {
-    let value = serde_json::from_str::<Payload>(payload).unwrap_or_default().value.unwrap_or_default();
+    let parsed = serde_json::from_str::<Payload>(payload).unwrap_or_default();
+    if event.starts_with("pointer:frame.") {
+        if frame_pointer(event, &parsed) {
+            rerender();
+        }
+        return;
+    }
+    let value = parsed.value.clone().unwrap_or_default();
     match event {
+        EV_FRAME_OPEN => open_framing().await,
+        e if e.starts_with(EV_FRAME_PHASE) => state::with_state(|s| s.frame_phase = e[EV_FRAME_PHASE.len()..].parse().unwrap_or(0)),
+        EV_FRAME_OWN => state::with_state(|s| {
+            let p = s.frame_phase as usize;
+            if p != bal2d_pack::phase::IDLE as usize {
+                if let Some(f) = &mut s.framing {
+                    f[p] = if f[p].is_some() { None } else { f[bal2d_pack::phase::IDLE as usize] };
+                    s.built = None;
+                }
+            }
+        }),
+        EV_FRAME_RESET => state::with_state(|s| {
+            let p = s.frame_phase as usize;
+            let default = s.overview.as_ref().map(|o| o.default);
+            if let Some(f) = &mut s.framing {
+                f[p] = if p == bal2d_pack::phase::IDLE as usize { default } else { None };
+                s.built = None;
+            }
+        }),
+        EV_FRAME_ZOOM | EV_FRAME_X | EV_FRAME_Y => state::with_state(|s| {
+            let (Some(o), Some(c)) = (s.overview.clone(), frame_camera(s)) else { return };
+            let Ok(v) = value.parse::<f32>() else { return };
+            let (x, y, w, h) = crate::framing::frame_rect(&o, c);
+            let next = match event {
+                EV_FRAME_ZOOM => crate::framing::zoomed(&o, c, v),
+                EV_FRAME_X => crate::framing::centred(&o, c, v, y + h * 0.5),
+                _ => crate::framing::centred(&o, c, x + w * 0.5, v),
+            };
+            set_frame_camera(s, next);
+        }),
         EV_NAME => return state::with_state(|s| s.name = value),
         EV_ZOOM => {
             state::with_state(|s| {
@@ -114,6 +219,8 @@ pub async fn on_event(event: &str, payload: &str) {
         EV_CLEAR => state::with_state(|s| {
             s.assets.clear();
             s.built = None;
+            s.overview = None;
+            s.framing = None;
             s.name.clear();
             s.status.clear();
         }),
@@ -212,6 +319,8 @@ async fn add_files() {
     state::with_state(|s| {
         s.assets = assets;
         s.built = None;
+        s.overview = None;
+        s.framing = None;
         if s.name.is_empty() {
             s.name = suggested;
         }
@@ -235,7 +344,14 @@ async fn build() {
     });
     state::set_status("", false);
     rerender();
-    let req = assets::BuildRequest { assets: s.assets.clone(), name: s.name.clone(), screen: size, zoom: s.zoom, high_quality: s.high_quality };
+    let req = assets::BuildRequest {
+        assets: s.assets.clone(),
+        name: s.name.clone(),
+        screen: size,
+        zoom: s.zoom,
+        high_quality: s.high_quality,
+        framing: s.framing,
+    };
     // Each step is shown as it starts (the compile runs in this call; the UI is redrawn from here).
     let mut shown = (String::new(), u32::MAX);
     let result = assets::build(&req, &mut |label, f| {
@@ -257,6 +373,47 @@ async fn build() {
             }
             Err(e) => {
                 st.built = None;
+                st.status = e;
+                st.error = true;
+            }
+        }
+    });
+}
+
+/// Generates the scene overview for the framing editor (a small compile, then a frame of each
+/// phase), showing progress like a build.
+async fn open_framing() {
+    let s = state::snapshot();
+    let Some(size) = screen(&s) else {
+        state::set_status("请先连接手表：取景按手表的屏幕比例进行。", true);
+        return;
+    };
+    state::with_state(|s| {
+        s.busy = true;
+        s.progress = Some(("生成场景预览".into(), 0));
+    });
+    state::set_status("", false);
+    rerender();
+    let mut shown = (String::new(), u32::MAX);
+    let result = crate::framing::overview(&s.assets, size, &mut |label, f| {
+        let percent = (f * 100.0) as u32;
+        if label != shown.0 || percent != shown.1 {
+            shown = (label.to_string(), percent);
+            state::with_state(|s| s.progress = Some((label.to_string(), percent)));
+            rerender();
+        }
+    });
+    state::with_state(|st| {
+        st.busy = false;
+        st.progress = None;
+        match result {
+            Ok((o, f)) => {
+                st.overview = Some(o);
+                st.framing = Some(f);
+                st.frame_phase = bal2d_pack::phase::IDLE;
+                st.built = None;
+            }
+            Err(e) => {
                 st.status = e;
                 st.error = true;
             }
@@ -460,12 +617,7 @@ fn import_tab(s: &UiState) -> View {
             ),
         )
         .child(
-            row()
-                .child(field(
-                    "取景",
-                    select(EV_ZOOM, &s.zoom.to_string(), &[("80", "远一些 80%"), ("100", "标准 100%"), ("120", "近一些 120%"), ("140", "特写 140%")]),
-                ))
-                .child(field(
+            row().child(field(
                     "画质",
                     select(
                         EV_QUALITY,
@@ -481,7 +633,7 @@ fn import_tab(s: &UiState) -> View {
                 .child(View::new(Kind::Progress, None).prop("value", &percent.to_string()).prop("max", "100").prop("size", "2"))
         }))
         .maybe(s.hello.is_none().then(|| text("连接手表后才能编译：角色包按手表的屏幕尺寸生成。", 12, tone::MUTED)));
-    let mut out = stack(16).child(assets_card).child(settings);
+    let mut out = stack(16).child(assets_card).maybe((!s.assets.is_empty()).then(|| framing_card(s))).child(settings);
     if let Some(b) = &s.built {
         let mut c = card()
             .child(row().child(heading(&format!("预览 · {}", b.name)).grow()).child(badge(&format!("{}×{}", b.screen.0, b.screen.1), "gray")))
@@ -517,6 +669,92 @@ fn import_tab(s: &UiState) -> View {
         out = out.child(c);
     }
     out
+}
+
+/// The framing editor: the scene with the watch-shaped box over it, per phase.
+fn framing_card(s: &UiState) -> View {
+    use bal2d_pack::phase;
+    const ACCENT: &str = "var(--accent-9)";
+    let (Some(o), Some(f)) = (&s.overview, s.framing) else {
+        let can = !s.busy && s.hello.is_some() && s.transfer.is_none();
+        return card()
+            .child(heading("取景"))
+            .child(text(
+                "默认按头部居中取景。打开取景器可以看到整个场景，拖动方框决定手环屏幕上显示哪一部分；开场、对话、摸头还可以各用一个取景，手环上会在这些阶段之间平滑切换。",
+                13,
+                tone::MUTED,
+            ))
+            .child(row().child(button("打开取景器", EV_FRAME_OPEN, "soft").disabled_if(!can)));
+    };
+    let p = s.frame_phase;
+    let mut tabs = row();
+    for ph in [phase::IDLE, phase::INTRO, phase::TALK, phase::TOUCH] {
+        let own = ph != phase::IDLE && f[ph as usize].is_some();
+        let label = format!("{}{}", crate::framing::phase_name(ph), if own { " ·单独" } else { "" });
+        tabs = tabs.child(
+            button(&label, &format!("{EV_FRAME_PHASE}{ph}"), if ph == p { "solid" } else { "soft" }).disabled_if(o.frames[ph as usize].is_none()),
+        );
+    }
+    let own = f[p as usize].is_some();
+    let cam = f[p as usize].or(f[phase::IDLE as usize]).unwrap_or(o.default);
+    let (x, y, w, h) = crate::framing::frame_rect(o, cam);
+    let image = o.frames[p as usize].as_deref().or(o.frames[phase::IDLE as usize].as_deref()).unwrap_or("");
+    let handle = View::new(Kind::Div, None)
+        .absolute()
+        .translate(w - 12.0, h - 12.0)
+        .width(22)
+        .height(22)
+        .radius(11)
+        .bg(ACCENT)
+        .on(On::PointerDown, EV_FRAME_RESIZE);
+    let frame = View::new(Kind::Div, None)
+        .absolute()
+        .translate(x, y)
+        .width(w.max(1.0) as u32)
+        .height(h.max(1.0) as u32)
+        .border(2, ACCENT)
+        .z_index(1)
+        .on(On::PointerDown, EV_FRAME_MOVE)
+        .child(handle);
+    let scene = View::new(Kind::Div, None)
+        .relative()
+        .width(o.size.0)
+        .height(o.size.1)
+        .bg("#000")
+        .on(On::PointerMove, EV_FRAME_DRAG)
+        .on(On::PointerUp, EV_FRAME_UP)
+        .on(On::MouseLeave, EV_FRAME_UP)
+        .child(View::new(Kind::Image, Some(image)).absolute().width(o.size.0).height(o.size.1).opacity(0.85))
+        .child(frame);
+    let slider = |label: &str, event: &str, min: f32, max: f32, step: f32, v: f32| {
+        field(
+            label,
+            View::new(Kind::Slider, None)
+                .width_full()
+                .prop("min", &format!("{min}"))
+                .prop("max", &format!("{max}"))
+                .prop("step", &format!("{step}"))
+                .prop("value", &format!("{}", v.clamp(min, max).round()))
+                .prop("key", &format!("{event}.{p}"))
+                .on(On::Change, event),
+        )
+    };
+    let zoom = cam.scale / o.default.scale * 100.0;
+    let mut c = card()
+        .child(row().child(heading("取景").grow()).child(button("恢复默认", EV_FRAME_RESET, "ghost")))
+        .child(tabs);
+    if p != phase::IDLE {
+        c = c.child(
+            row()
+                .child(text(if own { "这一阶段使用单独的取景。" } else { "这一阶段沿用待机的取景（拖动方框即改为单独取景）。" }, 13, tone::MUTED).grow())
+                .child(button(if own { "改为沿用待机" } else { "单独取景" }, EV_FRAME_OWN, "soft")),
+        );
+    }
+    c.child(View::new(Kind::Div, None).row().justify_center().child(scene))
+        .child(text("方框就是手环屏幕显示的范围：拖动方框移动，拖动右下角的圆点缩放；也可以用下面的滑块。", 12, tone::MUTED))
+        .child(slider("缩放（%）", EV_FRAME_ZOOM, 20.0, 600.0, 5.0, zoom))
+        .child(slider("左右", EV_FRAME_X, 0.0, o.size.0 as f32, 1.0, x + w * 0.5))
+        .child(slider("上下", EV_FRAME_Y, 0.0, o.size.1 as f32, 1.0, y + h * 0.5))
 }
 
 fn watch_tab(s: &UiState) -> View {

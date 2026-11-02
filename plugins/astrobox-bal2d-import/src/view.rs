@@ -29,6 +29,7 @@ pub enum Kind {
     MenuSeparator,
     Separator,
     Badge,
+    Slider,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +37,10 @@ pub enum On {
     Click,
     Change,
     Input,
+    PointerDown,
+    PointerMove,
+    PointerUp,
+    MouseLeave,
 }
 
 /// One style setter of `ui::Element`, with its argument.
@@ -64,6 +69,12 @@ enum Style {
     Grow(f32),
     Shrink(f32),
     Disabled,
+    Relative,
+    Absolute,
+    Transform(String),
+    Border(u32, String),
+    ZIndex(i32),
+    Opacity(f32),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -202,6 +213,32 @@ impl View {
         self.style(Style::Grow(1.0)).style(Style::MinWidth(0))
     }
 
+    pub fn relative(self) -> Self {
+        self.style(Style::Relative)
+    }
+
+    /// Absolutely placed at the parent's top-left; move it with `translate`.
+    pub fn absolute(self) -> Self {
+        self.style(Style::Absolute)
+    }
+
+    /// Moved by (x, y) CSS pixels (either sign).
+    pub fn translate(self, x: f32, y: f32) -> Self {
+        self.style(Style::Transform(format!("translate({x:.1}px, {y:.1}px)")))
+    }
+
+    pub fn border(self, width: u32, color: &str) -> Self {
+        self.style(Style::Border(width, color.to_string()))
+    }
+
+    pub fn z_index(self, z: i32) -> Self {
+        self.style(Style::ZIndex(z))
+    }
+
+    pub fn opacity(self, opacity: f32) -> Self {
+        self.style(Style::Opacity(opacity))
+    }
+
     pub fn disabled(self) -> Self {
         self.style(Style::Disabled)
     }
@@ -252,6 +289,12 @@ impl View {
                 Style::Grow(value) => element.flex_grow(value),
                 Style::Shrink(value) => element.flex_shrink(value),
                 Style::Disabled => element.disabled(),
+                Style::Relative => element.relative(),
+                Style::Absolute => element.absolute().top(0).left(0),
+                Style::Transform(t) => element.transform(&t),
+                Style::Border(w, c) => element.border(w, &c),
+                Style::ZIndex(z) => element.z_index(z),
+                Style::Opacity(o) => element.opacity(o),
             };
         }
         for (event, id) in &self.events {
@@ -289,6 +332,7 @@ impl From<Kind> for ui::ElementType {
             Kind::MenuSeparator => ui::ElementType::DropdownMenuSeparator,
             Kind::Separator => ui::ElementType::Separator,
             Kind::Badge => ui::ElementType::Badge,
+            Kind::Slider => ui::ElementType::Slider,
         }
     }
 }
@@ -299,6 +343,10 @@ impl From<On> for ui::Event {
             On::Click => ui::Event::Click,
             On::Change => ui::Event::Change,
             On::Input => ui::Event::Input,
+            On::PointerDown => ui::Event::PointerDown,
+            On::PointerMove => ui::Event::PointerMove,
+            On::PointerUp => ui::Event::PointerUp,
+            On::MouseLeave => ui::Event::MouseLeave,
         }
     }
 }
@@ -353,6 +401,16 @@ impl View {
                 Style::Grow(v) => set("flex-grow", v.to_string()),
                 Style::Shrink(v) => set("flex-shrink", v.to_string()),
                 Style::Disabled => set("disabled", "true".into()),
+                Style::Relative => set("position", "relative".into()),
+                Style::Absolute => {
+                    set("position", "absolute".into());
+                    set("top", "0px".into());
+                    set("left", "0px".into());
+                }
+                Style::Transform(t) => set("transform", t.clone()),
+                Style::Border(w, c) => set("border", format!("{w}px solid {c}")),
+                Style::ZIndex(z) => set("z-index", z.to_string()),
+                Style::Opacity(o) => set("opacity", o.to_string()),
             }
         }
         let kind = match self.kind {
@@ -378,6 +436,7 @@ impl View {
             Kind::MenuSeparator => "DROPDOWN_MENU_SEPARATOR",
             Kind::Separator => "SEPARATOR",
             Kind::Badge => "BADGE",
+            Kind::Slider => "SLIDER",
         };
         let own_id = *id;
         let children: Vec<Value> = self.children.iter().map(|child| child.to_json(id)).collect();
@@ -393,7 +452,15 @@ impl View {
             "height": height,
             "event_listeners": self.events.iter().map(|(event, id)| json!({
                 "id": id,
-                "event": match event { On::Click => "CLICK", On::Change => "CHANGE", On::Input => "INPUT" },
+                "event": match event {
+                    On::Click => "CLICK",
+                    On::Change => "CHANGE",
+                    On::Input => "INPUT",
+                    On::PointerDown => "POINTERDOWN",
+                    On::PointerMove => "POINTERMOVE",
+                    On::PointerUp => "POINTERUP",
+                    On::MouseLeave => "MOUSELEAVE",
+                },
             })).collect::<Vec<_>>(),
             "children": children,
         })

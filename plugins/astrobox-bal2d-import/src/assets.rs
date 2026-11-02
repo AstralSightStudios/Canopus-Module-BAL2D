@@ -161,7 +161,7 @@ pub fn suggested_name(assets: &[Asset]) -> String {
 
 /// The prefab entry for the main skeleton in a community interaction dump (`interactions.json`:
 /// keys like `SpineLobbies/<lobby>/<skeleton>`), if one was added.
-fn interactions(assets: &[Asset], layers: &[LayerInput]) -> Option<bal2d_pack::Interactions> {
+pub(crate) fn interactions(assets: &[Asset], layers: &[LayerInput]) -> Option<bal2d_pack::Interactions> {
     let main = layers.last()?;
     let file = assets.iter().find(|a| a.kind == FileKind::Interactions)?;
     let text = std::str::from_utf8(&file.data).ok()?;
@@ -190,6 +190,8 @@ pub struct BuildRequest {
     pub screen: (u32, u32),
     pub zoom: u32,
     pub high_quality: bool,
+    /// From the framing editor: a camera per phase (else the default framing at `zoom`).
+    pub framing: Option<crate::framing::Framing>,
 }
 
 /// Compiles the pack and renders a frame after the intro; `progress` gets what it is doing and
@@ -205,6 +207,11 @@ pub fn build(req: &BuildRequest, progress: &mut dyn FnMut(&str, f32)) -> Result<
         format,
         budget: budget(req.high_quality),
         name: name.clone(),
+        camera: req.framing.and_then(|f| f[bal2d_pack::phase::IDLE as usize]),
+        phase_cameras: req
+            .framing
+            .map(|f| (1..f.len()).filter_map(|p| f[p].map(|c| (p as u8, c))).collect())
+            .unwrap_or_default(),
         ..Default::default()
     };
     let inter = interactions(&req.assets, &layers);
@@ -302,7 +309,7 @@ mod tests {
             recognise(&name, data, &mut assets);
         }
         let t0 = std::time::Instant::now();
-        let built = build(&BuildRequest { assets, name: String::new(), screen: (336, 480), zoom: 100, high_quality: false }, &mut |_, _| {}).unwrap();
+        let built = build(&BuildRequest { assets, name: String::new(), screen: (336, 480), zoom: 100, high_quality: false, framing: None }, &mut |_, _| {}).unwrap();
         eprintln!("built in {:?}: {}", t0.elapsed(), built.summary);
         assert!(built.bytes.starts_with(b"BL2D"));
         assert!(built.preview.starts_with("data:image/png;base64,"));

@@ -8,6 +8,7 @@ use crate::exports::astrobox::psys_plugin_v4::{canopusconnect as plugin_connect,
 mod assets;
 mod connect;
 mod face;
+mod framing;
 mod state;
 mod ui;
 mod view;
