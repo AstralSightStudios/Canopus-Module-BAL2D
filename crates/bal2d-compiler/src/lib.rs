@@ -20,6 +20,7 @@ mod trim;
 pub mod interactions;
 pub mod raster;
 pub mod pack_atlas;
+pub mod stream;
 
 use std::collections::BTreeMap;
 
@@ -42,8 +43,9 @@ pub struct LayerInput {
     pub name: String,
     pub skel: Vec<u8>,
     pub atlas: String,
-    /// Atlas page file name -> PNG bytes.
-    pub pages: Vec<(String, Vec<u8>)>,
+    /// Atlas page file name -> PNG bytes (shared: the AstroBox plugin's 128 MiB cannot hold
+    /// copies of a lobby's pages).
+    pub pages: Vec<(String, std::sync::Arc<[u8]>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -135,18 +137,162 @@ fn load(input: &LayerInput) -> Result<Layer, String> {
     if !missing.is_empty() {
         return Err(format!("{}: atlas is missing {} regions (first: {})", input.name, missing.len(), missing[0]));
     }
-    let mut pages = Vec::new();
     for p in &atlas.pages {
-        let png = input
-            .pages
-            .iter()
-            .find(|(n, _)| n == &p.name)
-            .ok_or_else(|| format!("{}: page {} not provided", input.name, p.name))?;
-        let img = image::decode_png(&png.1).map_err(|e| format!("{}: {e}", p.name))?;
-        // Straight alpha in the source atlases; work premultiplied from here on.
-        pages.push(if p.pma { img } else { img.premultiplied() });
+        if !input.pages.iter().any(|(n, _)| n == &p.name) {
+            return Err(format!("{}: page {} not provided", input.name, p.name));
+        }
     }
-    Ok(Layer { name: input.name.clone(), data, atlas, pages })
+    // The pages are not decoded here: `work_atlases` cuts the needed regions out of the PNGs.
+    Ok(Layer { name: input.name.clone(), data, atlas, pages: Vec::new() })
+}
+
+/// The work atlas may hold this many times the texel budget (its regions at the density they
+/// are drawn at, before the budget scales them down): enough for the bake and for an exact
+/// final resampling, bounded whatever the source pages are.
+const WORK_BUDGET: f64 = 4.0;
+/// Work pages live only in memory: no GPU limit on their size.
+const WORK_MAX_PAGE: u32 = 16384;
+
+/// Replaces every layer's atlas with a work atlas for the bake: the regions its live attachments
+/// draw, cut out of the PNG pages row by row ([`stream::extract`]) at the density they are drawn
+/// at (within `WORK_BUDGET`), packed unrotated and premultiplied. Attachments never seen are
+/// culled first. The source pages are never decoded whole (the AstroBox plugin has 128 MiB, a
+/// 4096 page alone is 64 MiB). Returns each layer's source texel count and source atlas (for
+/// [`source_atlases`]).
+fn work_atlases(layers: &mut [Layer], inputs: &[LayerInput], cam: Camera, opts: &Options) -> Result<(Vec<u64>, Vec<Atlas>), String> {
+    let mut texels = Vec::with_capacity(layers.len());
+    let mut sources = Vec::with_capacity(layers.len());
+    for (layer, input) in layers.iter_mut().zip(inputs) {
+        texels.push(layer.atlas.regions.iter().map(|r| r.width as u64 * r.height as u64).sum());
+        let (seen, _) = simulate(layer, cam, opts);
+        cull(&mut layer.data, &seen);
+        let needs = region_needs(layer, &seen);
+        let mut scales: Vec<f32> = needs.iter().map(|n| (n.1 * opts.quality).clamp(1.0 / 64.0, 1.0)).collect();
+        let area: f64 = needs
+            .iter()
+            .zip(&scales)
+            .map(|(n, s)| ((n.2[2] - n.2[0]) as f64 * *s as f64 + 4.0) * ((n.2[3] - n.2[1]) as f64 * *s as f64 + 4.0))
+            .sum();
+        let cap = opts.budget as f64 * WORK_BUDGET;
+        if area > cap {
+            let k = (cap / area).sqrt() as f32;
+            scales.iter_mut().for_each(|s| *s *= k);
+        }
+        let items: Vec<pack_atlas::Item> = needs
+            .iter()
+            .zip(&scales)
+            .map(|(&(region, _, crop), &scale)| pack_atlas::Item { region, scale, rotated: layer.atlas.regions[region].degrees != 0, crop })
+            .collect();
+        let images = extract_items(&layer.atlas, input, &items)?;
+        let packed = pack_atlas::build_images(&layer.atlas, &items, images, WORK_MAX_PAGE)?;
+        let atlas = Atlas::parse(&packed.atlas_text);
+        // Culled attachments stay in the list (unbound now; never written): only the live ones
+        // must find their regions.
+        let missing = bind_atlas(&mut layer.data, &atlas);
+        let live: std::collections::BTreeSet<String> = layer
+            .data
+            .skins
+            .iter()
+            .flat_map(|s| s.attachments.iter().map(|e| e.2))
+            .flat_map(|id| region_paths(&layer.data.attachments[id as usize]))
+            .collect();
+        if let Some(m) = missing.iter().find(|m| live.contains(*m)) {
+            return Err(format!("{}: work atlas misses region {m}", layer.name));
+        }
+        sources.push(std::mem::replace(&mut layer.atlas, atlas));
+        layer.pages = packed.pages;
+    }
+    Ok((texels, sources))
+}
+
+/// Binds the layers back to their source atlases once the work atlases have served (the bake):
+/// the final regions are cut from the sources at their final size in one resampling, with the
+/// source offsets (a work atlas's are rounded to whole work texels: going through it would round
+/// twice and shift regions by up to a pixel). Frees the work pages.
+fn source_atlases(layers: &mut [Layer], sources: Vec<Atlas>) {
+    for (layer, atlas) in layers.iter_mut().zip(sources) {
+        // Culled attachments miss their regions in either atlas; the live ones bound before.
+        let _ = bind_atlas(&mut layer.data, &atlas);
+        layer.atlas = atlas;
+        layer.pages = Vec::new();
+    }
+}
+
+/// The items' images cut out of the layer's PNG pages row by row ([`stream::extract`]),
+/// premultiplied, at [`pack_atlas::item_size`].
+fn extract_items(atlas: &Atlas, input: &LayerInput, items: &[pack_atlas::Item]) -> Result<Vec<Rgba>, String> {
+    let mut images: Vec<Option<Rgba>> = (0..items.len()).map(|_| None).collect();
+    for (pi, page) in atlas.pages.iter().enumerate() {
+        let on_page: Vec<usize> = (0..items.len()).filter(|&i| atlas.regions[items[i].region].page as usize == pi).collect();
+        if on_page.is_empty() {
+            continue;
+        }
+        let png = input.pages.iter().find(|(n, _)| n == &page.name).ok_or_else(|| format!("{}: page {} not provided", input.name, page.name))?;
+        let wants: Vec<stream::Want> = on_page
+            .iter()
+            .map(|&i| stream::Want { region: items[i].region, crop: items[i].crop, size: pack_atlas::item_size(&items[i]) })
+            .collect();
+        // Straight alpha in the source atlases; premultiplied from here on.
+        let out = stream::extract(atlas, &png.1, !page.pma, &wants).map_err(|e| format!("{}: {e}", page.name))?;
+        for (i, img) in on_page.into_iter().zip(out) {
+            images[i] = Some(img);
+        }
+    }
+    Ok(images.into_iter().map(|i| i.unwrap_or_else(|| Rgba::new(1, 1))).collect())
+}
+
+/// The atlas paths an attachment draws: its own, or each frame of its sequence.
+fn region_paths(a: &Attachment) -> Vec<String> {
+    let (path, seq) = match &a.kind {
+        AttachmentKind::Region(r) => (&r.path, &r.sequence),
+        AttachmentKind::Mesh(m) => (&m.path, &m.sequence),
+        _ => return Vec::new(),
+    };
+    match seq {
+        Some(s) => (0..s.count).map(|i| s.path(path, i)).collect(),
+        None => vec![path.clone()],
+    }
+}
+
+/// Per atlas region of the live attachments: the highest density they are drawn at and the
+/// visible crop in logical pixels (two texels of margin for bilinear filtering; the whole region
+/// when its bounds are empty).
+fn region_needs(layer: &Layer, seen: &[Seen]) -> Vec<(usize, f32, [u32; 4])> {
+    let mut density: BTreeMap<usize, (f32, [f32; 4])> = BTreeMap::new();
+    let live: Vec<u32> = layer.data.skins.iter().flat_map(|s| s.attachments.iter().map(|e| e.2)).collect();
+    for id in live {
+        let sn = &seen[id as usize];
+        for path in region_paths(&layer.data.attachments[id as usize]) {
+            if let Some(ri) = layer.atlas.find(&path) {
+                let e = density.entry(ri).or_insert((0.0, [f32::MAX, f32::MAX, f32::MIN, f32::MIN]));
+                e.0 = e.0.max(sn.density);
+                e.1[0] = e.1[0].min(sn.bounds[0]);
+                e.1[1] = e.1[1].min(sn.bounds[1]);
+                e.1[2] = e.1[2].max(sn.bounds[2]);
+                e.1[3] = e.1[3].max(sn.bounds[3]);
+            }
+        }
+    }
+    density
+        .into_iter()
+        .map(|(ri, (d, b))| {
+            let r = &layer.atlas.regions[ri];
+            let (w, h) = (r.width as f32, r.height as f32);
+            let crop = if b[0] <= b[2] && b[1] <= b[3] {
+                [
+                    (b[0] - 2.0).floor().clamp(0.0, w - 1.0) as u32,
+                    (b[1] - 2.0).floor().clamp(0.0, h - 1.0) as u32,
+                    (b[2] + 2.0).ceil().clamp(1.0, w) as u32,
+                    (b[3] + 2.0).ceil().clamp(1.0, h) as u32,
+                ]
+            } else {
+                [0, 0, r.width as u32, r.height as u32]
+            };
+            let crop = if crop[2] > crop[0] && crop[3] > crop[1] { crop } else { [0, 0, r.width as u32, r.height as u32] };
+            let crop = if std::env::var("BAL2D_NO_CROP").is_ok() { [0, 0, r.width as u32, r.height as u32] } else { crop };
+            (ri, d, crop)
+        })
+        .collect()
 }
 
 /// Head-centered default framing (see `bal2d-tool`): the game's 1440-unit frame height.
@@ -453,11 +599,13 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
         .map(|(li, l)| if no_prune { 0 } else { prune::played_only(&mut l.data, li == main, &inter) })
         .collect();
     let drag_bones: Vec<&str> = inter.drags.iter().map(|d| d.bone.as_str()).collect();
+    let (source_texels, sources) = work_atlases(&mut layers, inputs, cam, opts)?;
     let baked = if opts.bake { bake::bake(&mut layers, main, &inter, cam, opts) } else { None };
     if let Some(b) = &baked {
         let h = b.header;
         report.baked = Some((b.slots.len(), b.triangles, [h.x, h.y, h.width, h.height], b.after_intro));
     }
+    source_atlases(&mut layers, sources);
 
     // Observe, cull, and gather per-region scale requirements.
     struct RegionNeed {
@@ -474,32 +622,14 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
         let kept = cull(&mut layer.data, &seen);
         let (tris_trimmed, verts_trimmed) = if std::env::var("BAL2D_NO_TRIM").is_ok() { (0, 0) } else { trim::trim_meshes(&mut layer.data, &tri_seen) };
         let timelines_dropped = if no_prune { 0 } else { prune::dead_timelines(&mut layer.data, if li == main { &drag_bones } else { &[] }) };
-        let mut density: BTreeMap<usize, (f32, [f32; 4])> = BTreeMap::new();
-        let live: Vec<u32> = layer.data.skins.iter().flat_map(|s| s.attachments.iter().map(|e| e.2)).collect();
-        for id in live {
-            let a = &layer.data.attachments[id as usize];
-            let path = match &a.kind {
-                AttachmentKind::Region(r) => &r.path,
-                AttachmentKind::Mesh(m) => &m.path,
-                _ => continue,
-            };
-            if let Some(ri) = layer.atlas.find(path) {
-                let e = density.entry(ri).or_insert((0.0, [f32::MAX, f32::MAX, f32::MIN, f32::MIN]));
-                let sn = &seen[id as usize];
-                e.0 = e.0.max(sn.density);
-                e.1[0] = e.1[0].min(sn.bounds[0]);
-                e.1[1] = e.1[1].min(sn.bounds[1]);
-                e.1[2] = e.1[2].max(sn.bounds[2]);
-                e.1[3] = e.1[3].max(sn.bounds[3]);
-            }
-        }
-        let before: u64 = layer.atlas.regions.iter().map(|r| r.width as u64 * r.height as u64).sum();
+        let region_list = region_needs(layer, &seen);
+        let before = source_texels[li];
         report.layers.push(LayerReport {
             name: layer.name.clone(),
             attachments: total,
             kept,
             regions_before: layer.atlas.regions.len(),
-            regions_after: density.len(),
+            regions_after: region_list.len(),
             texels_before: before,
             animations_dropped: dropped[li],
             timelines_dropped,
@@ -507,22 +637,7 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
             vertices_trimmed: verts_trimmed,
             ..Default::default()
         });
-        for (ri, (d, b)) in density {
-            let r = &layer.atlas.regions[ri];
-            let (w, h) = (r.width as f32, r.height as f32);
-            // Two texels of margin for bilinear filtering; empty bounds keep the whole region.
-            let crop = if b[0] <= b[2] && b[1] <= b[3] {
-                [
-                    (b[0] - 2.0).floor().clamp(0.0, w - 1.0) as u32,
-                    (b[1] - 2.0).floor().clamp(0.0, h - 1.0) as u32,
-                    (b[2] + 2.0).ceil().clamp(1.0, w) as u32,
-                    (b[3] + 2.0).ceil().clamp(1.0, h) as u32,
-                ]
-            } else {
-                [0, 0, r.width as u32, r.height as u32]
-            };
-            let crop = if crop[2] > crop[0] && crop[3] > crop[1] { crop } else { [0, 0, r.width as u32, r.height as u32] };
-            let crop = if std::env::var("BAL2D_NO_CROP").is_ok() { [0, 0, r.width as u32, r.height as u32] } else { crop };
+        for (ri, d, crop) in region_list {
             needs.push(RegionNeed { layer: li, region: ri, density: d, crop });
         }
     }
@@ -572,7 +687,8 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
             let r = &layer.atlas.regions[n.region];
             items.push(pack_atlas::Item { region: n.region, scale: *s, rotated: r.degrees != 0, crop: n.crop });
         }
-        let packed = pack_atlas::build(&layer.atlas, &layer.pages, &items, opts.max_page)?;
+        let images = extract_items(&layer.atlas, &inputs[li], &items)?;
+        let packed = pack_atlas::build_images(&layer.atlas, &items, images, opts.max_page)?;
         let skel = writer::write_skeleton(&layer.data, 1.0);
         // Verify the re-encoded skeleton binds to the new atlas before shipping it.
         let mut check = read_skeleton(&skel, 1.0).map_err(|e| format!("{}: re-read: {e}", layer.name))?;

@@ -8,25 +8,39 @@ use bal2d_spine::BlendMode;
 pub struct Texture {
     pub width: usize,
     pub height: usize,
-    pub texels: Vec<[f32; 4]>,
+    /// RGBA8 as given; converted when sampled (a quarter of the memory of f32 texels, which
+    /// the AstroBox plugin's 128 MiB cannot spare).
+    rgba: Vec<u8>,
+    /// Straight alpha (premultiplied when sampled) or premultiplied.
+    straight: bool,
 }
 
 impl Texture {
     /// From straight-alpha RGBA8 (the BA atlases are not premultiplied).
     pub fn from_straight_rgba8(width: usize, height: usize, rgba: &[u8]) -> Texture {
-        let texels = rgba
-            .chunks_exact(4)
-            .map(|p| {
-                let a = p[3] as f32 / 255.0;
-                [p[0] as f32 / 255.0 * a, p[1] as f32 / 255.0 * a, p[2] as f32 / 255.0 * a, a]
-            })
-            .collect();
-        Texture { width, height, texels }
+        Texture { width, height, rgba: rgba.to_vec(), straight: true }
     }
 
     pub fn from_premultiplied_rgba8(width: usize, height: usize, rgba: &[u8]) -> Texture {
-        let texels = rgba.chunks_exact(4).map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0, p[3] as f32 / 255.0]).collect();
-        Texture { width, height, texels }
+        Texture { width, height, rgba: rgba.to_vec(), straight: false }
+    }
+
+    /// Premultiplied RGBA8, taking the buffer.
+    pub fn from_premultiplied_vec(width: usize, height: usize, rgba: Vec<u8>) -> Texture {
+        Texture { width, height, rgba, straight: false }
+    }
+
+    /// Texel (x, y) as premultiplied floats in 0..=1.
+    #[inline]
+    fn texel(&self, x: usize, y: usize) -> [f32; 4] {
+        let i = (y * self.width + x) * 4;
+        let p = &self.rgba[i..i + 4];
+        if self.straight {
+            let a = p[3] as f32 / 255.0;
+            [p[0] as f32 / 255.0 * a, p[1] as f32 / 255.0 * a, p[2] as f32 / 255.0 * a, a]
+        } else {
+            [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0, p[3] as f32 / 255.0]
+        }
     }
 
     /// Bilinear sample with texel centers at (i + 0.5) / size, clamped to the edge.
@@ -40,7 +54,7 @@ impl Texture {
         let cl = |v: f32, n: usize| (v as isize).clamp(0, n as isize - 1) as usize;
         let (xa, xb) = (cl(x0, self.width), cl(x0 + 1.0, self.width));
         let (ya, yb) = (cl(y0, self.height), cl(y0 + 1.0, self.height));
-        let t = |x: usize, y: usize| self.texels[y * self.width + x];
+        let t = |x: usize, y: usize| self.texel(x, y);
         let (p00, p10, p01, p11) = (t(xa, ya), t(xb, ya), t(xa, yb), t(xb, yb));
         let mut out = [0f32; 4];
         for k in 0..4 {

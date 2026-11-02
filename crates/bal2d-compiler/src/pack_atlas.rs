@@ -64,19 +64,34 @@ fn logical(atlas: &Atlas, pages: &[Rgba], region: usize) -> Rgba {
     out
 }
 
+/// The resampled size of an item: its crop times its scale, at least one texel.
+pub fn item_size(it: &Item) -> (u32, u32) {
+    let [x0, y0, x1, y1] = it.crop;
+    let (cw, ch) = (x1 - x0, y1 - y0);
+    (((cw as f32 * it.scale).round() as u32).max(1), ((ch as f32 * it.scale).round() as u32).max(1))
+}
+
+/// Crops and resamples the items from decoded pages, then packs them ([`build_images`]).
 pub fn build(atlas: &Atlas, pages: &[Rgba], items: &[Item], max_page: u32) -> Result<Packed, String> {
     let mut images = Vec::with_capacity(items.len());
     for it in items {
-        let r = &atlas.regions[it.region];
         let [x0, y0, x1, y1] = it.crop;
-        let (cw, ch) = (x1 - x0, y1 - y0);
-        let w = ((cw as f32 * it.scale).round() as u32).max(1);
-        let h = ((ch as f32 * it.scale).round() as u32).max(1);
+        let (w, h) = item_size(it);
         if w + 2 * PAD > max_page || h + 2 * PAD > max_page {
-            return Err(format!("region {} ({}x{}) does not fit a {max_page} page", r.name, w, h));
+            return Err(format!("region {} ({}x{}) does not fit a {max_page} page", atlas.regions[it.region].name, w, h));
         }
-        let src = logical(atlas, pages, it.region).crop(x0, y0, cw, ch);
+        let src = logical(atlas, pages, it.region).crop(x0, y0, x1 - x0, y1 - y0);
         images.push(src.resize(w, h));
+    }
+    build_images(atlas, items, images, max_page)
+}
+
+/// Packs already resampled item images (`images[i]` is `items[i]` at [`item_size`]).
+pub fn build_images(atlas: &Atlas, items: &[Item], images: Vec<Rgba>, max_page: u32) -> Result<Packed, String> {
+    for (it, img) in items.iter().zip(&images) {
+        if img.width + 2 * PAD > max_page || img.height + 2 * PAD > max_page {
+            return Err(format!("region {} ({}x{}) does not fit a {max_page} page", atlas.regions[it.region].name, img.width, img.height));
+        }
     }
     // Skyline (bottom-left) packing, tallest first; try several page widths and keep the
     // smallest total area. Regions that do not fit under max_page open another page.

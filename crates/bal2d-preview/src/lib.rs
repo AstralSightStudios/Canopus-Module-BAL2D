@@ -60,7 +60,7 @@ impl PackPreview {
             let mut section = vec![0u8; p.section_len()];
             bal2d_core::read_page(&mut &pack[..], p, &mut section).map_err(LoadError::Pack)?;
             let img = bal2d_compiler::image::decode_page(p.header.width as u32, p.header.height as u32, p.header.format, &section[8..]);
-            per_layer[p.layer as usize].push(Texture::from_premultiplied_rgba8(img.width as usize, img.height as usize, &img.data));
+            per_layer[p.layer as usize].push(Texture::from_premultiplied_vec(img.width as usize, img.height as usize, img.data));
         }
         let bake = match &lobby.bake {
             Some(b) => Some(decode_bake(pack, b).map_err(LoadError::Pack)?),

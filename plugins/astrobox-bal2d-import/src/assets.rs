@@ -39,7 +39,7 @@ pub fn recognise(name: &str, data: Vec<u8>, out: &mut Vec<Asset>) -> usize {
     match kind {
         Some(kind) => {
             out.retain(|a| a.name != name || a.kind != kind);
-            out.push(Asset { name: name.to_string(), kind, data });
+            out.push(Asset { name: name.to_string(), kind, data: data.into() });
             1
         }
         None => 0,
@@ -67,20 +67,20 @@ fn png_size(data: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// How many of the page's regions have an opaque centre texel in `png`.
+/// How many of the page's regions have an opaque centre texel in `png` (read row by row: the
+/// page is never decoded whole).
 fn region_hits(png: &Asset, atlas: &Atlas, page: u32) -> usize {
-    let Ok(img) = bal2d_compiler::image::decode_png(&png.data) else { return 0 };
-    atlas
+    let points: Vec<(u32, u32)> = atlas
         .regions
         .iter()
         .filter(|r| r.page == page)
-        .filter(|r| {
+        .map(|r| {
             // Packed size: rotated regions swap width and height.
             let (w, h) = if r.degrees == 90 || r.degrees == 270 { (r.height, r.width) } else { (r.width, r.height) };
-            let (x, y) = ((r.x + w / 2) as u32, (r.y + h / 2) as u32);
-            x < img.width && y < img.height && img.data[((y * img.width + x) * 4 + 3) as usize] > 0
+            ((r.x + w / 2) as u32, (r.y + h / 2) as u32)
         })
-        .count()
+        .collect();
+    bal2d_compiler::stream::alpha_at(&png.data, &points).map(|a| a.iter().filter(|&&v| v > 0).count()).unwrap_or(0)
 }
 
 /// The skeletons with their atlas and pages, background layers first and the lobby with the
@@ -145,7 +145,7 @@ pub fn layers(assets: &[Asset]) -> Result<Vec<LayerInput>, String> {
             pages.push((page.name.clone(), png.data.clone()));
         }
         let main = data.find_bone("Touch_Point").is_some();
-        out.push((main, LayerInput { name: stem(&skel.name).to_string(), skel: skel.data.clone(), atlas: text.clone(), pages }));
+        out.push((main, LayerInput { name: stem(&skel.name).to_string(), skel: skel.data.to_vec(), atlas: text.clone(), pages }));
     }
     out.sort_by_key(|(main, l)| (*main, l.name.clone()));
     Ok(out.into_iter().map(|x| x.1).collect())

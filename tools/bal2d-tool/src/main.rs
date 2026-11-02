@@ -303,7 +303,7 @@ fn compile(args: &[String]) {
             bal2d_compiler::LayerInput {
                 name: p.file_stem().unwrap().to_string_lossy().into_owned(),
                 skel: std::fs::read(p).unwrap(),
-                pages: parsed.pages.iter().map(|pg| (pg.name.clone(), std::fs::read(dir.join(&pg.name)).unwrap())).collect(),
+                pages: parsed.pages.iter().map(|pg| (pg.name.clone(), std::fs::read(dir.join(&pg.name)).unwrap().into())).collect(),
                 atlas,
             }
         })

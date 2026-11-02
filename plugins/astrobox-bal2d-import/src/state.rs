@@ -32,12 +32,13 @@ impl FileKind {
     }
 }
 
-/// One asset file, kept in memory (a lobby is a few MB).
+/// One asset file, kept in memory (a lobby is a few MB). Shared, not copied, by the build: the
+/// plugin has 128 MiB in all.
 #[derive(Clone, Debug)]
 pub struct Asset {
     pub name: String,
     pub kind: FileKind,
-    pub data: Vec<u8>,
+    pub data: std::sync::Arc<[u8]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

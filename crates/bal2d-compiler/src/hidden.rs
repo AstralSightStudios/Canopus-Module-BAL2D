@@ -34,7 +34,7 @@ pub fn hidden_layers(pack: &[u8]) -> Result<Vec<usize>, String> {
         let mut section = vec![0u8; p.section_len()];
         bal2d_core::read_page(&mut &pack[..], p, &mut section).map_err(|e| format!("{e:?}"))?;
         let img = crate::image::decode_page(p.header.width as u32, p.header.height as u32, p.header.format, &section[8..]);
-        textures[p.layer as usize].push(Texture::from_premultiplied_rgba8(img.width as usize, img.height as usize, &img.data));
+        textures[p.layer as usize].push(Texture::from_premultiplied_vec(img.width as usize, img.height as usize, img.data));
     }
     lobby.start();
     let main = lobby.interactions.layer as usize;
