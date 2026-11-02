@@ -14,6 +14,7 @@ use crate::{assets, face, watch};
 const EV_TAB: &str = "action:tab.";
 const EV_DEVICE: &str = "input:device";
 const EV_CONNECT: &str = "action:connect";
+const EV_REFRESH: &str = "action:refresh";
 const EV_ADD: &str = "action:assets.add";
 const EV_CLEAR: &str = "action:assets.clear";
 const EV_NAME: &str = "input:name";
@@ -91,7 +92,12 @@ pub async fn on_event(event: &str, payload: &str) {
             });
             watch::hello().await;
         }
-        EV_CONNECT => watch::hello().await,
+        // The device list is read at load and on AstroBox device events: a watch connected
+        // after the plugin opened may only show up when asked again.
+        EV_CONNECT | EV_REFRESH => {
+            crate::connect::refresh_devices().await;
+            watch::hello().await;
+        }
         e if e.starts_with(EV_TAB) => {
             let tab = match &e[EV_TAB.len()..] {
                 "watch" => Tab::Watch,
@@ -393,14 +399,14 @@ fn header(s: &UiState) -> View {
         None => badge("未连接模块", "gray"),
     };
     card()
-        .child(row().child(heading("BA 记忆大厅").grow()).child(status))
+        .child(row().child(heading("BA 记忆大厅").grow()).child(status).child(button("刷新", EV_REFRESH, "ghost")))
         .child(text(
             "把你自己从游戏中提取的记忆大厅（Spine 骨骼 + 图集 + 贴图）编译成手表角色包。插件不包含任何游戏素材；素材仅限个人使用，请勿分享。",
             13,
             tone::MUTED,
         ))
         .child(if s.devices.is_empty() {
-            callout("没有已连接的手表。请先在 AstroBox 中连接手表。", tone::WELL, tone::MUTED)
+            callout("没有已连接的手表。请先在 AstroBox 中连接手表，然后点右上角“刷新”。", tone::WELL, tone::MUTED)
         } else {
             row().child(field("手表", picker)).child(button("连接", EV_CONNECT, "soft"))
         })
