@@ -640,7 +640,8 @@ impl Lobby {
         let main = self.main();
         let drag = self.drag.as_ref().map(|d| (d.bone, d.pos));
         for i in 0..self.layers.len() {
-            if baked & (1 << i.min(31)) != 0 {
+            // A bake with live slots still needs the pose (for those).
+            if baked & (1 << i.min(31)) != 0 && !self.idle[i].as_ref().is_some_and(|b| b.needs_pose()) {
                 self.idle_pending[i] += dt;
                 continue;
             }
@@ -735,10 +736,12 @@ impl Lobby {
     /// whose top-left is `origin` on the pack's screen. Returns the triangles drawn.
     pub fn draw_idle(&mut self, layer: usize, origin: (f32, f32), size: (f32, f32), page_size: &dyn Fn(u32) -> Option<(f32, f32)>, emit: &mut dyn FnMut(&bal2d_render::Call)) -> u32 {
         let pending = self.idle_pending.get(layer).copied().unwrap_or(0.0);
+        let c = self.camera;
+        let cam = (c.cx + (origin.0 + size.0 * 0.5 - self.width * 0.5) / c.scale, c.cy - (origin.1 + size.1 * 0.5 - self.height * 0.5) / c.scale, c.scale);
         let (Some(l), Some(Some(b))) = (self.layers.get(layer), self.idle.get_mut(layer)) else { return 0 };
         let Some(e) = l.state.current(0) else { return 0 };
         let tau = idle::wrap(l.state.entry(e).track_time + pending - b.bake.start, b.bake.period);
-        b.draw(&l.data, tau, origin, size, page_size, emit)
+        b.draw(&l.data, &l.skeleton, cam, tau, origin, size, page_size, emit)
     }
 
     /// Whether the baked image stands in for its slots now: always, or once the intro is over

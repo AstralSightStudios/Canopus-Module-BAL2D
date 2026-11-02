@@ -609,10 +609,16 @@ pub struct IdleBake {
     pub shapes: Vec<IdleShape>,
     /// Straight RGBA8 tints (R in the low byte).
     pub colors: Vec<u32>,
+    /// Runs of slots drawn live, not from the bake (clipped ones, with their clipping slot): a
+    /// call with shape [`IDLE_LIVE`] draws run `color` there.
+    pub live: Vec<Vec<u16>>,
     pub frames: u16,
     /// The frames' calls (see [`IdleCursor`]).
     pub stream: Vec<u8>,
 }
+
+/// The shape of a call that draws a run of live slots ([`IdleBake::live`]).
+pub const IDLE_LIVE: u16 = u16::MAX;
 
 /// Fixed-point scale of [`IdleCall`] matrices: they are the screen positions (x, y) of three
 /// texels of the shape, its anchor and the anchor moved by its span along x and along y.
@@ -676,7 +682,7 @@ impl IdleBake {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::new();
-        v.push(2u8);
+        v.push(3u8);
         v.extend_from_slice(&self.animation.to_le_bytes());
         for f in [self.rate, self.period, self.start] {
             v.extend_from_slice(&f.to_le_bytes());
@@ -697,6 +703,13 @@ impl IdleBake {
         for c in &self.colors {
             v.extend_from_slice(&c.to_le_bytes());
         }
+        v.extend_from_slice(&(self.live.len() as u16).to_le_bytes());
+        for run in &self.live {
+            v.extend_from_slice(&(run.len() as u16).to_le_bytes());
+            for s in run {
+                v.extend_from_slice(&s.to_le_bytes());
+            }
+        }
         v.extend_from_slice(&self.frames.to_le_bytes());
         v.extend_from_slice(&(self.stream.len() as u32).to_le_bytes());
         v.extend_from_slice(&self.stream);
@@ -710,7 +723,7 @@ impl IdleBake {
     /// `decode`, keeping the section's own buffer as the stream (no second copy of it).
     pub fn decode_owned(mut d: Vec<u8>) -> Option<IdleBake> {
         let mut r = Bytes { d: &d, at: 0 };
-        if r.u8()? != 2 {
+        if r.u8()? != 3 {
             return None;
         }
         let animation = r.u16()?;
@@ -740,6 +753,16 @@ impl IdleBake {
         for _ in 0..nc {
             colors.push(r.u32()?);
         }
+        let nl = r.u16()? as usize;
+        let mut live = Vec::with_capacity(nl);
+        for _ in 0..nl {
+            let k = r.u16()? as usize;
+            let mut run = Vec::with_capacity(k);
+            for _ in 0..k {
+                run.push(r.u16()?);
+            }
+            live.push(run);
+        }
         let frames = r.u16()?;
         let len = r.u32()? as usize;
         let at = r.at;
@@ -747,7 +770,7 @@ impl IdleBake {
             return None;
         }
         d.drain(..at);
-        Some(IdleBake { animation, rate, period, start, shapes, colors, frames, stream: d })
+        Some(IdleBake { animation, rate, period, start, shapes, colors, live, frames, stream: d })
     }
 }
 
@@ -831,7 +854,10 @@ impl IdleCursor {
                 } else {
                     None
                 };
-                *self.now.get_mut(shape as usize)? = Some(m0);
+                // Live-run markers name no shape.
+                if let Some(x) = self.now.get_mut(shape as usize) {
+                    *x = Some(m0);
+                }
                 out.push(IdleCall { shape, color, m0, m1 });
             }
             Some(())
@@ -1036,7 +1062,7 @@ mod idle_tests {
             vec![call(0, 101, Some([1, 2, 3, 4, 5, 6])), call(1, 31, None)],
         ];
         let stream = IdleBake::encode_frames(&frames, 2);
-        let bake = IdleBake { animation: 3, rate: 30.0, period: 0.1, start: 0.25, shapes: vec![shape(0), shape(1)], colors: vec![0xFFFF_FFFF, 0x8000_00FF], frames: 3, stream };
+        let bake = IdleBake { animation: 3, rate: 30.0, period: 0.1, start: 0.25, shapes: vec![shape(0), shape(1)], colors: vec![0xFFFF_FFFF, 0x8000_00FF], live: vec![vec![4, 5]], frames: 3, stream };
         let back = IdleBake::decode(&bake.encode()).unwrap();
         assert_eq!(back, bake);
         let mut c = IdleCursor::new(2);

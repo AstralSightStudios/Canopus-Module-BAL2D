@@ -8,7 +8,7 @@
 use alloc::vec::Vec;
 
 use bal2d_pack::{IdleBake, IdleCall, IdleCursor, IdleShape};
-use bal2d_render::{path_coord, Call, PATH_CLOSE, PATH_LINE, PATH_MOVE};
+use bal2d_render::{path_coord, Call, DrawList, Paths, PATH_CLOSE, PATH_LINE, PATH_MOVE};
 use bal2d_spine::*;
 
 /// One layer's baked idle with its decoding state.
@@ -33,6 +33,10 @@ pub struct IdleLayer {
     acc: Vec<[f32; 3]>,
     fixed: Vec<[i16; 2]>,
     mats: Vec<[f32; 6]>,
+    /// Per live run: the slots left out of its draw list; and the list and grouping it uses.
+    live_skip: Vec<Vec<bool>>,
+    live_list: DrawList,
+    live_paths: Paths,
 }
 
 impl IdleLayer {
@@ -65,6 +69,19 @@ impl IdleLayer {
             vert_at.push(all.len() as u32);
         }
         all.shrink_to_fit();
+        let live_skip: Vec<Vec<bool>> = bake
+            .live
+            .iter()
+            .map(|run| {
+                let mut skip = alloc::vec![true; data.slots.len()];
+                for &sl in run {
+                    if let Some(x) = skip.get_mut(sl as usize) {
+                        *x = false;
+                    }
+                }
+                skip
+            })
+            .collect();
         Some(IdleLayer {
             cursor: IdleCursor::new(n),
             frame: None,
@@ -78,6 +95,13 @@ impl IdleLayer {
             acc: Vec::new(),
             fixed: Vec::new(),
             mats: Vec::new(),
+            live_skip,
+            live_list: DrawList::default(),
+            live_paths: {
+                let mut p = Paths::new();
+                p.tolerance = 1.0;
+                p
+            },
             bake,
         })
     }
@@ -144,7 +168,25 @@ impl IdleLayer {
     /// calls share would land in two places (a hairline gap or overlap along the seam): every
     /// vertex is put where the calls using it place it on average, so neighbouring paths meet
     /// exactly. The texture keeps each call's own affine, as on the live path.
-    pub fn draw(&mut self, data: &SkeletonData, tau: f32, origin: (f32, f32), size: (f32, f32), page_size: &dyn Fn(u32) -> Option<(f32, f32)>, emit: &mut dyn FnMut(&Call)) -> u32 {
+    /// Whether the layer's skeleton must still be posed every frame (its live runs need it).
+    pub fn needs_pose(&self) -> bool {
+        !self.bake.live.is_empty()
+    }
+
+    /// `sk` (posed) and `cam` (skeleton -> target, as `Paths::draw` takes it) are for the live
+    /// runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &mut self,
+        data: &SkeletonData,
+        sk: &Skeleton,
+        cam: (f32, f32, f32),
+        tau: f32,
+        origin: (f32, f32),
+        size: (f32, f32),
+        page_size: &dyn Fn(u32) -> Option<(f32, f32)>,
+        emit: &mut dyn FnMut(&Call),
+    ) -> u32 {
         let b = &self.bake;
         let pos = tau * b.rate;
         let f = (pos as i32).clamp(0, b.frames as i32 - 1) as u16;
@@ -157,10 +199,21 @@ impl IdleLayer {
         let mut triangles = 0;
         let mut i = 0;
         while i < self.cur.len() {
+            if self.cur[i].shape == bal2d_pack::IDLE_LIVE {
+                let run = self.cur[i].color as usize;
+                i += 1;
+                if let Some(skip) = self.live_skip.get(run) {
+                    bal2d_render::build_masked(data, sk, &mut self.live_list, Some(skip));
+                    let before = self.live_paths.triangles;
+                    self.live_paths.draw(0, &self.live_list, cam, size, page_size, |c| emit(c));
+                    triangles += self.live_paths.triangles - before;
+                }
+                continue;
+            }
             // A run of calls of one attachment (they are consecutive: one batch).
             let att = self.bake.shapes.get(self.cur[i].shape as usize).map(|s| (s.slot, s.attachment));
             let mut j = i + 1;
-            while j < self.cur.len() && self.bake.shapes.get(self.cur[j].shape as usize).map(|s| (s.slot, s.attachment)) == att {
+            while j < self.cur.len() && self.cur[j].shape != bal2d_pack::IDLE_LIVE && self.bake.shapes.get(self.cur[j].shape as usize).map(|s| (s.slot, s.attachment)) == att {
                 j += 1;
             }
             let run = i..j;

@@ -24,7 +24,7 @@ const QUANT_MARGIN: f32 = 0.06;
 /// where it does not (a thirtieth of a second); below it, they must fit the whole interval.
 pub const RATE: f32 = 30.0;
 pub const MAX_FRAMES: f32 = 600.0;
-pub const HOLD_RATE: f32 = 20.0;
+pub const HOLD_RATE: f32 = 12.0;
 /// Groups a carried-over grouping may have beyond a fresh one before it is redone.
 const SLACK: usize = 0;
 /// Longest the lobby is played looking for the idle loop (seconds).
@@ -48,6 +48,8 @@ struct Batch {
     screen: Vec<[f32; 2]>,
     texel: Vec<[f32; 2]>,
     tris: Vec<[u16; 3]>,
+    /// Clipped: its geometry is not the attachment's own, so it is drawn live.
+    live: bool,
 }
 
 type Pose = Vec<Batch>;
@@ -57,8 +59,7 @@ fn color(c: [f32; 4]) -> u32 {
     q(c[0]) | q(c[1]) << 8 | q(c[2]) << 16 | q(c[3]) << 24
 }
 
-/// Layer `li`'s batches now, through the idle framing; `None` if one is clipped (its geometry is
-/// not the attachment's own: it cannot be baked).
+/// Layer `li`'s batches now, through the idle framing (clipped ones marked live).
 fn capture(lobby: &Lobby, li: usize, sizes: &[(f32, f32)], list: &mut DrawList) -> Option<Pose> {
     let c = lobby.cameras[bal2d_pack::phase::IDLE as usize];
     let (w2, h2) = (lobby.width * 0.5, lobby.height * 0.5);
@@ -66,10 +67,11 @@ fn capture(lobby: &Lobby, li: usize, sizes: &[(f32, f32)], list: &mut DrawList) 
     let data = &lobby.layers[li].data;
     let mut out = Vec::with_capacity(list.batches.len());
     for b in &list.batches {
-        let (_, tris, verts) = bal2d_core::idle::geometry(data, b.attachment)?;
         let idx = &list.indices[b.first_index as usize..(b.first_index + b.index_count) as usize];
-        if idx != tris || b.vertex_count as usize != verts {
-            return None;
+        let own = bal2d_core::idle::geometry(data, b.attachment).is_some_and(|(_, tris, verts)| idx == tris && b.vertex_count as usize == verts);
+        if !own {
+            out.push(Batch { key: (b.slot, b.attachment), page: b.page, color: 0, screen: Vec::new(), texel: Vec::new(), tris: Vec::new(), live: true });
+            continue;
         }
         let &(pw, ph) = sizes.get(b.page as usize)?;
         let v0 = b.first_vertex as usize;
@@ -81,6 +83,7 @@ fn capture(lobby: &Lobby, li: usize, sizes: &[(f32, f32)], list: &mut DrawList) 
             screen: (0..n).map(|i| [(list.positions[(v0 + i) * 2] - c.cx) * c.scale + w2, h2 - (list.positions[(v0 + i) * 2 + 1] - c.cy) * c.scale]).collect(),
             texel: (0..n).map(|i| [list.uvs[(v0 + i) * 2] * pw, list.uvs[(v0 + i) * 2 + 1] * ph]).collect(),
             tris: idx.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect(),
+            live: false,
         });
     }
     Some(out)
@@ -287,6 +290,9 @@ pub fn bake(pack: &[u8], max_rate: f32, tolerance: f32) -> (Vec<(u16, IdleBake)>
         let mut prev: HashMap<(u16, u32), Vec<Vec<u16>>> = HashMap::new();
         let mut calls: Vec<Vec<IdleCall>> = Vec::with_capacity(frames);
         let mut total_calls = 0usize;
+        let mut live: Vec<Vec<u16>> = Vec::new();
+        let mut live_ids: HashMap<u16, u16> = HashMap::new();
+        let mut current_run = 0usize;
         let mut mergeable = 0usize;
         for _ in 0..frames {
             lobby.update(half);
@@ -302,7 +308,33 @@ pub fn bake(pack: &[u8], max_rate: f32, tolerance: f32) -> (Vec<(u16, IdleBake)>
             let mut frame = Vec::new();
             let mut last_call: Option<(u32, u8, u32, ([f32; 6], [f32; 6]))> = None;
             let mut next_prev = HashMap::new();
+            let mut in_run = false;
             for b in &a {
+                // Clipped slots: one marker per run, the run drawn live from the clipping slot on.
+                if b.live {
+                    if !in_run {
+                        let sk = &lobby.layers[li].skeleton;
+                        let data = &lobby.layers[li].data;
+                        let pos = sk.draw_order.iter().position(|&s| s == b.key.0).unwrap_or(0);
+                        let clip = sk.draw_order[..pos].iter().rev().copied().find(|&s| {
+                            sk.slots[s as usize].attachment.is_some_and(|a| matches!(data.attachments[a as usize].kind, bal2d_spine::AttachmentKind::Clipping(_)))
+                        });
+                        let first = clip.unwrap_or(b.key.0);
+                        let id = *live_ids.entry(first).or_insert_with(|| {
+                            live.push(vec![first]);
+                            (live.len() - 1) as u16
+                        });
+                        frame.push(IdleCall { shape: bal2d_pack::IDLE_LIVE, color: id, m0: [0; 6], m1: None });
+                        current_run = id as usize;
+                        in_run = true;
+                    }
+                    if !live[current_run].contains(&b.key.0) {
+                        live[current_run].push(b.key.0);
+                    }
+                    last_call = None;
+                    continue;
+                }
+                in_run = false;
                 // An attachment that is gone by the end of the interval holds still until then.
                 fn same<'p>(p: &'p Pose, i: Option<&usize>, n: usize) -> Option<&'p [[f32; 2]]> {
                     i.map(|&i| &p[i].screen[..]).filter(|s| s.len() == n)
@@ -404,7 +436,7 @@ pub fn bake(pack: &[u8], max_rate: f32, tolerance: f32) -> (Vec<(u16, IdleBake)>
             eprintln!("layer {li}: {:.0} calls/frame, {:.1} could join the call before (same page, blend, tint, affine)", total_calls as f32 / frames as f32, mergeable as f32 / frames as f32);
         }
         let stream = IdleBake::encode_frames(&calls, shapes.len());
-        let bake = IdleBake { animation: animation as u16, rate, period, start, shapes, colors, frames: frames as u16, stream };
+        let bake = IdleBake { animation: animation as u16, rate, period, start, shapes, colors, live, frames: frames as u16, stream };
         let bytes = bake.encode().len();
         report.layers.push((frames as u16, total_calls as f32 / frames as f32, bake.shapes.len(), bytes));
         out.push((li as u16, bake));
