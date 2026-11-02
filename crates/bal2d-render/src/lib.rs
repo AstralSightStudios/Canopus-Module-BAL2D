@@ -362,6 +362,150 @@ impl Tri {
     }
 }
 
+/// The texel rectangle (x, y, width, height, in whole texels) that two triangles cover exactly:
+/// the halves of one axis-aligned rectangle split along a diagonal, as a region attachment or a
+/// one-quad mesh draws. Such a group can be drawn as an image blit instead of a path.
+pub fn texel_rect(tris: &[Tri]) -> Option<[i32; 4]> {
+    let [a, b] = tris else { return None };
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for p in a.t.iter().chain(&b.t) {
+        lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+        hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+    }
+    let whole = |v: f32| {
+        let r = if v >= 0.0 { (v + 0.5) as i32 } else { (v - 0.5) as i32 };
+        ((v - r as f32).abs() < 0.01).then_some(r)
+    };
+    let (x0, y0, x1, y1) = (whole(lo[0])?, whole(lo[1])?, whole(hi[0])?, whole(hi[1])?);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    // Every corner is a rectangle corner (index: bit 0 right, bit 1 bottom); each triangle uses
+    // three distinct ones and the corners they leave out are opposite (they share the diagonal).
+    let corner = |p: &[f32; 2]| -> Option<u8> {
+        let (x, y) = (whole(p[0])?, whole(p[1])?);
+        let cx = if x == x0 { 0 } else if x == x1 { 1 } else { return None };
+        let cy = if y == y0 { 0 } else if y == y1 { 2 } else { return None };
+        Some(cx | cy)
+    };
+    let missing = |t: &Tri| -> Option<u8> {
+        let mut seen = 0u8;
+        for p in &t.t {
+            seen |= 1 << corner(p)?;
+        }
+        (seen.count_ones() == 3).then(|| (!seen & 0xF).trailing_zeros() as u8)
+    };
+    let (ma, mb) = (missing(a)?, missing(b)?);
+    (ma ^ mb == 3).then_some([x0, y0, x1 - x0, y1 - y0])
+}
+
+/// The corners of two triangles over four vertices in order round the quad they make: the two
+/// vertices both use (its diagonal) at 0 and 2, the others at 1 and 3. `None` unless the
+/// triangles share exactly one edge.
+pub fn quad_order(idx: &[u16]) -> Option<[usize; 4]> {
+    let (a, b) = (idx.get(..3)?, idx.get(3..6)?);
+    // The distinct vertices both use: exactly two.
+    let (mut shared, mut n) = ([0u16; 3], 0);
+    for (i, v) in a.iter().enumerate() {
+        if b.contains(v) && !a[..i].contains(v) {
+            shared[n] = *v;
+            n += 1;
+        }
+    }
+    let only_a = *a.iter().find(|v| !b.contains(v))?;
+    let only_b = *b.iter().find(|v| !a.contains(v))?;
+    let order = [shared[0], only_a, shared[1], only_b].map(|v| v as usize);
+    (n == 2 && order.iter().all(|&v| v < 4) && only_a != only_b).then_some(order)
+}
+
+/// The blit for a quad drawn as triangles 0-1-2 and 2-3-0 ([`QUAD_INDICES`]): its texel
+/// rectangle and texel -> target affine, when the corners go round one axis-aligned rectangle of
+/// whole texels (0 and 2 opposite) and one affine places all four within [`BLIT_ERROR`].
+pub fn quad_blit(screen: &[[f32; 2]], texel: &[[f32; 2]]) -> Option<([i32; 4], [f32; 6])> {
+    let (s, t) = (screen.get(..4)?, texel.get(..4)?);
+    let whole = |v: f32| {
+        let r = if v >= 0.0 { (v + 0.5) as i32 } else { (v - 0.5) as i32 };
+        ((v - r as f32).abs() < 0.01).then_some(r)
+    };
+    let (u0, v0, u2, v2) = (whole(t[0][0])?, whole(t[0][1])?, whole(t[2][0])?, whole(t[2][1])?);
+    let (u1, v1, u3, v3) = (whole(t[1][0])?, whole(t[1][1])?, whole(t[3][0])?, whole(t[3][1])?);
+    // 0 and 2 opposite, 1 and 3 opposite, all four on the same two columns and rows.
+    let cols = (u0 != u2) && ((u1 == u0 && u3 == u2) || (u1 == u2 && u3 == u0));
+    let rows = (v0 != v2) && ((v1 == v0 && v3 == v2) || (v1 == v2 && v3 == v0));
+    if !(cols && rows) || (u1 == u0) == (v1 == v0) {
+        return None;
+    }
+    let tri = Tri { s: [s[0], s[1], s[2]], t: [t[0], t[1], t[2]], v: [0, 1, 2] };
+    let m = tri.affine()?;
+    let last = Tri { s: [s[3], s[3], s[3]], t: [t[3], t[3], t[3]], v: [3, 3, 3] };
+    if !(tri.error(&m) <= BLIT_ERROR && last.error(&m) <= BLIT_ERROR) {
+        return None;
+    }
+    let (x0, y0) = (u0.min(u2), v0.min(v2));
+    Some(([x0, y0, (u0 - u2).abs(), (v0 - v2).abs()], m))
+}
+
+/// Least-squares refits per group the watch uses (`Paths::new`) and the previews follow.
+pub const REFITS: u8 = 0;
+
+/// [`cluster`] as [`Paths`] groups (the same code), with `refits` least-squares refits per
+/// group: what the watch draws, for previews.
+pub fn cluster_refit(tris: &[Tri], tol: f32, refits: u8, order: &mut Vec<u32>, out: &mut Vec<Cluster>) {
+    let mut p = Paths { tolerance: tol, refits, ..Default::default() };
+    p.tris.extend_from_slice(tris);
+    p.group();
+    order.clear();
+    order.extend_from_slice(&p.order);
+    out.clear();
+    out.extend(p.clusters.iter().map(|c| Cluster { start: c.start, count: c.count, m: c.m }));
+}
+
+/// Groups smaller than this are not refitted (little to gain for a whole extra scan).
+pub const REFIT_MIN: usize = 3;
+
+/// The least-squares texel -> screen affine over the corners of `members` (texels centred on
+/// their mean, in f32: the watch has no double-precision FPU). `None` when the corners are
+/// collinear in texel space.
+pub fn fit_affine(tris: &[Tri], members: &[u32]) -> Option<[f32; 6]> {
+    let n = members.len() as f32 * 3.0;
+    let (mut mu, mut mv) = (0.0f32, 0.0f32);
+    for &i in members {
+        let t = &tris[i as usize].t;
+        mu += t[0][0] + t[1][0] + t[2][0];
+        mv += t[0][1] + t[1][1] + t[2][1];
+    }
+    mu /= n;
+    mv /= n;
+    let (mut suu, mut suv, mut svv) = (0.0f32, 0.0f32, 0.0f32);
+    let (mut sux, mut svx, mut suy, mut svy, mut sx, mut sy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for &i in members {
+        let tri = &tris[i as usize];
+        for k in 0..3 {
+            let (u, v) = (tri.t[k][0] - mu, tri.t[k][1] - mv);
+            let (x, y) = (tri.s[k][0], tri.s[k][1]);
+            suu += u * u;
+            suv += u * v;
+            svv += v * v;
+            sux += u * x;
+            svx += v * x;
+            suy += u * y;
+            svy += v * y;
+            sx += x;
+            sy += y;
+        }
+    }
+    let det = suu * svv - suv * suv;
+    if !(det > 1e-6 * suu * svv) {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let a = (sux * svv - svx * suv) * inv;
+    let b = (svx * suu - sux * suv) * inv;
+    let d = (suy * svv - svy * suv) * inv;
+    let e = (svy * suu - suy * suv) * inv;
+    Some([a, b, sx / n - a * mu - b * mv, d, e, sy / n - d * mu - e * mv])
+}
+
 /// Greedily groups triangles that one affine draws within `tol` screen pixels. A cluster's
 /// affine is its first triangle's; a triangle joins the current cluster if that affine places
 /// its corners within tolerance, else starts the next one. `tris` is the batch's visible,
@@ -400,6 +544,10 @@ pub fn cluster_with(tris: &[Tri], tol: f32, order: &mut Vec<u32>, out: &mut Vec<
     }
 }
 
+/// Largest corner error (target pixels) of a group drawn as a blit: its edges come from the
+/// affine, not from the mesh (a path's edges are the mesh's own).
+pub const BLIT_ERROR: f32 = 0.25;
+
 /// Path coordinates are in 1/`PATH_SCALE` target pixels: VGLite S16 paths drawn through a
 /// 1/`PATH_SCALE` path matrix. Half the size of FP32 paths, 1/8 pixel precision, +-4095 pixels
 /// of range (farther vertices are clamped).
@@ -424,6 +572,9 @@ pub struct Call<'a> {
     pub bounds: [i16; 4],
     /// Texel -> target pixel affine (`Cluster::m`).
     pub matrix: [f32; 6],
+    /// With [`Paths::blits`]: the group is this texel rectangle (x, y, width, height) mapped by
+    /// `matrix`, to be drawn as an image blit (`path` is then empty).
+    pub rect: Option<[i32; 4]>,
 }
 
 /// Turns draw lists into GPU calls: the visible triangles of each batch, grouped by affine
@@ -441,6 +592,8 @@ pub struct Paths {
     clusters: Vec<Cluster>,
     pending: Vec<u32>,
     rest: Vec<u32>,
+    alt: Vec<u32>,
+    alt_rest: Vec<u32>,
     #[cfg(feature = "outline")]
     outline: Outline,
     data: Vec<i16>,
@@ -448,6 +601,13 @@ pub struct Paths {
     pub tolerance: f32,
     /// Paths as cluster outlines instead of one subpath per triangle (feature `outline`).
     pub outline_paths: bool,
+    /// Groups that are one texel rectangle drawn rigidly come as [`Call::rect`] (image blits:
+    /// no path to build, upload or rasterize as edges).
+    pub blits: bool,
+    /// Calls given as rectangles since [`Paths::reset_stats`].
+    pub rects: u32,
+    /// Least-squares refits tried per group (0: the seed triangle's affine only).
+    pub refits: u8,
     /// Visible triangles and calls since [`Paths::reset_stats`].
     pub triangles: u32,
     pub calls: u32,
@@ -455,7 +615,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn new() -> Paths {
-        Paths { tolerance: 0.75, ..Default::default() }
+        Paths { tolerance: 0.75, refits: REFITS, ..Default::default() }
     }
 
     /// Room for batches of up to `max_triangles` triangles and `max_vertices` vertices.
@@ -473,6 +633,8 @@ impl Paths {
             && grow(&mut self.clusters, n)
             && grow(&mut self.pending, n)
             && grow(&mut self.rest, n)
+            && grow(&mut self.alt, n)
+            && grow(&mut self.alt_rest, n)
             && grow(&mut self.data, n * 10 + 2)
             && self.reserve_outline(n)
     }
@@ -490,6 +652,7 @@ impl Paths {
     pub fn reset_stats(&mut self) {
         self.triangles = 0;
         self.calls = 0;
+        self.rects = 0;
     }
 
     /// Clusters the batch's visible triangles into `order` / `clusters` (as [`cluster_with`]).
@@ -515,7 +678,9 @@ impl Paths {
             let candidates = &self.pending[head + 1..];
             let (mut taken, mut left) = (self.order.len(), 0usize);
             let (order, rest) = (self.order.as_mut_ptr(), self.rest.as_mut_ptr());
-            let tris = &self.tris;
+            // A slice (pointer and length in registers), not the Vec: its header would be reloaded
+            // after every store through the raw pointers.
+            let tris: &[Tri] = &self.tris;
             for &i in candidates {
                 // SAFETY: `pending` only holds indices of `tris`.
                 let fit = unsafe { tris.get_unchecked(i as usize) }.fits(&m, tol);
@@ -532,6 +697,33 @@ impl Paths {
             unsafe {
                 self.order.set_len(taken);
                 self.rest.set_len(left);
+            }
+            let mut m = m;
+            // Refits: one affine fitted to all the members' corners usually places more of this
+            // round's triangles within tolerance than the seed's own does (10-25% fewer calls).
+            for _ in 0..self.refits {
+                if taken - start < REFIT_MIN || self.rest.is_empty() {
+                    break;
+                }
+                let Some(m2) = fit_affine(&self.tris, &self.order[start..taken]) else { break };
+                self.alt.clear();
+                self.alt_rest.clear();
+                for &i in self.order[start..taken].iter().chain(self.rest.iter()) {
+                    // SAFETY: both lists only hold indices of `tris`.
+                    if unsafe { self.tris.get_unchecked(i as usize) }.fits(&m2, tol) {
+                        self.alt.push(i);
+                    } else {
+                        self.alt_rest.push(i);
+                    }
+                }
+                if self.alt.len() <= taken - start {
+                    break;
+                }
+                self.order.truncate(start);
+                self.order.extend_from_slice(&self.alt);
+                core::mem::swap(&mut self.rest, &mut self.alt_rest);
+                taken = self.order.len();
+                m = m2;
             }
             self.clusters.push(Cluster { start: start as u32, count: (taken - start) as u32, m });
             core::mem::swap(&mut self.pending, &mut self.rest);
@@ -576,32 +768,91 @@ impl Paths {
             let v0 = b.first_vertex as usize;
             let span = v0 * 2..(v0 + b.vertex_count as usize) * 2;
             let (Some(pos), Some(uv)) = (list.positions.get(span.clone()), list.uvs.get(span)) else { continue };
+            let n = b.vertex_count as usize;
+            let Some(idx) = list.indices.get(b.first_index as usize..(b.first_index + b.index_count) as usize) else { continue };
+            // Every index is checked once here: the loops below index without checks.
+            if idx.iter().any(|&i| i as usize >= n) {
+                continue;
+            }
+            // One pass over the vertices: target pixels, path units, texels, and the batch's
+            // bounds (written straight into reserved room).
             self.screen.clear();
-            self.screen.extend(pos.chunks_exact(2).map(|q| [(q[0] - cx) * s + w2, h2 - (q[1] - cy) * s]));
             self.fixed.clear();
-            self.fixed.extend(self.screen.iter().map(|p| [path_coord(p[0]), path_coord(p[1])]));
             self.texel.clear();
-            self.texel.extend(uv.chunks_exact(2).map(|t| [t[0] * pw, t[1] * ph]));
-            let idx = &list.indices[b.first_index as usize..(b.first_index + b.index_count) as usize];
-            // Only the triangles that reach the target are kept.
-            self.tris.clear();
-            self.tris.reserve(idx.len() / 3);
-            for t in idx.chunks_exact(3) {
-                let (a, bb, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
-                let (qa, qb, qc) = (self.fixed[a], self.fixed[bb], self.fixed[c]);
-                let vis = !(qa[0].max(qb[0]).max(qc[0]) < 0
-                    || qa[1].max(qb[1]).max(qc[1]) < 0
-                    || qa[0].min(qb[0]).min(qc[0]) > limit_x
-                    || qa[1].min(qb[1]).min(qc[1]) > limit_y);
-                if !vis {
+            self.screen.reserve(n);
+            self.fixed.reserve(n);
+            self.texel.reserve(n);
+            let (mut lo, mut hi) = ([i16::MAX; 2], [i16::MIN; 2]);
+            {
+                let (sc, fx, tx) = (self.screen.spare_capacity_mut(), self.fixed.spare_capacity_mut(), self.texel.spare_capacity_mut());
+                for (k, (q, t)) in pos.chunks_exact(2).zip(uv.chunks_exact(2)).enumerate() {
+                    let p = [(q[0] - cx) * s + w2, h2 - (q[1] - cy) * s];
+                    let f = [path_coord(p[0]), path_coord(p[1])];
+                    lo = [lo[0].min(f[0]), lo[1].min(f[1])];
+                    hi = [hi[0].max(f[0]), hi[1].max(f[1])];
+                    // SAFETY: `k < n` (the spans hold `n` vertices) and each list has room for `n`.
+                    unsafe {
+                        sc.get_unchecked_mut(k).write(p);
+                        fx.get_unchecked_mut(k).write(f);
+                        tx.get_unchecked_mut(k).write([t[0] * pw, t[1] * ph]);
+                    }
+                }
+            }
+            // SAFETY: the first `n` entries of each were written just above.
+            unsafe {
+                self.screen.set_len(n);
+                self.fixed.set_len(n);
+                self.texel.set_len(n);
+            }
+            // Only the triangles that reach the target are kept. The batch's bounds decide for
+            // all of them at once when it lies wholly on or wholly off the target.
+            if hi[0] < 0 || hi[1] < 0 || lo[0] > limit_x || lo[1] > limit_y {
+                continue;
+            }
+            let all_in = lo[0] >= 0 && lo[1] >= 0 && hi[0] <= limit_x && hi[1] <= limit_y;
+            // A region attachment (or a one-quad mesh): one atlas rectangle drawn rigidly is a
+            // blit, found from its four corners without building triangles or clustering.
+            if self.blits && b.vertex_count == 4 && idx.len() == 6 {
+                let quad = quad_order(idx).and_then(|o| quad_blit(&o.map(|k| self.screen[k]), &o.map(|k| self.texel[k])));
+                if let Some((rect, m)) = quad {
+                    self.triangles += 2;
+                    self.calls += 1;
+                    self.rects += 1;
+                    emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &[], bounds: [0; 4], matrix: m, rect: Some(rect) });
                     continue;
                 }
-                self.tris.push(Tri {
-                    s: [self.screen[a], self.screen[bb], self.screen[c]],
-                    t: [self.texel[a], self.texel[bb], self.texel[c]],
-                    v: [a as u32, bb as u32, c as u32],
-                });
             }
+            self.tris.clear();
+            self.tris.reserve(idx.len() / 3);
+            let mut kept = 0;
+            {
+                let (screen, fixed, texel) = (&self.screen[..], &self.fixed[..], &self.texel[..]);
+                let out = self.tris.spare_capacity_mut();
+                for t in idx.chunks_exact(3) {
+                    let (a, bb, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+                    // SAFETY: every index is below `n` (checked above), the length of the three.
+                    let (qa, qb, qc) = unsafe { (*fixed.get_unchecked(a), *fixed.get_unchecked(bb), *fixed.get_unchecked(c)) };
+                    let vis = all_in
+                        || !(qa[0].max(qb[0]).max(qc[0]) < 0
+                            || qa[1].max(qb[1]).max(qc[1]) < 0
+                            || qa[0].min(qb[0]).min(qc[0]) > limit_x
+                            || qa[1].min(qb[1]).min(qc[1]) > limit_y);
+                    if !vis {
+                        continue;
+                    }
+                    // SAFETY: as above; `kept` < idx.len() / 3, the room reserved.
+                    unsafe {
+                        out.get_unchecked_mut(kept).write(Tri {
+                            s: [*screen.get_unchecked(a), *screen.get_unchecked(bb), *screen.get_unchecked(c)],
+                            t: [*texel.get_unchecked(a), *texel.get_unchecked(bb), *texel.get_unchecked(c)],
+                            v: [a as u32, bb as u32, c as u32],
+                        });
+                    }
+                    kept += 1;
+                }
+            }
+            // SAFETY: the first `kept` entries were written just above.
+            unsafe { self.tris.set_len(kept) };
             if self.tris.is_empty() {
                 continue;
             }
@@ -613,6 +864,16 @@ impl Paths {
                 let mut lo = [i16::MAX; 2];
                 let mut hi = [i16::MIN; 2];
                 let members = &self.order[c.start as usize..(c.start + c.count) as usize];
+                if self.blits && c.count == 2 {
+                    let pair = [self.tris[members[0] as usize], self.tris[members[1] as usize]];
+                    // Drawn by the affine alone, so its corners must land where the mesh has them.
+                    if let Some(rect) = texel_rect(&pair).filter(|_| pair.iter().all(|t| t.error(&c.m) <= BLIT_ERROR)) {
+                        self.calls += 1;
+                        self.rects += 1;
+                        emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &[], bounds: [0; 4], matrix: c.m, rect: Some(rect) });
+                        continue;
+                    }
+                }
                 #[cfg(feature = "outline")]
                 let outlined = self.outline_paths;
                 #[cfg(not(feature = "outline"))]
@@ -656,7 +917,7 @@ impl Paths {
                     d.push(0);
                 }
                 self.calls += 1;
-                emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &self.data, bounds: [lo[0], lo[1], hi[0], hi[1]], matrix: c.m });
+                emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &self.data, bounds: [lo[0], lo[1], hi[0], hi[1]], matrix: c.m, rect: None });
             }
         }
     }
@@ -905,5 +1166,67 @@ mod clip_tests {
             }
         }
         assert!((area.abs() - 0.5).abs() < 1e-4, "area {area}");
+    }
+}
+
+#[cfg(test)]
+mod rect_tests {
+    use super::*;
+
+    fn tri(t: [[f32; 2]; 3]) -> Tri {
+        Tri { s: t, t, v: [0, 1, 2] }
+    }
+
+    #[test]
+    fn a_quad_split_along_a_diagonal_is_its_rectangle() {
+        let (a, b, c, d) = ([2.0, 3.0], [10.0, 3.0], [10.0, 7.0], [2.0, 7.0]);
+        assert_eq!(texel_rect(&[tri([a, b, c]), tri([a, c, d])]), Some([2, 3, 8, 4]));
+        assert_eq!(texel_rect(&[tri([b, c, d]), tri([d, a, b])]), Some([2, 3, 8, 4]));
+    }
+
+    #[test]
+    fn a_rigid_quad_is_a_blit() {
+        // Texels (4, 6)..(12, 10) turned a quarter and moved: x' = 100 - v, y' = 20 + u.
+        let t = [[4.0, 6.0], [12.0, 6.0], [12.0, 10.0], [4.0, 10.0]];
+        let s: Vec<[f32; 2]> = t.iter().map(|p| [100.0 - p[1], 20.0 + p[0]]).collect();
+        let (rect, m) = quad_blit(&s, &t).unwrap();
+        assert_eq!(rect, [4, 6, 8, 4]);
+        for (p, q) in t.iter().zip(&s) {
+            assert!((m[0] * p[0] + m[1] * p[1] + m[2] - q[0]).abs() < 1e-4);
+            assert!((m[3] * p[0] + m[4] * p[1] + m[5] - q[1]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn quads_are_put_in_order_round_their_diagonal() {
+        assert_eq!(quad_order(&QUAD_INDICES), Some([0, 1, 2, 3]));
+        // Diagonal 1-3: 1, 2, 3, 0.
+        assert_eq!(quad_order(&[1, 2, 3, 1, 3, 0]), Some([1, 2, 3, 0]));
+        assert_eq!(quad_order(&[0, 1, 2, 0, 1, 2]), None);
+        assert_eq!(quad_order(&[0, 1, 2, 3, 4, 5]), None);
+    }
+
+    #[test]
+    fn bent_or_scrambled_quads_are_not() {
+        let t = [[4.0, 6.0], [12.0, 6.0], [12.0, 10.0], [4.0, 10.0]];
+        let mut s: Vec<[f32; 2]> = t.to_vec();
+        s[3][0] += 1.0; // one corner off the affine
+        assert!(quad_blit(&s, &t).is_none());
+        // 0 and 2 adjacent, not opposite: the triangles would overlap.
+        let t2 = [[4.0, 6.0], [12.0, 10.0], [12.0, 6.0], [4.0, 10.0]];
+        assert!(quad_blit(&t2, &t2).is_none());
+    }
+
+    #[test]
+    fn overlapping_or_partial_pairs_are_not() {
+        let (a, b, c, d) = ([2.0, 3.0], [10.0, 3.0], [10.0, 7.0], [2.0, 7.0]);
+        // Both leave out corners next to each other: they overlap and miss a quarter.
+        assert_eq!(texel_rect(&[tri([a, b, c]), tri([a, b, d])]), None);
+        // A corner inside the rectangle.
+        assert_eq!(texel_rect(&[tri([a, b, [6.0, 5.0]]), tri([a, c, d])]), None);
+        // Not on whole texels.
+        let e = [2.5, 3.0];
+        assert_eq!(texel_rect(&[tri([e, b, c]), tri([e, c, [2.5, 7.0]])]), None);
+        assert_eq!(texel_rect(&[tri([a, b, c])]), None);
     }
 }

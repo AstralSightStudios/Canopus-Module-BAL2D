@@ -520,6 +520,14 @@ pub fn read_skeleton(bytes: &[u8], scale: f32) -> Result<SkeletonData> {
         }
     }
 
+    // Weighted tables are checked once here, so skinning can index them without checks.
+    let bone_count = d.bones.len();
+    for a in d.attachments.iter_mut() {
+        if let AttachmentKind::Mesh(m) = &mut a.kind {
+            m.vertices.check(bone_count);
+        }
+    }
+
     // Events.
     let n = input.count()?;
     for _ in 0..n {
@@ -565,7 +573,7 @@ fn read_vertices(input: &mut Input, weighted: bool, scale: f32) -> Result<Vertic
         for _ in 0..count * 2 {
             v.push(input.f32()? * scale);
         }
-        return Ok(Vertices { bones: Vec::new(), vertices: v, world_len });
+        return Ok(Vertices { bones: Vec::new(), vertices: v, world_len, checked: false, bone_bound: 0 });
     }
     let mut bones = Vec::with_capacity(count * 3);
     let mut weights = Vec::with_capacity(count * 9);
@@ -579,7 +587,7 @@ fn read_vertices(input: &mut Input, weighted: bool, scale: f32) -> Result<Vertic
             weights.push(input.f32()?);
         }
     }
-    Ok(Vertices { bones, vertices: weights, world_len })
+    Ok(Vertices { bones, vertices: weights, world_len, checked: false, bone_bound: 0 })
 }
 
 fn read_skin(
@@ -821,7 +829,7 @@ impl CurveBuilder {
             curves[frame_count - 1] = CURVE_STEPPED;
         }
         CurveBuilder {
-            curve: Curve { entries: entries as u8, frames: vec![0.0; frame_count * entries], curves },
+            curve: Curve { entries: entries as u8, frames: vec![0.0; frame_count * entries], curves, constant: false },
             frame_count,
             bezier: 0,
         }
@@ -874,6 +882,23 @@ impl CurveBuilder {
         // Drop unused Bezier storage (the writer may over-count).
         let size = self.frame_count + self.bezier * BEZIER_SIZE;
         self.curve.curves.truncate(size);
+        let c = &mut self.curve;
+        let (e, n) = (c.entries as usize, self.frame_count);
+        // Bit equality: a curve between equal keys with handles away from them still moves.
+        c.constant = e >= 2
+            && n > 0
+            && (1..e).all(|v| {
+                let x = c.frames[v].to_bits();
+                (1..n).all(|k| c.frames[k * e + v].to_bits() == x)
+                    && (0..n - 1).all(|k| {
+                        let t = c.curves[k];
+                        if t < CURVE_BEZIER {
+                            return true;
+                        }
+                        let b = t as usize - 2 + (v - 1) * BEZIER_SIZE;
+                        c.curves.get(b + 3).is_some_and(|_| c.curves[b + 1].to_bits() == x && c.curves[b + 3].to_bits() == x)
+                    })
+            });
         self.curve
     }
 }
@@ -1253,7 +1278,8 @@ fn read_animation(input: &mut Input, name: String, d: &SkeletonData, scale: f32)
                                 frame += 1;
                             }
                         }
-                        timelines.push(Timeline::Deform { slot, attachment, curve: b.finish(), vertices });
+                        let constant = vertices.windows(2).all(|w| w[0].iter().zip(&w[1]).all(|(a, b)| a.to_bits() == b.to_bits()));
+                        timelines.push(Timeline::Deform { slot, attachment, curve: b.finish(), vertices, constant });
                     }
                     ATTACHMENT_SEQUENCE => {
                         let mut frames = Vec::with_capacity(frame_count * 3);

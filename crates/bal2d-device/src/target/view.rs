@@ -3,7 +3,11 @@
 //! * Marker mode: a patched watchface carries a placeholder Image record with a known UID; the
 //!   firmware instantiates it as a `wfimg` (an `lv_image` subclass) at the layer's z position
 //!   in the watchface. We point that object at our frame.
-//! * Overlay mode (development): our own `lv_image` on the display's top layer.
+//! * Overlay mode ("全屏显示", for watchfaces without a layer): our own full-screen `lv_image`
+//!   as the last child of the watchface's container (the parent of its first `wfimg`). It is
+//!   part of the watchface like a marker: it scrolls away with it (the launcher and apps are
+//!   never covered), swipes bubble to the home pages, and LVGL's cover check skips drawing the
+//!   watchface under it (it is opaque). Watchfaces without `wfimg` objects (Lua) get none.
 //!
 //! The source is an in-memory LVGL 9 image descriptor over the render target. Two descriptors
 //! alternate so each frame is a new source for LVGL (and its cache entry is dropped).
@@ -18,6 +22,15 @@ use super::lv::{self, Obj, event, flag};
 
 /// LVGL's DELETE event.
 const EVENT_DELETE: u32 = 36;
+/// LVGL's DRAW_MAIN event (twelve before DELETE in LVGL 9.2's list): LVGL drew the object.
+const EVENT_DRAW_MAIN: u32 = 24;
+/// After a frame is handed over, LVGL must draw the object within this long (ms), or it counts
+/// as covered (another page or window drawn over the watchface).
+const COVER_GRACE_MS: u32 = 300;
+/// While covered, the object is offered to LVGL again this often (ms) to notice it uncovered.
+const COVER_PROBE_MS: u32 = 500;
+/// Pages followed at once (home has four, plus the launcher list and the control centre).
+const PAGE_SLOTS: usize = 16;
 const LV_IMAGE_HEADER_MAGIC: u32 = 0x19;
 const LV_COLOR_FORMAT_RGB565: u32 = 0x12;
 
@@ -59,6 +72,17 @@ pub struct View {
     flip: usize,
     /// The object's screen rectangle (x, y, w, h) at the last attach.
     pub rect: (i32, i32, i32, i32),
+    /// The display size (set at attach): an object scrolled off it is not drawn.
+    screen: (i32, i32),
+    /// Full-screen objects drawn after ours (later siblings of it and of its ancestors) last seen
+    /// off the screen or hidden, or covering it after that: pages that can slide or appear over
+    /// the watchface (compared, never read). Rebuilt from the live siblings at every check.
+    pages: [usize; PAGE_SLOTS],
+    pages_len: usize,
+    /// When LVGL last drew the object, the last frame was handed over, and the last probe (ms).
+    drawn_at: u32,
+    presented_at: u32,
+    probed_at: u32,
     pub touches: heapless_touch::Queue,
     /// A press on a drag area holds the scroll chain and gesture bubbling back.
     grabbed: bool,
@@ -123,6 +147,12 @@ pub fn view() -> &'static mut View {
                 dsc: [empty(), empty()],
                 flip: 0,
                 rect: (0, 0, 0, 0),
+                screen: (0, 0),
+                pages: [0; PAGE_SLOTS],
+                pages_len: 0,
+                drawn_at: 0,
+                presented_at: 0,
+                probed_at: 0,
                 touches: heapless_touch::Queue::new(),
                 grabbed: false,
                 touch: lv::NULL,
@@ -152,7 +182,7 @@ impl View {
 
     /// Places the touch proxy over `rect` (screen coordinates), creating it on first use.
     pub fn place_touch(&mut self, rect: (i32, i32, i32, i32)) {
-        if self.mode != Mode::Marker || self.obj.is_null() || rect.2 <= 0 || rect.3 <= 0 {
+        if self.mode == Mode::None || self.obj.is_null() || rect.2 <= 0 || rect.3 <= 0 {
             return;
         }
         if self.touch.is_null() {
@@ -195,7 +225,7 @@ impl View {
     /// layout yet; then the placeholder's own size (resource record: width +12, height +14) is
     /// used until LVGL lays it out.
     pub fn remeasure(&mut self) {
-        if self.mode != Mode::Marker || self.obj.is_null() {
+        if self.mode == Mode::None || self.obj.is_null() {
             return;
         }
         let (x, y, w, h) = unsafe { lv::measured(self.obj) };
@@ -223,18 +253,33 @@ impl View {
         if self.obj.is_null() {
             return false;
         }
-        if self.mode == Mode::Overlay {
-            return true;
-        }
+        // Apps and the launcher do not change the active screen on this firmware: they are
+        // sibling windows of the watchface's, shown and hidden with LV_OBJ_FLAG_HIDDEN, so a
+        // hidden ancestor means the watchface is not on screen (our own flag is ours to set).
         let mut o = self.obj;
         for _ in 0..64 {
             let parent = unsafe { core::ptr::read_volatile((o as *const *mut c_void).add(1)) };
             if parent.is_null() {
-                return o == fw::active_screen();
+                return o == fw::active_screen() && self.on_display();
+            }
+            if unsafe { lv::flags(parent) } & flag::HIDDEN != 0 {
+                return false;
             }
             o = parent;
         }
         false
+    }
+
+    /// Whether the object overlaps the display (its coordinates are absolute; a `wfimg` that
+    /// reports no size has the size of its resource record, kept in `rect`).
+    fn on_display(&self) -> bool {
+        let (sw, sh) = self.screen;
+        if sw <= 0 || sh <= 0 {
+            return true;
+        }
+        let (x, y, w, h) = unsafe { lv::measured(self.obj) };
+        let (w, h) = if w > 1 && h > 1 { (w, h) } else { (self.rect.2, self.rect.3) };
+        x < sw && y < sh && x + w > 0 && y + h > 0
     }
 
     pub fn set_hidden(&mut self, hidden: bool) {
@@ -262,6 +307,119 @@ impl View {
         self.flip ^= 1;
         let src = &*self.dsc[self.flip] as *const ImageDsc as *const c_void;
         unsafe { lvx_image_set_src(self.obj, src) };
+        self.presented_at = lv::now_ms();
+    }
+
+    /// Calls `f` for every object drawn after ours: the later siblings of the object and of each
+    /// of its ancestors (all alive while the object is).
+    fn later_siblings(&self, mut f: impl FnMut(Obj) -> bool) -> bool {
+        let mut o = self.obj;
+        for _ in 0..32 {
+            let parent = unsafe { lv::parent(o) };
+            if parent.is_null() {
+                break;
+            }
+            let kids = unsafe { lv::children(parent) };
+            if let Some(i) = kids.iter().position(|k| *k == o) {
+                for &k in &kids[i + 1..] {
+                    if f(k) {
+                        return true;
+                    }
+                }
+            }
+            o = parent;
+        }
+        false
+    }
+
+    /// Whether `o` is shown over most of the display.
+    fn over_screen(&self, o: Obj) -> bool {
+        let (sw, sh) = self.screen;
+        if o.is_null() || sw <= 0 || sh <= 0 || unsafe { lv::flags(o) } & flag::HIDDEN != 0 {
+            return false;
+        }
+        let (x, y, w, h) = unsafe { lv::measured(o) };
+        let ow = (x + w).min(sw) - x.max(0);
+        let oh = (y + h).min(sh) - y.max(0);
+        ow > 0 && oh > 0 && (ow as i64 * oh as i64) * 5 >= (sw as i64 * sh as i64) * 4
+    }
+
+    /// Whether `o` is the size of most of the display, wherever it is.
+    fn screen_sized(&self, o: Obj) -> bool {
+        let (sw, sh) = self.screen;
+        let (_, _, w, h) = unsafe { lv::measured(o) };
+        sw > 0 && sh > 0 && (w.min(sw) as i64 * h.min(sh) as i64) * 5 >= (sw as i64 * sh as i64) * 4
+    }
+
+    /// Whether a page slid or appeared over the watchface. The launcher list, the control centre
+    /// and the other home pages are screen-sized siblings drawn after it, kept hidden or off the
+    /// screen until shown, and LVGL keeps drawing the watchface under them. A screen-sized object
+    /// first seen already over the screen is the watchface's own (a Lua face builds its
+    /// full-screen parts after the layer exists) and never counts: only one seen away first does.
+    pub fn paged_over(&mut self) -> bool {
+        if self.obj.is_null() {
+            self.pages_len = 0;
+            return false;
+        }
+        let known = self.pages;
+        let known = &known[..self.pages_len];
+        let (mut next, mut n, mut paged) = ([0usize; PAGE_SLOTS], 0, false);
+        self.later_siblings(|o| {
+            if !self.screen_sized(o) {
+                return false;
+            }
+            let over = self.over_screen(o);
+            let page = known.contains(&(o as usize));
+            paged |= over && page;
+            if (!over || page) && n < PAGE_SLOTS {
+                next[n] = o as usize;
+                n += 1;
+            }
+            false
+        });
+        self.pages = next;
+        self.pages_len = n;
+        paged
+    }
+
+    /// Debug: the ancestor chain (class [index/count]).
+    pub fn chain_debug(&self) -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        let mut o = self.obj;
+        for _ in 0..32 {
+            let parent = unsafe { lv::parent(o) };
+            if parent.is_null() {
+                break;
+            }
+            let kids = unsafe { lv::children(parent) };
+            let i = kids.iter().position(|k| *k == o).map_or(-1, |i| i as i32);
+            let class = unsafe { core::ptr::read_volatile(parent as *const usize) };
+            s += &alloc::format!(" {:x}[{i}/{}]", class & 0xffff, kids.len());
+            o = parent;
+        }
+        s += &alloc::format!("; pages {}", self.pages_len);
+        s
+    }
+
+    /// Whether LVGL has stopped drawing the object although it is visible by the tree: the
+    /// launcher, the control centre and other pages are drawn over the watchface without hiding
+    /// or moving it. While covered, the frame is offered again every `COVER_PROBE_MS` (no new
+    /// rendering) and drawing resumes once LVGL draws it.
+    pub fn covered(&mut self, now: u32) -> bool {
+        if self.obj.is_null() || self.presented_at == 0 {
+            return false;
+        }
+        let drawn_since = self.drawn_at.wrapping_sub(self.presented_at) as i32 >= 0;
+        if drawn_since || now.wrapping_sub(self.presented_at) < COVER_GRACE_MS {
+            return false;
+        }
+        if now.wrapping_sub(self.probed_at) >= COVER_PROBE_MS {
+            self.probed_at = now;
+            self.present();
+            // A probe is not a frame: the grace period does not start again.
+            self.presented_at = now.wrapping_sub(COVER_GRACE_MS);
+        }
+        true
     }
 
     pub fn detach(&mut self) {
@@ -279,15 +437,27 @@ impl View {
                 lv::on_event(obj, touch_event, code, code as usize);
             }
             lv::on_event(obj, deleted, EVENT_DELETE, 0);
+            lv::on_event(obj, drawn, EVENT_DRAW_MAIN, 0);
         }
+        self.drawn_at = 0;
+        self.presented_at = 0;
     }
 
-    /// Development overlay on the top layer, full screen.
+    /// The full-screen layer on top of a watchface without one (see the module docs).
     pub fn attach_overlay(&mut self, width: i32, height: i32) -> bool {
         if self.mode == Mode::Overlay && !self.obj.is_null() {
             return true;
         }
-        let parent = fw::layer_top();
+        let root = fw::active_screen();
+        if root.is_null() {
+            return false;
+        }
+        let mut image: Obj = lv::NULL;
+        fw::tree_walk(root, find_wfimg, (&mut image) as *mut Obj as *mut c_void);
+        if image.is_null() {
+            return false;
+        }
+        let parent = unsafe { core::ptr::read_volatile((image as *const *mut c_void).add(1)) };
         if parent.is_null() {
             return false;
         }
@@ -296,13 +466,18 @@ impl View {
             return false;
         }
         unsafe {
-            lv::clear_flag(obj, flag::SCROLLABLE | flag::CLICK_FOCUSABLE | flag::GESTURE_BUBBLE | flag::EVENT_BUBBLE);
+            // Like a marker: not scrollable itself, so drags scroll the home pages.
+            lv::clear_flag(obj, flag::SCROLLABLE | flag::CLICK_FOCUSABLE);
             lvx_object_set_size(obj, width, height);
             lvx_object_align(obj, lv::align::TOP_LEFT, 0, 0);
         }
         self.hook_events(obj);
         self.obj = obj;
         self.mode = Mode::Overlay;
+        self.screen = (width, height);
+        self.pages_len = 0;
+        self.paged_over();
+        super::trace(&alloc::format!("attach chain:{}", self.chain_debug()));
         self.rect = (0, 0, width, height);
         true
     }
@@ -329,6 +504,10 @@ impl View {
         self.hook_events(found);
         self.obj = found;
         self.mode = Mode::Marker;
+        self.screen = screen;
+        self.pages_len = 0;
+        self.paged_over();
+        super::trace(&alloc::format!("attach chain:{}", self.chain_debug()));
         let (x, y, w, h) = unsafe { lv::measured(found) };
         let class = unsafe { core::ptr::read_volatile(found as *const usize) };
         if class != fw::WFIMG_CLASS && w <= 16 && h <= 16 {
@@ -340,6 +519,18 @@ impl View {
         self.rect = (x, y, w, h);
         true
     }
+}
+
+/// The first `wfimg` of a watchface (its container hosts the overlay).
+extern "C" fn find_wfimg(obj: *mut c_void, user: *mut c_void) -> u32 {
+    if obj.is_null() {
+        return 0;
+    }
+    if unsafe { core::ptr::read_volatile(obj as *const usize) } == fw::WFIMG_CLASS {
+        unsafe { *(user as *mut Obj) = obj };
+        return 2; // stop
+    }
+    0
 }
 
 extern "C" fn find_marker(obj: *mut c_void, user: *mut c_void) -> u32 {
@@ -399,6 +590,10 @@ extern "C" fn proxy_deleted(_e: *mut c_void) {
     let v = view();
     v.touch = lv::NULL;
     v.touch_rect = (0, 0, 0, 0);
+}
+
+extern "C" fn drawn(_e: *mut c_void) {
+    view().drawn_at = lv::now_ms();
 }
 
 extern "C" fn deleted(_e: *mut c_void) {

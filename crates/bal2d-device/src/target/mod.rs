@@ -46,6 +46,8 @@ static BT_LINK: AtomicU8 = AtomicU8::new(0xFF);
 const BREATHER_MS: u32 = 250;
 const BREATHER_EVERY_MS: u32 = 2000;
 const LINK_SETTLE_MS: u32 = 10_000;
+/// Frame + redraw (ms) above which half of it, not a third, stays idle.
+const HEAVY_BUSY_MS: u32 = 80;
 
 unsafe extern "C" fn on_bt_state(_ctx: *const canopus_abi::ContextV1, _topic: *const core::ffi::c_char, payload: *const c_void, len: u32, _user: *mut c_void) {
     if len >= 2 && !payload.is_null() {
@@ -125,6 +127,9 @@ pub struct Runtime {
     status_at: u32,
     /// The phone link at the last frame, when it last came up, and the last breather (ms).
     bt_was: u8,
+    /// Why the last frame was skipped (bits: not visible, paged over, covered; 0 drawn), for
+    /// the log on changes.
+    gate_was: u8,
     bt_up_at: u32,
     breather_at: u32,
     /// A frame's whole cost, its own plus the UI work it causes (ms, smoothed), and when the
@@ -169,6 +174,7 @@ pub fn rt() -> &'static mut Runtime {
                 busy_ms: 0,
                 status_at: 0,
                 bt_was: 0xFF,
+                gate_was: 0,
                 bt_up_at: 0,
                 breather_at: 0,
                 quality_changed: 0,
@@ -424,7 +430,7 @@ fn load_step() -> Option<i32> {
     let r = rt();
     let Some(l) = r.loader.as_mut() else {
         let Some(name) = pick_pack() else { return Some(-2) };
-        trace(&alloc::format!("loading {name}; heap free {} KB largest {} KB", heap_free_kb(), largest_block_kb()));
+        trace(&alloc::format!("loading {name}; heap: free {} KB, largest {} KB", heap_free_kb(), largest_block_kb()));
         let Some(file) = Fs::open(&alloc::format!("{PACK_DIR}/{name}"), canopus_abi::FS_READ) else { return Some(-5) };
         r.loader = Some(Loader { name, src: FileSource { file }, t0: lv::now_ms(), lobby: None, pages: Vec::new(), per_layer: Vec::new(), next: 0 });
         return None;
@@ -432,7 +438,7 @@ fn load_step() -> Option<i32> {
     let Some(lobby) = l.lobby.as_ref() else {
         match Lobby::load_from(&mut l.src) {
             Ok((lobby, pages)) => {
-                trace(&alloc::format!("parsed in {} ms; {} pages; heap free {} KB largest {} KB", lv::now_ms().wrapping_sub(l.t0), pages.len(), heap_free_kb(), largest_block_kb()));
+                trace(&alloc::format!("parsed in {} ms; {} pages; heap: free {} KB, largest {} KB", lv::now_ms().wrapping_sub(l.t0), pages.len(), heap_free_kb(), largest_block_kb()));
                 l.per_layer = (0..lobby.layers.len()).map(|_| Vec::new()).collect();
                 l.lobby = Some(lobby);
                 l.pages = pages;
@@ -446,7 +452,7 @@ fn load_step() -> Option<i32> {
     };
     if let Some(p) = l.pages.get(l.next) {
         let up = gpu::Page::from_pack(&mut l.src, p);
-        trace(&alloc::format!("page {}/{} {}x{} {:?}: {}; heap free {} KB", p.layer, p.index, p.header.width, p.header.height, p.header.format, up.as_ref().err().copied().unwrap_or(0), heap_free_kb()));
+        trace(&alloc::format!("page {}/{} {}x{} {:?}: {}; heap: free {} KB", p.layer, p.index, p.header.width, p.header.height, p.header.format, up.as_ref().err().copied().unwrap_or(0), heap_free_kb()));
         match up {
             Ok(page) => l.per_layer[p.layer as usize].push(page),
             Err(e) => return Some(e),
@@ -457,7 +463,7 @@ fn load_step() -> Option<i32> {
     let bake = match &lobby.bake {
         Some(b) => match gpu::BakeImage::from_pack(&mut l.src, b) {
             Ok(img) => {
-                trace(&alloc::format!("bake {}x{} at ({}, {}){}; heap free {} KB", b.header.width, b.header.height, b.header.x, b.header.y, if b.after_intro { " after the intro" } else { "" }, heap_free_kb()));
+                trace(&alloc::format!("bake {}x{} at ({}, {}){}; heap: free {} KB", b.header.width, b.header.height, b.header.x, b.header.y, if b.after_intro { " after the intro" } else { "" }, heap_free_kb()));
                 Some(img)
             }
             Err(e) => return Some(e),
@@ -498,11 +504,15 @@ fn load_step() -> Option<i32> {
         && r.list.indices.try_reserve_exact(idx).is_ok()
         && r.list.batches.try_reserve_exact(512).is_ok()
         && r.renderer.reserve(max_tris);
-    trace(&alloc::format!("buffers: {verts} vertices, {idx} indices, {max_tris} triangles max: {ok}; heap free {} KB", heap_free_kb()));
+    trace(&alloc::format!("buffers: {verts} vertices, {idx} indices, {max_tris} triangles max: {ok}; heap: free {} KB", heap_free_kb()));
     if !ok {
         return Some(-12);
     }
     let Some(l) = r.loader.take() else { return Some(-22) };
+    // Each lobby starts at the most exact clustering and adapts from there (a light one shown
+    // after a heavy one would otherwise start where the heavy one left it).
+    r.renderer.paths.tolerance = TOLERANCES[0];
+    r.quality_changed = lv::now_ms();
     r.pack = l.name;
     r.lobby = l.lobby;
     r.pages = l.per_layer;
@@ -534,7 +544,7 @@ fn unload() {
     r.loader = None;
     r.boot_error = 0;
     view::view().set_hidden(true);
-    trace(&alloc::format!("unloaded; heap free {} KB", heap_free_kb()));
+    trace(&alloc::format!("unloaded; heap: free {} KB", heap_free_kb()));
 }
 
 /// Starts the runtime: loads the pack, allocates the target, starts the frame timer.
@@ -563,7 +573,7 @@ pub fn start() -> i32 {
         let lock = canopus_runtime::display::acquire_wake_lock(ctx, canopus_abi::WAKELOCK_SCREEN);
         trace(&alloc::format!("keep-awake wake lock: {lock:?}"));
     }
-    trace(&alloc::format!("start: screen {:?} heap free {} KB largest {} KB", r.screen, heap_free_kb(), largest_block_kb()));
+    trace(&alloc::format!("start: screen {:?} heap free {} KB, largest {} KB", r.screen, heap_free_kb(), largest_block_kb()));
     0
 }
 
@@ -691,9 +701,11 @@ extern "C" fn frame(timer: *mut c_void) {
     }
     // Duty-cycle limit. The first call after a frame comes right after LVGL has redrawn the
     // screen with it (the timer then runs every millisecond): that measures what a frame costs
-    // beyond its own work (mostly waiting for the panel's TE pulse and transfer). The UI task is
-    // blocked for all of it, so a third of frame + redraw stays idle (at least 4 ms): the watch's
-    // own UI and Bluetooth always get their turn, however heavy the character and the face are.
+    // beyond its own work (mostly waiting for the panel's TE pulse and transfer). A third of frame
+    // + redraw then stays idle (at least 4 ms), so the watch's own UI and Bluetooth always get
+    // their turn, however heavy the character is. Less (a third of the frame alone, or of the
+    // frame + the redraw's CPU part) lets the phone fail to connect with a heavy lobby drawn
+    // full-screen over an animated face on Mirage: scripts/btstress.py is that test.
     if r.settling {
         r.settling = false;
         let refresh = now.wrapping_sub(r.frame_end).min(1000);
@@ -702,7 +714,9 @@ extern "C" fn frame(timer: *mut c_void) {
         let busy = own + refresh;
         r.busy_ms = (r.busy_ms * 7 + busy) / 8;
         adapt_quality(now);
-        let mut rest = (busy / 3).max(4);
+        // Very heavy frames (under about 9 fps) leave half as much idle again: a heavy lobby
+        // full-screen over an animated face still starved the phone link on Mirage with a third.
+        let mut rest = (if busy > HEAVY_BUSY_MS { busy / 2 } else { busy / 3 }).max(4);
         let link = BT_LINK.load(Ordering::Relaxed);
         if link == 1 && r.bt_was != 1 {
             r.bt_up_at = now;
@@ -740,7 +754,11 @@ extern "C" fn frame(timer: *mut c_void) {
     }
     if r.selftest.is_none() {
         let t = selftest::run(&mut r.renderer);
-        trace(&alloc::format!("self-test flags {:#x}", t.flags));
+        // Development: `dev-refits` (a digit) sets the clustering refits, for A/B timing.
+        if let Some(n) = Fs::read("dev-refits", 4).and_then(|b| b.first().copied()).filter(|c| c.is_ascii_digit()) {
+            r.renderer.paths.refits = n - b'0';
+        }
+        trace(&alloc::format!("self-test flags {:#x}, region blits {}, refits {}", t.flags, r.renderer.paths.blits, r.renderer.paths.refits));
         r.selftest = Some(t);
         return;
     }
@@ -752,7 +770,7 @@ extern "C" fn frame(timer: *mut c_void) {
             r.loader = None;
             r.boot_error = rc;
         }
-        trace(&alloc::format!("load result {rc}"));
+        trace(&alloc::format!("load result: {rc}"));
         return;
     }
     if !screen_on() {
@@ -762,7 +780,13 @@ extern "C" fn frame(timer: *mut c_void) {
     let r = rt();
     let v = view::view();
     let (Some(lobby), Some(target)) = (r.lobby.as_mut(), r.target.as_mut()) else { return };
-    if !v.visible() {
+    let (shown, paged, covered) = (v.visible(), v.paged_over(), v.covered(now));
+    let gate = !shown as u8 | (paged as u8) << 1 | (covered as u8) << 2;
+    if gate != r.gate_was {
+        r.gate_was = gate;
+        trace(&alloc::format!("gate: visible {shown}, paged over {paged}, covered {covered}"));
+    }
+    if gate != 0 {
         // Pressed state belongs to the screen that went away.
         v.touches.len = 0;
         r.last_ms = now;
@@ -853,7 +877,7 @@ extern "C" fn frame(timer: *mut c_void) {
         };
         if r.perf.frames < 400 || r.perf.frames % 300 < 31 {
             trace(&alloc::format!(
-                "perf fps {}.{} update {} draw {} (driver {}) gpu {} ui {} tris {} calls {} errors {} last {}",
+                "perf fps {}.{} update {} draw {} (driver {}) gpu {} ui {} tris {} calls {} (blits so far {}) errors {} last {}",
                 r.perf.fps_x10 / 10,
                 r.perf.fps_x10 % 10,
                 r.perf.update_ms,
@@ -863,6 +887,7 @@ extern "C" fn frame(timer: *mut c_void) {
                 r.refresh_ms,
                 r.perf.triangles,
                 r.perf.calls,
+                r.renderer.paths.rects,
                 r.perf.errors,
                 r.perf.last_error
             ));

@@ -5,7 +5,8 @@ and averages a few stats readings (the module's own measurements, in guest time)
     scripts/perf.py [--wait S] [--samples N] NAME...     NAME: pack names as `link list` shows
     scripts/perf.py --all                               every installed pack
 
-Prints one line per pack (fps, update / draw / driver / GPU ms, triangles, calls, errors) and
+Each pack is sampled once it has played about --settle seconds (its frame count over its fps),
+past its intro. Prints one line per pack (fps, update / draw / driver / GPU ms, triangles, calls, errors) and
 writes the table to build/mirage/perf-<label>.txt when --label is given.
 """
 import argparse
@@ -53,6 +54,10 @@ def main():
     ap.add_argument("names", nargs="*")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--wait", type=float, default=14)
+    ap.add_argument("--settle", type=float, default=28,
+                    help="lobby seconds (frames / fps) to let pass before sampling: past the longest "
+                         "intro (23.7 s), so the idle loop is measured. In timing mode guest time runs "
+                         "at a varying fraction of host time, so a host-time wait alone is not enough.")
     ap.add_argument("--samples", type=int, default=3)
     ap.add_argument("--every", type=float, default=3)
     ap.add_argument("--label", default="")
@@ -67,6 +72,15 @@ def main():
             continue
         link("select", ids[name])
         time.sleep(a.wait)
+        # Frames count from boot: the lobby's own time is the frames since it first showed up.
+        deadline, first = time.time() + 900, None
+        while time.time() < deadline:
+            st = stats()
+            if st and st["pack"] == int(ids[name], 16) and st["fps_x10"] > 0:
+                first = st["frames"] if first is None else first
+                if (st["frames"] - first) * 10 / st["fps_x10"] >= a.settle:
+                    break
+            time.sleep(5)
         got = []
         for _ in range(a.samples):
             st = stats()

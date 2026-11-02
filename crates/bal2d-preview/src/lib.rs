@@ -71,6 +71,11 @@ impl PackPreview {
         Ok(PackPreview { lobby, pages: per_layer, list: DrawList::default(), bake, gpu_tolerance })
     }
 
+    /// Layer `layer`'s decoded pages.
+    pub fn pages(&self, layer: usize) -> &[Texture] {
+        &self.pages[layer]
+    }
+
     pub fn size(&self) -> (usize, usize) {
         (self.lobby.width as usize, self.lobby.height as usize)
     }

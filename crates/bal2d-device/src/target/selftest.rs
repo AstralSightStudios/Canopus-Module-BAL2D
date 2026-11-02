@@ -43,7 +43,9 @@ pub mod probe {
     pub const MIRROR_LARGE: u32 = 1 << 14;
     /// No probe drew outside its square.
     pub const OUTSIDE: u32 = 1 << 15;
-    pub const ALL: u32 = (1 << 16) - 1;
+    /// An atlas rectangle blitted rotated, scaled, tinted and blended (`Call::rect` draws).
+    pub const BLIT_REGION: u32 = 1 << 16;
+    pub const ALL: u32 = (1 << 17) - 1;
 }
 
 /// Summary bits for `Stats::flags` (bits 16..23).
@@ -292,12 +294,36 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
         let m = [1.0f32, 0.0, (12 * 8 + 2) as f32, 0.0, 1.0, 2.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
         d(&mut rc, fw::vg_blit_rect(target.ptr(), bb.ptr(), rect.as_ptr(), m.as_ptr(), 0, 0, 0));
         wants.push((probe::BLIT, 12, [10 << 3, 20 << 2, 30 << 3], 0));
+        // An atlas region as `Call::rect` draws it: texels [4, 12) x [4, 12) of a 16 x 16 image
+        // (the probe colour, blue around it) turned a quarter, halved and tinted onto cell 15's
+        // square. The blit's matrix maps rectangle-relative texels (the rectangle is the image
+        // for the GPU): (u', v') -> (126 - v' / 2, 2 + u' / 2). Blue anywhere, or the square
+        // misplaced, means the driver or GPU does not keep to the rectangle that way.
+        let region = GpuMem::new(16 * 16 * 4).map(|mut mem| {
+            for (i, p) in mem.slice().chunks_exact_mut(4).enumerate() {
+                let (u, v) = (i % 16, i / 16);
+                let inside = (4..12).contains(&u) && (4..12).contains(&v);
+                p.copy_from_slice(&if inside { rgba(A, 0xFF) } else { 0xFF00_00FF }.to_le_bytes());
+            }
+            mem.clean();
+            let mut buffer = VgBuffer::new(&mut mem, 16, 16, 64, gpu::VG_FMT_BGRA8888);
+            buffer.set_image_mode(0x1F01);
+            (mem, buffer)
+        });
+        let mut region = region;
+        if let Some((_, rb)) = region.as_mut() {
+            let rect = [4i32, 4, 8, 8];
+            let m = [0.0f32, -0.5, 126.0, 0.5, 0.0, 2.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+            d(&mut rc, fw::vg_blit_rect(target.ptr(), rb.ptr(), rect.as_ptr(), m.as_ptr(), src_over, 0xFF40_80FF, 0x2000));
+            wants.push((probe::BLIT_REGION, 15, exp([0xF8, 0x40, 0x10]), 6));
+        }
         // Kept alive until the GPU is done.
         d(&mut rc, sq.draw(&mut target, 13, &mut msmall, false, 0.0, src_over, pad, white));
         wants.push((probe::MIRROR_SMALL, 13, exp(A), 0));
         d(&mut rc, sq.draw(&mut target, 14, &mut mlarge, false, 0.0, src_over, pad, white));
         wants.push((probe::MIRROR_LARGE, 14, exp(A), 0));
         d(&mut rc, fw::vg_finish());
+        drop(region);
         drop(bb);
         drop(bm);
     } else {
@@ -314,9 +340,19 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
     if outside_ok {
         passed |= probe::OUTSIDE;
     }
-    // Probe 15 (a cell no probe draws) stays background too: checked above.
+    // Cell 15's square is the region blit; everything around it stays background: checked above.
+    if passed & probe::BLIT_REGION == 0 {
+        for y in 0..H {
+            let mut row = alloc::string::String::new();
+            for x in 120..W {
+                let v = unsafe { core::ptr::read_volatile((nc + (y * W * 2 + x * 2) as usize) as *const u16) };
+                row += &alloc::format!(" {v:04x}");
+            }
+            super::trace(&alloc::format!("region blit row {y}:{row}"));
+        }
+    }
     out.passed = passed;
-    super::trace(&alloc::format!("gpu self-test: passed {passed:#06x} of {:#06x}, rc {rc}", probe::ALL));
+    super::trace(&alloc::format!("gpu self-test: passed {passed:#07x} of {:#07x}, rc {rc}", probe::ALL));
     // Development: `selftest-force` (text, a hex probe mask) marks those probes failed, so the
     // fallbacks can be tried where everything passes (Mirage).
     if let Some(text) = super::host::Fs::read(FORCE_FILE, 16) {
@@ -330,6 +366,10 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
     if (!coherent_small && passed & probe::MIRROR_SMALL != 0) || (passed & probe::LARGE == 0 && passed & probe::MIRROR_LARGE != 0) {
         gpu::MIRROR_NC.store(true, Ordering::Relaxed);
         out.flags |= flag::MIRROR;
+    }
+    // Region blits are an optimization: without a clean pass they stay off (paths draw them).
+    if passed & (probe::BLIT_REGION | probe::OUTSIDE) == probe::BLIT_REGION | probe::OUTSIDE && passed & probe::LARGE != 0 {
+        renderer.paths.blits = true;
     }
     let s16_ok = passed & probe::S16 != 0 || (passed & probe::MIRROR_SMALL != 0);
     if !s16_ok && passed & probe::FP32 != 0 {

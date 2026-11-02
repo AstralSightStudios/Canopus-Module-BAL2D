@@ -15,11 +15,11 @@ sources = ["crates/bal2d-device/Cargo.toml"]
 # Firmware entry points this module binds itself (docs/re/firmware-p0.md):
 allowed_constants = [
   # Band 10 Pro 3.101.043: vg_lite finish / flush / clear / blit_rect / draw_pattern / set_scissor /
-  # enable_scissor / set_CLUT (the driver's flash veneers), lv_display_get_layer_top, wfimg class,
+  # enable_scissor / set_CLUT (the driver's flash veneers), wfimg class,
   # disp_def (default display).
   "0x0c187bb1", "0x0c1877e9", "0x0c187ab1", "0x0c187a59", "0x0c187f01", "0x0c1876f9", "0x0c187a49",
   "0x0c187d21",
-  "0x1c02fb35", "0x2cdbdc40", "0x2010318c",
+  "0x2cdbdc40", "0x2010318c",
   # mm_mallinfo and the user heap pointer (the module checks free memory: malloc asserts on failure).
   "0x0c1f8029", "0x200f4c28",
   # Rust core table words that look like firmware addresses (scripts/allow-constants.py):

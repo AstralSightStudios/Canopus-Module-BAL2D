@@ -190,6 +190,39 @@ pub unsafe fn delete(object: Obj) {
 }
 
 /// (x, y, w, h) after the last layout pass.
+/// An object's parent (`lv_obj_t::parent`, after the class pointer).
+pub unsafe fn parent(object: Obj) -> Obj {
+    if object.is_null() {
+        return NULL;
+    }
+    unsafe { core::ptr::read_volatile((object as *const Obj).add(1)) }
+}
+
+/// An object's children, in drawing order (`spec_attr`: the array at +0, the count at +48).
+pub unsafe fn children<'a>(object: Obj) -> &'a [Obj] {
+    if object.is_null() {
+        return &[];
+    }
+    let spec = unsafe { core::ptr::read_volatile((object as *const *const u8).add(2)) };
+    if spec.is_null() {
+        return &[];
+    }
+    let list = unsafe { core::ptr::read_volatile(spec as *const *const Obj) };
+    let count = unsafe { core::ptr::read_volatile(spec.add(48) as *const u16) } as usize;
+    if list.is_null() || count == 0 {
+        return &[];
+    }
+    unsafe { core::slice::from_raw_parts(list, count) }
+}
+
+/// `lv_obj_t::flags` (LVGL 9.2 on 3.101.043: +44, after the coordinates).
+pub unsafe fn flags(object: Obj) -> u32 {
+    if object.is_null() {
+        return 0;
+    }
+    unsafe { core::ptr::read_volatile((object as *const u8).add(44) as *const u32) }
+}
+
 pub unsafe fn measured(object: Obj) -> (i32, i32, i32, i32) {
     if object.is_null() {
         return (0, 0, 0, 0);

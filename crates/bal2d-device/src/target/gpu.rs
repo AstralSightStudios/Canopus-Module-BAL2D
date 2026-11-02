@@ -444,6 +444,32 @@ impl Renderer {
                 }
                 let m = &mut **image_matrix;
                 *m = [call.matrix[0], call.matrix[1], call.matrix[2], call.matrix[3], call.matrix[4], call.matrix[5], 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+                if let Some(rect) = &call.rect {
+                    // An atlas rectangle drawn rigidly: an image blit (no path). The rectangle is
+                    // the image for the GPU, so the matrix takes rectangle-relative texels.
+                    let (rx, ry) = (rect[0] as f32, rect[1] as f32);
+                    m[2] += m[0] * rx + m[1] * ry;
+                    m[5] += m[3] * rx + m[4] * ry;
+                    let timed = stats.calls % 8 == 0;
+                    let t0 = if timed { super::lv::now_ms() } else { 0 };
+                    let rc = fw::vg_blit_rect(target.buffer.ptr(), page.buffer.ptr(), rect.as_ptr(), m.as_ptr(), blend(call.blend), tint(call.color), FILTER_BILINEAR);
+                    if timed {
+                        stats.submit_ms += super::lv::now_ms().wrapping_sub(t0) * 8;
+                    }
+                    stats.calls += 1;
+                    if stats.calls % FLUSH_EVERY == 0 {
+                        let rc = fw::vg_flush();
+                        if rc != 0 {
+                            stats.errors += 1;
+                            stats.last_error = rc;
+                        }
+                    }
+                    if rc != 0 {
+                        stats.errors += 1;
+                        stats.last_error = rc;
+                    }
+                    return;
+                }
                 let p = &mut **path;
                 for (k, v) in call.bounds.iter().enumerate() {
                     p[k * 4..k * 4 + 4].copy_from_slice(&(*v as f32).to_le_bytes());

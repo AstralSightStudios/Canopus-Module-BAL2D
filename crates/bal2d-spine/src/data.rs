@@ -291,9 +291,41 @@ pub struct Vertices {
     pub vertices: Vec<f32>,
     /// Number of floats of world output (2 per vertex).
     pub world_len: u32,
+    /// [`Vertices::check`] found the bone table consistent with `vertices` and `world_len`
+    /// and every bone index below `bone_bound`: skinning may then index without checks.
+    pub checked: bool,
+    pub bone_bound: u32,
 }
 
 impl Vertices {
+    /// Validates a weighted table (counts, lengths, bone indices below `bone_count`) and marks
+    /// it [`Vertices::checked`]. Anything that edits the table afterwards must clear the mark.
+    pub fn check(&mut self, bone_count: usize) {
+        self.checked = false;
+        if self.bones.is_empty() {
+            return;
+        }
+        let (t, w) = (&self.bones, &self.vertices);
+        let (mut v, mut b, mut verts, mut bound) = (0usize, 0usize, 0usize, 0u32);
+        while v < t.len() {
+            let n = t[v] as usize;
+            let Some(ids) = t.get(v + 1..v + 1 + n) else { return };
+            for &id in ids {
+                if id as usize >= bone_count {
+                    return;
+                }
+                bound = bound.max(id + 1);
+            }
+            v += 1 + n;
+            b += 3 * n;
+            verts += 1;
+        }
+        if b == w.len() && verts * 2 == self.world_len as usize {
+            self.checked = true;
+            self.bone_bound = bound;
+        }
+    }
+
     pub fn is_weighted(&self) -> bool {
         !self.bones.is_empty()
     }
@@ -497,6 +529,10 @@ pub struct Curve {
     pub entries: u8,
     pub frames: Vec<f32>,
     pub curves: Vec<f32>,
+    /// Every value holds the same value at every key and along every Bezier between keys (its
+    /// handles are at that value too): evaluating it gives the first key's values exactly, so
+    /// no search or interpolation is needed. Set when the curve is read.
+    pub constant: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,7 +588,8 @@ pub enum Timeline {
     /// `constraint` is `None` for timelines that apply to every physics constraint.
     Physics { constraint: Option<u16>, property: PhysicsProperty, curve: Curve },
     PhysicsReset { constraint: Option<u16>, frames: Vec<f32> },
-    Deform { slot: u16, attachment: u32, curve: Curve, vertices: Vec<Vec<f32>> },
+    /// `constant`: every key holds the same values (bit for bit), set when the timeline is read.
+    Deform { slot: u16, attachment: u32, curve: Curve, vertices: Vec<Vec<f32>>, constant: bool },
     Sequence { slot: u16, attachment: u32, frames: Vec<f32> },
     DrawOrder { frames: Vec<f32>, orders: Vec<Option<Vec<u16>>> },
     Event { frames: Vec<f32>, events: Vec<EventKey> },

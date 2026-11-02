@@ -39,6 +39,12 @@ PACKAGER = Path(os.environ.get("FACETORY_PACKAGER",
                                "/Volumes/EXT0/GitHub/facetory/rust/target/debug/examples/package_lua_watchface"))
 CLI = CANOPUS / "target/debug/canopus"
 WORK = Path(os.environ.get("BAL2D_DEV_WORK", ROOT / "build/mirage"))
+# QEMU with the timing model and the fair main-loop lock (qemu-miwear dp-1700-exp at f2a682f1e5 or
+# later). The shared Mirage build is older: under heavy drawing its unfair lock starves the
+# Bluetooth chardev and phone calls fail in plain mode. Boots inherit MIRAGE_QEMU.
+TIMING_QEMU = Path("/Volumes/EXT0/tmp/qemu-miwear-timing/build/qemu-system-arm")
+if not os.environ.get("MIRAGE_QEMU") and TIMING_QEMU.exists():
+    os.environ["MIRAGE_QEMU"] = str(TIMING_QEMU)
 
 PROD_INSTALLER = CANOPUS / "watchfaces/canopus-installer-prod/xiaomi-band-10-pro"
 
@@ -191,8 +197,12 @@ class Session:
         manifest.write_text(text)
         output = self.work / "ba_l2d.canopus"
         try:
-            sh(CLI, "build", "--manifest", manifest, cwd=ROOT, capture_output=True)
-            sh(CLI, "package", "--manifest", manifest, "--output", output, cwd=ROOT, capture_output=True)
+            for args in (("build",), ("package", "--output", output)):
+                r = subprocess.run([str(a) for a in (CLI, *args[:1], "--manifest", manifest, *args[1:])], cwd=ROOT,
+                                   capture_output=True, text=True)
+                if r.returncode:
+                    sys.stderr.write(r.stdout[-4000:] + r.stderr[-8000:])
+                    raise RuntimeError(f"canopus {args[0]} failed")
         finally:
             manifest.unlink(missing_ok=True)
         return output

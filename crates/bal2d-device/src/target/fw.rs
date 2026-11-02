@@ -19,7 +19,6 @@ mod addr {
     pub const VG_SET_SCISSOR: usize = 0x0C18_76F9;
     pub const VG_ENABLE_SCISSOR: usize = 0x0C18_7A49;
     pub const VG_SET_CLUT: usize = 0x0C18_7D21;
-    pub const LAYER_TOP: usize = 0x1C02_FB35;
     pub const WFIMG_CLASS: usize = 0x2CDB_DC40;
     /// `disp_def` (the literal in `lv_display_get_layer_top`: 0x20103174 + 0x18).
     pub const DISPLAY_DEFAULT: usize = 0x2010_318C;
@@ -114,11 +113,6 @@ pub fn heap_info() -> (u32, u32) {
     let mut info = [0u32; 7];
     call!(MALLINFO, fn(*mut u32, *mut c_void) -> *mut u32, info.as_mut_ptr(), heap);
     (info[5], info[3])
-}
-
-/// `lv_display_get_layer_top(NULL)`.
-pub fn layer_top() -> *mut c_void {
-    call!(LAYER_TOP, fn(*mut c_void) -> *mut c_void, core::ptr::null_mut())
 }
 
 /// Screen coordinates of the input device behind an LVGL event.

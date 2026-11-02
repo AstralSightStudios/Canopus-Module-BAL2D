@@ -222,6 +222,9 @@ impl Curve {
     /// index from `search`.
     #[inline]
     pub fn value_at(&self, time: f32, i: usize, v: usize) -> f32 {
+        if self.constant {
+            return self.frames[v];
+        }
         let e = self.entries as usize;
         let curve_type = self.curves[i / e];
         if curve_type == CURVE_LINEAR {
@@ -237,10 +240,85 @@ impl Curve {
         }
     }
 
+    /// Values 1..=`out.len()` of the frame at float index `i` at `time` (as [`Curve::value_at`]
+    /// for each, the same floats). The channels of a key usually share one Bezier timing (only
+    /// the values differ): then the sample that brackets `time` is found once for all of them.
+    pub fn values_at(&self, time: f32, i: usize, out: &mut [f32]) {
+        if self.constant {
+            out.copy_from_slice(&self.frames[1..1 + out.len()]);
+            return;
+        }
+        let e = self.entries as usize;
+        let curve_type = self.curves[i / e];
+        let shared = curve_type >= CURVE_BEZIER && out.len() > 1 && {
+            let base = curve_type as usize - 2;
+            let (cx1, cx2) = (self.curves[base].to_bits(), self.curves[base + 2].to_bits());
+            (1..out.len()).all(|v| self.curves[base + v * BEZIER_SIZE].to_bits() == cx1 && self.curves[base + v * BEZIER_SIZE + 2].to_bits() == cx2)
+        };
+        if !shared {
+            for (v, o) in out.iter_mut().enumerate() {
+                *o = self.value_at(time, i, v + 1);
+            }
+            return;
+        }
+        let base = curve_type as usize - 2;
+        let frames = &self.frames;
+        let (t1, t2) = (frames[i], frames[i + e]);
+        let c = &self.curves[base..base + BEZIER_SIZE];
+        // The time axis of `Bezier` (the same operations), up to the sample past `time`.
+        let tmpx = (t1 - c[0] * 2.0 + c[2]) * 0.03;
+        let dddx = ((c[0] - c[2]) * 3.0 - t1 + t2) * 0.006;
+        let mut ddx = tmpx * 2.0 + dddx;
+        let mut dx = (c[0] - t1) * 0.3 + tmpx + dddx * 0.166_666_67;
+        let mut sx = t1 + dx;
+        let mut x = t1;
+        let mut steps = BEZIER_SAMPLES / 2;
+        for k in 0..BEZIER_SAMPLES / 2 {
+            if if k == 0 { sx > time } else { sx >= time } {
+                steps = k;
+                break;
+            }
+            x = sx;
+            dx += ddx;
+            ddx += dddx;
+            sx += dx;
+        }
+        let end = steps == BEZIER_SAMPLES / 2;
+        let q = if end { (time - x) / (t2 - x) } else { (time - x) / (sx - x) };
+        for (v, o) in out.iter_mut().enumerate() {
+            let c = &self.curves[base + v * BEZIER_SIZE..base + (v + 1) * BEZIER_SIZE];
+            let (v1, v2) = (frames[i + v + 1], frames[i + e + v + 1]);
+            // The value axis: sample `steps` (the one past `time`) and the one before it.
+            let tmpy = (v1 - c[1] * 2.0 + c[3]) * 0.03;
+            let dddy = ((c[1] - c[3]) * 3.0 - v1 + v2) * 0.006;
+            let mut ddy = tmpy * 2.0 + dddy;
+            let mut dy = (c[1] - v1) * 0.3 + tmpy + dddy * 0.166_666_67;
+            let mut sy = v1 + dy;
+            let mut y = v1;
+            for _ in 0..steps {
+                y = sy;
+                dy += ddy;
+                ddy += dddy;
+                sy += dy;
+            }
+            *o = if end { y + q * (v2 - y) } else { y + q * (sy - y) };
+        }
+    }
+
     /// Single-value curve (entries == 2) at `time` (time >= first frame).
     pub fn curve_value(&self, time: f32) -> f32 {
+        if self.constant {
+            return self.frames[1];
+        }
         let i = search(&self.frames, time, 2);
         self.value_at(time, i, 1)
+    }
+
+    /// The float index of the frame at or before `time` (`search`); 0 for a constant curve,
+    /// whose frames all hold the same values.
+    #[inline]
+    pub fn index(&self, time: f32) -> usize {
+        if self.constant { 0 } else { search(&self.frames, time, self.entries as usize) }
     }
 
     /// Interpolation percent between `frame` and the next (entries == 1 curves: deform).
@@ -422,9 +500,10 @@ pub fn apply_timeline(
                         }
                         return;
                     }
-                    let i = search(&curve.frames, time, 3);
-                    let x = curve.value_at(time, i, 1);
-                    let y = curve.value_at(time, i, 2);
+                    let i = curve.index(time);
+                    let mut xy = [0f32; 2];
+                    curve.values_at(time, i, &mut xy);
+                    let [x, y] = xy;
                     match blend {
                         MixBlend::Setup => {
                             *cx = sx + x * alpha;
@@ -455,9 +534,10 @@ pub fn apply_timeline(
                         }
                         return;
                     }
-                    let i = search(&curve.frames, time, 3);
-                    let x = curve.value_at(time, i, 1) * setup.scale_x;
-                    let y = curve.value_at(time, i, 2) * setup.scale_y;
+                    let i = curve.index(time);
+                    let mut xy = [0f32; 2];
+                    curve.values_at(time, i, &mut xy);
+                    let (x, y) = (xy[0] * setup.scale_x, xy[1] * setup.scale_y);
                     if alpha == 1.0 {
                         if blend == MixBlend::Add {
                             b.scale_x += x - setup.scale_x;
@@ -591,11 +671,9 @@ pub fn apply_timeline(
                 return;
             }
             let e = curve.entries as usize;
-            let i = search(&curve.frames, time, e);
+            let i = curve.index(time);
             let mut v = [0f32; 7];
-            for (k, slot_v) in v.iter_mut().enumerate().take(e - 1) {
-                *slot_v = curve.value_at(time, i, k + 1);
-            }
+            curve.values_at(time, i, &mut v[..e - 1]);
             match kind {
                 SlotColorKind::Rgba => {
                     if alpha == 1.0 {
@@ -713,8 +791,8 @@ pub fn apply_timeline(
             };
             set_attachment_by_name(data, sk, si, name);
         }
-        Timeline::Deform { slot, attachment, curve, vertices } => {
-            apply_deform(data, sk, *slot as usize, *attachment, curve, vertices, time, alpha, blend);
+        Timeline::Deform { slot, attachment, curve, vertices, constant } => {
+            apply_deform(data, sk, *slot as usize, *attachment, curve, vertices, *constant, time, alpha, blend);
         }
         Timeline::Event { frames, .. } => {
             let Some(events) = events else { return };
@@ -770,7 +848,7 @@ pub fn apply_timeline(
                 }
                 return;
             }
-            let i = search(&curve.frames, time, 6);
+            let i = curve.index(time);
             let mix = curve.value_at(time, i, 1);
             let softness = curve.value_at(time, i, 2);
             let f = &curve.frames;
@@ -816,7 +894,7 @@ pub fn apply_timeline(
                     _ => return,
                 }
             } else {
-                let i = search(&curve.frames, time, 7);
+                let i = curve.index(time);
                 for k in 0..6 {
                     let v = curve.value_at(time, i, k + 1);
                     if blend == MixBlend::Setup {
@@ -857,7 +935,7 @@ pub fn apply_timeline(
                             _ => return,
                         }
                     } else {
-                        let i = search(&curve.frames, time, 4);
+                        let i = curve.index(time);
                         for k in 0..3 {
                             let v = curve.value_at(time, i, k + 1);
                             if blend == MixBlend::Setup {
@@ -1057,6 +1135,7 @@ fn apply_deform(
     attachment: u32,
     curve: &Curve,
     vertices: &[Vec<f32>],
+    constant: bool,
     time: f32,
     alpha: f32,
     mut blend: MixBlend,
@@ -1070,9 +1149,25 @@ fn apply_deform(
     if a.timeline_attachment != attachment {
         return;
     }
+    let slot = &mut sk.slots[si];
+    // A constant timeline at full weight (not added) leaves the deform equal to its key, whatever
+    // the time past the first frame and whatever was there (the general paths below compute
+    // exactly the key then: p + (p - p) * percent == p). When the deform already holds that key,
+    // there is nothing to do: idle animations can carry tens of thousands of such values.
+    if constant && alpha == 1.0 && blend != MixBlend::Add && time >= curve.frames[0] {
+        let key = &vertices[0];
+        let id = key.as_ptr() as usize;
+        if slot.deform_key != id || slot.deform.len() != key.len() {
+            slot.deform.clear();
+            slot.deform.extend_from_slice(key);
+            slot.deform_key = id;
+        }
+        return;
+    }
+    slot.deform_key = 0;
     let weighted = verts.is_weighted();
     let setup = &verts.vertices;
-    let deform = &mut sk.slots[si].deform;
+    let deform = &mut slot.deform;
     if deform.is_empty() {
         blend = MixBlend::Setup;
     }

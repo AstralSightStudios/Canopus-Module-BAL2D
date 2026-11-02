@@ -126,7 +126,7 @@ pub fn draw_as_gpu(fb: &mut Framebuffer, list: &DrawList, pages: &[Texture], cam
             }
             tris.push(tri);
         }
-        bal2d_render::cluster(&tris, tol, &mut order, &mut clusters);
+        bal2d_render::cluster_refit(&tris, tol, bal2d_render::REFITS, &mut order, &mut clusters);
         for c in &clusters {
             let m = c.m;
             let det = m[0] * m[4] - m[1] * m[3];

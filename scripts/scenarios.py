@@ -169,9 +169,48 @@ class Run:
         d = self.stats()
         self.check("full-screen option draws over a face without a layer", c and d and d["frames"] > c["frames"],
                    f"{c} -> {d}")
+        # The layer belongs to the watchface: the launcher is reachable and not covered.
+        self.dev.wake()
+        self.dev.swipe(168, 300, 168, 60, 300, 2)
+        e = self.stats()
+        self.shot("stock-face-overlay-launcher")
+        time.sleep(3)
+        f = self.stats()
+        self.check("the full-screen layer stays on the watchface (launcher reachable, nothing drawn)",
+                   e and f and f["frames"] - e["frames"] <= 2, f"{e} -> {f}")
+        self.dev.swipe(168, 240, 168, 470, 300, 2)  # launcher -> watchface
         self.link("options", 0)
         time.sleep(4)
         self.shot("stock-face-overlay-off")
+
+    def pages(self):
+        """Home pages and the control centre slide over the watchface without hiding it (LVGL keeps
+        drawing it under them): nothing is drawn while one covers it, drawing resumes after."""
+        self.face(LUA_FACE)
+        self.ensure("Shiroko_home")
+        time.sleep(8)
+        for label, there, back in (("the next home page", (320, 440, 40, 440), (40, 440, 320, 440)),
+                                   ("the previous home page", (40, 440, 320, 440), (320, 440, 40, 440)),
+                                   ("the control centre", (250, 5, 250, 400), (250, 470, 250, 30))):
+            self.dev.wake()
+            a = self.stats()
+            time.sleep(3)
+            b = self.stats()
+            self.dev.swipe(*there, 300, 2)
+            c = self.stats()
+            self.shot("page-" + label.split()[-2] + "-" + label.split()[-1])
+            time.sleep(3)
+            d = self.stats()
+            self.dev.swipe(*back, 300, 2)
+            time.sleep(1)
+            e = self.stats()
+            time.sleep(3)
+            f = self.stats()
+            ok = all((a, b, c, d, e, f)) and b["frames"] > a["frames"] and d["frames"] - c["frames"] <= 2 \
+                and f["frames"] > e["frames"]
+            self.check(f"nothing is drawn under {label}, drawing resumes after", ok,
+                       f"{a and a['frames']}->{b and b['frames']} | {c and c['frames']}->{d and d['frames']} | "
+                       f"{e and e['frames']}->{f and f['frames']}")
 
     def screen_off_on(self):
         self.face(LUA_FACE)
@@ -236,6 +275,12 @@ class Run:
         self.dev.launcher_to_end()
         self.dev.tap(55, 288, 4)  # the app's icon on this emulator's launcher
         self.shot("app-page")
+        # The watchface window is hidden under the app: nothing is drawn meanwhile.
+        g = self.stats()
+        time.sleep(3)
+        h = self.stats()
+        self.check("nothing is drawn while an app covers the watchface", g and h and h["frames"] - g["frames"] <= 2,
+                   f"{g} -> {h}")
         self.dev.tap(168, 112, 1)  # 下一个角色
         time.sleep(10)
         self.dev.wake()
@@ -243,9 +288,11 @@ class Run:
         after = self.stats()
         self.check("the app's 'next character' switches the pack", before and after and after["pack"] != before["pack"],
                    f"{before} -> {after}")
-        self.dev.ctl("button", "home")
-        time.sleep(2)
-        self.dev.swipe(168, 240, 168, 470, 300, 2)  # launcher -> watchface
+        # Back to the watchface: the home button only goes back as far as the launcher here; two
+        # back swipes (app -> launcher -> watchface) close the app.
+        self.dev.wake()
+        self.dev.swipe(5, 240, 300, 240, 300, 2)
+        self.dev.swipe(5, 240, 300, 240, 300, 2)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -254,7 +301,7 @@ def main():
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     r = Run(a.packs)
-    names = ["lua_face", "interactions", "switch", "marker_faces", "overlay", "screen_off_on",
+    names = ["lua_face", "interactions", "switch", "marker_faces", "overlay", "pages", "screen_off_on",
              "leave_and_return", "transfer_while_playing", "delete", "app_page"]
     only = [n for n in a.only.split(",") if n]
     for name in names:

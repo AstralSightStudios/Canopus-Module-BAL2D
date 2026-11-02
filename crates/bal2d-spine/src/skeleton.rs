@@ -82,6 +82,9 @@ pub struct Slot {
     pub sequence_index: i32,
     /// Deform values for the current vertex attachment (empty: none).
     pub deform: Vec<f32>,
+    /// The constant deform key `deform` holds exactly, as written by a full-weight apply of a
+    /// constant timeline (its address; 0: none). Applying that key again changes nothing.
+    pub deform_key: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +229,7 @@ impl Skeleton {
                 attachment: None,
                 sequence_index: -1,
                 deform: Vec::new(),
+                deform_key: 0,
             })
             .collect();
         let ik = data
@@ -1997,6 +2001,7 @@ pub fn set_slot_attachment(data: &SkeletonData, slot: &mut Slot, attachment: Opt
     };
     if !same_timeline {
         slot.deform.clear();
+        slot.deform_key = 0;
     }
     slot.attachment = attachment;
     slot.sequence_index = -1;
@@ -2033,6 +2038,47 @@ pub fn compute_vertex_world(
         }
         return;
     }
+    let has_deform = !deform.is_empty();
+    // The whole attachment from a checked table (the draw list's case): no checks per vertex
+    // or influence. The same arithmetic in the same order as the general loop below.
+    if verts.checked
+        && start == 0
+        && count == verts.world_len as usize
+        && bones.len() >= verts.bone_bound as usize
+        && (!has_deform || deform.len() >= verts.vertices.len() / 3 * 2)
+        && (count == 0 || offset + (count / 2 - 1) * stride + 2 <= out.len())
+    {
+        let (table, weights) = (&verts.bones[..], &verts.vertices[..]);
+        let (mut v, mut b, mut f, mut w) = (0usize, 0usize, 0usize, offset);
+        // SAFETY: `check` made every count and bone index in `table` consistent with `weights`
+        // and below `bone_bound` <= `bones.len()`; `deform` holds 2 floats per influence; the
+        // last output pair fits `out` (all tested above).
+        unsafe {
+            while w < end {
+                let (mut wx, mut wy) = (0.0f32, 0.0f32);
+                let n = *table.get_unchecked(v) as usize;
+                for j in 0..n {
+                    let bone = bones.get_unchecked(*table.get_unchecked(v + 1 + j) as usize);
+                    let c = weights.get_unchecked(b + 3 * j..b + 3 * j + 3);
+                    let (vx, vy) = if has_deform {
+                        let d = deform.get_unchecked(f + 2 * j..f + 2 * j + 2);
+                        (c[0] + d[0], c[1] + d[1])
+                    } else {
+                        (c[0], c[1])
+                    };
+                    wx += (vx * bone.a + vy * bone.b + bone.world_x) * c[2];
+                    wy += (vx * bone.c + vy * bone.d + bone.world_y) * c[2];
+                }
+                v += 1 + n;
+                b += 3 * n;
+                f += 2 * n;
+                *out.get_unchecked_mut(w) = wx;
+                *out.get_unchecked_mut(w + 1) = wy;
+                w += stride;
+            }
+        }
+        return;
+    }
     let bones_table = &verts.bones;
     let vertices = &verts.vertices;
     let (mut v, mut skip) = (0usize, 0usize);
@@ -2046,7 +2092,6 @@ pub fn compute_vertex_world(
     let mut w = offset;
     let mut b = skip * 3;
     let mut f = skip << 1;
-    let has_deform = !deform.is_empty();
     // Each vertex's influences are taken as slices (one bounds check per vertex, not per
     // influence: this loop is the watch's skinning, among its hottest).
     while w < end {

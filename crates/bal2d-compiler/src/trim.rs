@@ -124,9 +124,9 @@ fn trim_mesh(d: &mut SkeletonData, id: u32, seen: &[bool]) -> Option<(Vec<Option
                 verts.extend_from_slice(&m.vertices.vertices[f * 3..(f + c) * 3]);
             }
         }
-        Vertices { bones, vertices: verts, world_len: next as u32 * 2 }
+        Vertices { bones, vertices: verts, world_len: next as u32 * 2, checked: false, bone_bound: 0 }
     } else {
-        Vertices { bones: Vec::new(), vertices: keep_pairs(&m.vertices.vertices), world_len: next as u32 * 2 }
+        Vertices { bones: Vec::new(), vertices: keep_pairs(&m.vertices.vertices), world_len: next as u32 * 2, checked: false, bone_bound: 0 }
     };
     let region_uvs = keep_pairs(&m.region_uvs);
     let uvs = if m.uvs.len() == nv * 2 { keep_pairs(&m.uvs) } else { m.uvs.clone() };
