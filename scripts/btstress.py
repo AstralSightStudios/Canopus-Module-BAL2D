@@ -37,6 +37,7 @@ def link(*args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rounds", type=int, default=5)
+    ap.add_argument("--fluent", action="store_true", help="keep options::FLUENT (smoothness first) set throughout")
     a = ap.parse_args()
     s = ms.Session("043", str(ROOT / "review/mirage/btstress"))
     fails = 0
@@ -66,11 +67,12 @@ def main():
     print(f"transfer: {'ok' if ok else 'FAIL'} {dt:5.1f} s {out[:90]}", flush=True)
     link("select", ids["Hoshino_home"])
     s.phone('setWatchface={"id":"%s"}' % STOCK_FACE)
-    ok, _, _ = link("options", 1)
+    base = 2 if a.fluent else 0
+    ok, _, _ = link("options", base | 1)
     time.sleep(15)
     calls("heavy overlay")
     for _ in range(5):
-        ok, _, _ = link("options", 0)
+        ok, _, _ = link("options", base)
         if ok:
             break
     s.phone('setWatchface={"id":"%s"}' % LUA_FACE)

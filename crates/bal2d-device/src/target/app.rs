@@ -23,6 +23,7 @@ static mut PAGE_DESCRIPTORS: core::mem::MaybeUninit<[firmware_page_descriptor; P
 static mut STATUS_LABEL: Obj = lv::NULL;
 static mut NAME_LABEL: Obj = lv::NULL;
 static mut OVERLAY_LABEL: Obj = lv::NULL;
+static mut FLUENT_LABEL: Obj = lv::NULL;
 
 pub fn app_id() -> u32 {
     APP_ID.load(Ordering::Acquire)
@@ -114,6 +115,11 @@ extern "C" fn toggle_overlay(_e: *mut core::ffi::c_void) {
     refresh();
 }
 
+extern "C" fn toggle_fluent(_e: *mut core::ffi::c_void) {
+    super::toggle_fluent();
+    refresh();
+}
+
 extern "C" fn on_create(_page: *mut firmware_page_descriptor, root: *mut core::ffi::c_void, _data: *mut core::ffi::c_void) -> i32 {
     super::start();
     let (w, _h) = super::rt().screen;
@@ -122,7 +128,8 @@ extern "C" fn on_create(_page: *mut firmware_page_descriptor, root: *mut core::f
         NAME_LABEL = lv::label(root, 24, 24, w - 48, true, 0xFFFFFF, lv::text_align::LEFT, lv::LONG_DOT);
         button(root, 80, w, "下一个角色", next_pack);
         OVERLAY_LABEL = button(root, 156, w, "", toggle_overlay);
-        STATUS_LABEL = lv::label(root, 24, 236, w - 48, false, 0xB8C4D8, lv::text_align::LEFT, lv::LONG_WRAP);
+        FLUENT_LABEL = button(root, 232, w, "", toggle_fluent);
+        STATUS_LABEL = lv::label(root, 24, 312, w - 48, false, 0xB8C4D8, lv::text_align::LEFT, lv::LONG_WRAP);
     }
     refresh();
     0
@@ -142,6 +149,7 @@ extern "C" fn on_destroy(_page: *mut firmware_page_descriptor) -> i32 {
         STATUS_LABEL = lv::NULL;
         NAME_LABEL = lv::NULL;
         OVERLAY_LABEL = lv::NULL;
+        FLUENT_LABEL = lv::NULL;
     }
     0
 }
@@ -157,5 +165,6 @@ pub fn refresh() {
         lv::set_text(label, &text);
         lv::set_text(NAME_LABEL, &super::pack_title());
         lv::set_text(OVERLAY_LABEL, if super::overlay_on() { "全屏显示：开" } else { "全屏显示：关" });
+        lv::set_text(FLUENT_LABEL, if super::fluent_on() { "流畅优先：开" } else { "流畅优先：关" });
     }
 }

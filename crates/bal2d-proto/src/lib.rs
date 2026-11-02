@@ -58,6 +58,10 @@ pub mod caps {
 pub mod options {
     /// Watchfaces without a BAL2D layer show the lobby full screen above the watchface.
     pub const OVERLAY: u8 = 1;
+    /// Smoothness first: the watch keeps about a tenth of each frame idle instead of a third (or
+    /// half for very heavy frames). Faster animation; whether the phone link and the watch's own
+    /// UI stay responsive with that little is what it is for finding out on a real watch.
+    pub const FLUENT: u8 = 2;
 }
 
 /// The firmware a module build runs on (`HELLO`): the phone compiles packs for it.

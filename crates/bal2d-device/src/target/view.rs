@@ -31,6 +31,10 @@ const COVER_GRACE_MS: u32 = 300;
 const COVER_PROBE_MS: u32 = 500;
 /// Pages followed at once (home has four, plus the launcher list and the control centre).
 const PAGE_SLOTS: usize = 16;
+/// The top of the display (screen pixels) belongs to the system's pull-down (notifications,
+/// control centre): a touch that starts there is neither held nor given to the lobby, and the
+/// touch proxy over the head stays below it. Elsewhere on the head a press is a pat.
+pub const SYSTEM_EDGE_PX: i32 = 40;
 const LV_IMAGE_HEADER_MAGIC: u32 = 0x19;
 const LV_COLOR_FORMAT_RGB565: u32 = 0x12;
 
@@ -86,6 +90,8 @@ pub struct View {
     pub touches: heapless_touch::Queue,
     /// A press on a drag area holds the scroll chain and gesture bubbling back.
     grabbed: bool,
+    /// The current touch started at the system edge: ignored until it is released.
+    edge_touch: bool,
     /// Marker mode: a transparent object on top of the watchface's widgets over the drag areas
     /// (the head), so a pat reaches the lobby even where the time or a widget is drawn above it.
     touch: Obj,
@@ -155,6 +161,7 @@ pub fn view() -> &'static mut View {
                 probed_at: 0,
                 touches: heapless_touch::Queue::new(),
                 grabbed: false,
+                edge_touch: false,
                 touch: lv::NULL,
                 touch_rect: (0, 0, 0, 0),
                 hidden: false,
@@ -182,6 +189,9 @@ impl View {
 
     /// Places the touch proxy over `rect` (screen coordinates), creating it on first use.
     pub fn place_touch(&mut self, rect: (i32, i32, i32, i32)) {
+        // Below the system edge (a head at the very top keeps only its lower part).
+        let top = rect.1.max(SYSTEM_EDGE_PX);
+        let rect = (rect.0, top, rect.2, rect.1 + rect.3 - top);
         if self.mode == Mode::None || self.obj.is_null() || rect.2 <= 0 || rect.3 <= 0 {
             return;
         }
@@ -574,6 +584,19 @@ fn shows_layer_file(obj: *mut c_void) -> bool {
     tail == want
 }
 
+/// Whether this touch event belongs to a touch that started at the system edge (and so is not
+/// the lobby's); keeps that state from the press to the release.
+fn at_system_edge(v: &mut View, kind: u8, y: i32) -> bool {
+    if kind == 0 {
+        v.edge_touch = y < SYSTEM_EDGE_PX;
+    }
+    let edge = v.edge_touch;
+    if kind == 2 {
+        v.edge_touch = false;
+    }
+    edge
+}
+
 extern "C" fn proxy_event(e: *mut c_void) {
     let code = unsafe { lvx_event_get_user_data(e) } as u32;
     let Some((x, y)) = fw::event_point(e) else { return };
@@ -583,6 +606,9 @@ extern "C" fn proxy_event(e: *mut c_void) {
         event::PRESSING => 1,
         _ => 2,
     };
+    if at_system_edge(v, kind, y) {
+        return;
+    }
     v.touches.push(heapless_touch::Ev { kind, x: x - v.rect.0, y: y - v.rect.1 });
 }
 
@@ -612,6 +638,10 @@ extern "C" fn touch_event(e: *mut c_void) {
         event::PRESSING => 1,
         _ => 2,
     };
+    // A pull from the top edge is the system's: not held here, not a pat.
+    if at_system_edge(v, kind, y) {
+        return;
+    }
     if v.mode == Mode::Marker {
         // A press on a drag area (the head) keeps the gesture: the watchface's own page swipe and
         // scrolling stop at this object until release. Elsewhere swipes reach the system as usual.

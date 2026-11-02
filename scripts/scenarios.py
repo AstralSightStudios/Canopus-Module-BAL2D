@@ -183,24 +183,47 @@ class Run:
         time.sleep(4)
         self.shot("stock-face-overlay-off")
 
+    def to_face(self):
+        """Back on the watchface if a page is left open (a lost gesture can leave the launcher up):
+        when no frames are drawn, swipe down from the middle (the launcher's way back)."""
+        self.dev.wake()
+        a = self.stats()
+        time.sleep(2)
+        b = self.stats()
+        if a and b and b["frames"] == a["frames"]:
+            self.log("  not drawing: swiping back to the watchface")
+            self.dev.swipe(168, 240, 168, 470, 300, 2)
+
     def pages(self):
-        """Home pages and the control centre slide over the watchface without hiding it (LVGL keeps
-        drawing it under them): nothing is drawn while one covers it, drawing resumes after."""
+        """Home pages and the pull-down notifications slide over the watchface without hiding it
+        (LVGL keeps drawing it under them): nothing is drawn while one covers it, drawing resumes
+        after. The pull starts at the top edge over the character's head (x 250): the system edge
+        must still be the system's there."""
         self.face(LUA_FACE)
         self.ensure("Shiroko_home")
         time.sleep(8)
         for label, there, back in (("the next home page", (320, 440, 40, 440), (40, 440, 320, 440)),
                                    ("the previous home page", (40, 440, 320, 440), (320, 440, 40, 440)),
-                                   ("the control centre", (250, 5, 250, 400), (250, 470, 250, 30))):
+                                   ("the pull-down notifications", (250, 5, 250, 400), (250, 470, 250, 30))):
             self.dev.wake()
             a = self.stats()
             time.sleep(3)
             b = self.stats()
             self.dev.swipe(*there, 300, 2)
             c = self.stats()
-            self.shot("page-" + label.split()[-2] + "-" + label.split()[-1])
             time.sleep(3)
             d = self.stats()
+            if c and d and d["frames"] - c["frames"] > 2:
+                # The gesture can be lost (a phone-link call just before it can leave the top edge
+                # busy): try it once more. A page that opened but was not detected still fails.
+                self.log(f"  {label}: frames still advancing, swiping again")
+                self.dev.wake()
+                time.sleep(2)
+                self.dev.swipe(*there, 300, 2)
+                c = self.stats()
+                time.sleep(3)
+                d = self.stats()
+            self.shot("page-" + label.split()[-2] + "-" + label.split()[-1])
             self.dev.swipe(*back, 300, 2)
             time.sleep(1)
             e = self.stats()
@@ -208,6 +231,8 @@ class Run:
             f = self.stats()
             ok = all((a, b, c, d, e, f)) and b["frames"] > a["frames"] and d["frames"] - c["frames"] <= 2 \
                 and f["frames"] > e["frames"]
+            if not ok:
+                self.to_face()
             self.check(f"nothing is drawn under {label}, drawing resumes after", ok,
                        f"{a and a['frames']}->{b and b['frames']} | {c and c['frames']}->{d and d['frames']} | "
                        f"{e and e['frames']}->{f and f['frames']}")
@@ -215,6 +240,7 @@ class Run:
     def screen_off_on(self):
         self.face(LUA_FACE)
         time.sleep(4)
+        self.to_face()
         self.dev.wake()
         a = self.stats()
         time.sleep(12)  # the screen goes off after ~5 s
@@ -237,6 +263,7 @@ class Run:
         time.sleep(4)
         self.face(LUA_FACE)
         time.sleep(6)
+        self.to_face()
         a = self.stats()
         self.shot("returned-to-face")
         time.sleep(3)
@@ -246,6 +273,7 @@ class Run:
 
     def transfer_while_playing(self):
         self.face(LUA_FACE)
+        self.to_face()
         pid = self.pack_id("CH0335_home")
         if pid:
             self.link("delete", pid)
@@ -259,7 +287,8 @@ class Run:
         self.ids = {}
         ok = self.pack_id("CH0335_home") is not None
         self.log(f"  {out.strip().splitlines()[-1] if out.strip() else '?'}")
-        self.check("a transfer completes while the character plays", ok and b and b["errors"] == 0,
+        self.check("a transfer completes while the character plays",
+                   ok and a and b and b["errors"] == 0 and b["frames"] > a["frames"],
                    f"{dt:.1f} s; {a} -> {b}")
 
     def delete(self):

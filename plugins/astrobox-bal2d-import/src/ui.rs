@@ -25,6 +25,7 @@ const EV_CANCEL: &str = "action:cancel";
 const EV_SELECT: &str = "action:pack.select.";
 const EV_DELETE: &str = "action:pack.delete.";
 const EV_OVERLAY: &str = "action:overlay";
+const EV_FLUENT: &str = "action:fluent";
 const EV_FACE_PICK: &str = "action:face.pick";
 const EV_FACE_Z: &str = "input:face.z";
 const EV_FACE_PATCH: &str = "action:face.patch";
@@ -133,6 +134,10 @@ pub async fn on_event(event: &str, payload: &str) {
         EV_OVERLAY => {
             let current = state::snapshot().hello.map(|h| h.options).unwrap_or(0);
             watch::set_options(current ^ bal2d_proto::options::OVERLAY).await;
+        }
+        EV_FLUENT => {
+            let current = state::snapshot().hello.map(|h| h.options).unwrap_or(0);
+            watch::set_options(current ^ bal2d_proto::options::FLUENT).await;
         }
         EV_FACE_PICK => pick_face().await,
         EV_FACE_Z => state::with_state(|s| {
@@ -543,9 +548,30 @@ fn watch_tab(s: &UiState) -> View {
         None => "读取中…".into(),
     };
     let overlay = h.options & bal2d_proto::options::OVERLAY != 0;
+    let fluent = h.options & bal2d_proto::options::FLUENT != 0;
     stack(16)
         .child(card().child(row().child(heading("手表上的角色").grow()).child(button("刷新", EV_CONNECT, "ghost"))).child(list))
-        .child(card().child(heading("手表上的性能")).child(text(&perf, 13, tone::MUTED)))
+        .child(
+            card()
+                .child(heading("手表上的性能"))
+                .child(text(&perf, 13, tone::MUTED))
+                .child(
+                    row()
+                        .child(
+                            text(
+                                if fluent {
+                                    "流畅优先：开。每帧只留约十分之一的时间给手表系统，动画更快；如果蓝牙连接变慢、断开或手表操作卡顿，请关闭。"
+                                } else {
+                                    "流畅优先：关。每帧留约三分之一的时间给手表系统和蓝牙（默认，最稳）。"
+                                },
+                                13,
+                                tone::TEXT,
+                            )
+                            .grow(),
+                        )
+                        .child(button(if fluent { "关闭" } else { "开启" }, EV_FLUENT, "soft")),
+                ),
+        )
         .child(
         card()
             .child(heading("显示方式"))

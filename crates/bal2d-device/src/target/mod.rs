@@ -48,6 +48,9 @@ const BREATHER_EVERY_MS: u32 = 2000;
 const LINK_SETTLE_MS: u32 = 10_000;
 /// Frame + redraw (ms) above which half of it, not a third, stays idle.
 const HEAVY_BUSY_MS: u32 = 80;
+/// "Smoothness first" (`options::FLUENT`): the idle share between frames, and its floor (ms).
+const FLUENT_IDLE_DIV: u32 = 10;
+const FLUENT_IDLE_MIN_MS: u32 = 2;
 
 unsafe extern "C" fn on_bt_state(_ctx: *const canopus_abi::ContextV1, _topic: *const core::ffi::c_char, payload: *const c_void, len: u32, _user: *mut c_void) {
     if len >= 2 && !payload.is_null() {
@@ -110,6 +113,8 @@ pub struct Runtime {
     loader: Option<Loader>,
     /// Show full screen above watchfaces without a BAL2D layer.
     overlay: bool,
+    /// `options::FLUENT` (read with the overlay option when the options change).
+    fluent: bool,
     /// What `connect::start` answered (0: the phone can send packs).
     pub connect: i32,
     /// The last frame drew the baked background.
@@ -164,6 +169,7 @@ pub fn rt() -> &'static mut Runtime {
                 load_tried: false,
                 loader: None,
                 overlay: false,
+                fluent: false,
                 connect: 1,
                 bake_active: false,
                 idle_until: 0,
@@ -256,6 +262,18 @@ pub fn pack_title() -> String {
 
 pub fn overlay_on() -> bool {
     options() & bal2d_proto::options::OVERLAY != 0
+}
+
+pub fn fluent_on() -> bool {
+    options() & bal2d_proto::options::FLUENT != 0
+}
+
+/// Flips "smoothness first" (app page button).
+pub fn toggle_fluent() {
+    let o = options() ^ bal2d_proto::options::FLUENT;
+    if Fs::write(OPTIONS_FILE, &[o]) {
+        options_changed();
+    }
 }
 
 /// Shows the next installed pack (app page button).
@@ -595,7 +613,12 @@ fn ensure_attached(now: u32) {
         r.attach_check = now;
         let was = v.mode;
         if OPTIONS_DIRTY.swap(false, Ordering::AcqRel) {
-            r.overlay = options() & bal2d_proto::options::OVERLAY != 0 || Fs::stat(OVERLAY_FLAG).is_some();
+            let o = options();
+            r.overlay = o & bal2d_proto::options::OVERLAY != 0 || Fs::stat(OVERLAY_FLAG).is_some();
+            if r.fluent != (o & bal2d_proto::options::FLUENT != 0) {
+                r.fluent = !r.fluent;
+                trace(&alloc::format!("smoothness first: {}", r.fluent));
+            }
             if !r.overlay && v.mode == view::Mode::Overlay {
                 v.detach();
             }
@@ -705,7 +728,9 @@ extern "C" fn frame(timer: *mut c_void) {
     // + redraw then stays idle (at least 4 ms), so the watch's own UI and Bluetooth always get
     // their turn, however heavy the character is. Less (a third of the frame alone, or of the
     // frame + the redraw's CPU part) lets the phone fail to connect with a heavy lobby drawn
-    // full-screen over an animated face on Mirage: scripts/btstress.py is that test.
+    // full-screen over an animated face on Mirage: scripts/btstress.py is that test. "Smoothness
+    // first" (options::FLUENT) keeps a tenth instead, to find out on a real watch whether its
+    // Bluetooth and UI need that much; the breathers while the phone connects stay either way.
     if r.settling {
         r.settling = false;
         let refresh = now.wrapping_sub(r.frame_end).min(1000);
@@ -716,7 +741,11 @@ extern "C" fn frame(timer: *mut c_void) {
         adapt_quality(now);
         // Very heavy frames (under about 9 fps) leave half as much idle again: a heavy lobby
         // full-screen over an animated face still starved the phone link on Mirage with a third.
-        let mut rest = (if busy > HEAVY_BUSY_MS { busy / 2 } else { busy / 3 }).max(4);
+        let mut rest = if r.fluent {
+            (busy / FLUENT_IDLE_DIV).max(FLUENT_IDLE_MIN_MS)
+        } else {
+            (if busy > HEAVY_BUSY_MS { busy / 2 } else { busy / 3 }).max(4)
+        };
         let link = BT_LINK.load(Ordering::Relaxed);
         if link == 1 && r.bt_was != 1 {
             r.bt_up_at = now;
