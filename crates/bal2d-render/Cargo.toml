@@ -1,0 +1,14 @@
+[package]
+name = "bal2d-render"
+description = "Turns a posed Spine skeleton into a draw list (no_std + alloc)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Paths as cluster outlines (host experiments; not in the watch build).
+outline = []
+
+[dependencies]
+bal2d-spine = { path = "../bal2d-spine", default-features = false }

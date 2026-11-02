@@ -1,0 +1,14 @@
+[package]
+name = "bal2d-compiler"
+description = "Compiles Blue Archive memorial-lobby Spine assets into a device .bal2d pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bal2d-spine = { path = "../bal2d-spine" }
+bal2d-render = { path = "../bal2d-render" }
+bal2d-pack = { path = "../bal2d-pack" }
+bal2d-core = { path = "../bal2d-core" }
+png = "0.17"

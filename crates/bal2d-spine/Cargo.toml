@@ -1,0 +1,17 @@
+[package]
+name = "bal2d-spine"
+description = "Spine 4.2 skeleton data, binary reader and runtime (no_std + alloc)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+libm = "0.2"
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,17 @@
+{
+  "name": "BA 记忆大厅导入器",
+  "icon": "icon.png",
+  "version": "0.1.0",
+  "description": "把你自己从游戏中提取的蔚蓝档案记忆大厅（Spine）编译成手表可播放的角色包，通过 CanopusConnect 传到手表上的 BAL2D 模块，并可给表盘加入角色图层。插件不包含任何游戏素材。",
+  "author": "Searchstars",
+  "website": "",
+  "entry": "astrobox_plugin_bal2d_import.wasm",
+  "wasi_version": 3,
+  "api_level": 4,
+  "permissions": [
+    "canopusconnect.send",
+    "canopusconnect.listen",
+    "device"
+  ],
+  "additional_files": []
+}

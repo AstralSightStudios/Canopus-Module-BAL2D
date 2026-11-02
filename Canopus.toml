@@ -1,0 +1,61 @@
+schema = 1
+
+[module]
+id = "ba_l2d"
+version = "0.1.0"
+version_code = 1
+kind = "target"
+language = "rust"
+lifecycle = "resident-after-activation"
+canopus_abi = "2"
+description = "BAL2D: Blue Archive memorial lobbies as a watchface layer, drawn by the GPU"
+
+[build]
+sources = ["crates/bal2d-device/Cargo.toml"]
+# Firmware entry points this module binds itself (docs/re/firmware-p0.md):
+allowed_constants = [
+  # Band 10 Pro 3.101.043: vg_lite finish / flush / clear / blit_rect / draw_pattern / set_scissor /
+  # enable_scissor / set_CLUT (the driver's flash veneers), lv_display_get_layer_top, wfimg class,
+  # disp_def (default display).
+  "0x0c187bb1", "0x0c1877e9", "0x0c187ab1", "0x0c187a59", "0x0c187f01", "0x0c1876f9", "0x0c187a49",
+  "0x0c187d21",
+  "0x1c02fb35", "0x2cdbdc40", "0x2010318c",
+  # mm_mallinfo and the user heap pointer (the module checks free memory: malloc asserts on failure).
+  "0x0c1f8029", "0x200f4c28",
+  # Rust core table words that look like firmware addresses (scripts/allow-constants.py):
+  "0x0c000a01",
+  "0x0cc020bc",
+  "0x0cc02901",
+  "0x0cc02e01",
+  "0x0cc000c0",
+  "0x0cc0203a",
+  "0x0cc02065",
+  "0x0c007372",
+  "0x0c000f06",
+  "0x0c011f0a",
+  "0x0c02040f",
+  "0x0c02050a",
+  "0x0c021004",
+  "0x0c021e08",
+  "0x0c042720",
+  "0x0c0b3408",
+  "0x0c010402",
+  "0x0c010801",
+  "0x0c016501",
+  "0x0c020201",
+  "0x0c022e02",
+  "0x0c022e30",
+  "0x0c030303",
+  "0x0c040c01",
+  "0x0c06da03",
+  "0x0c084608",
+  "0x0c0f0104",
+]
+
+[resources]
+files = ["assets/appicon.bin"]
+
+[targets]
+include = [
+  "xiaomi-band-10-pro-3.101.043",
+]

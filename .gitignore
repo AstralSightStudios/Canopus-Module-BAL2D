@@ -1,0 +1,15 @@
+/target/
+/build/
+/dist/
+__pycache__/
+.DS_Store
+/Canopus.dev-*.toml
+/shots/
+# Game assets are never committed or packaged: developers extract their own.
+/testdata/
+*.bal2d
+/review/
+/.scratch/
+/plugins/*/target/
+/plugins/*/dist/
+/assets/appicon.png

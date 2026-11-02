@@ -1,0 +1,26 @@
+[package]
+name = "bal2d-device"
+description = "BAL2D on Canopus: plays Blue Archive memorial lobbies as a watchface layer with the VGLite GPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[features]
+default = []
+device = ["dep:canopus-target-private", "dep:canopus-target-generated"]
+target-xiaomi-band-10-pro-3-101-043 = ["device", "canopus-target-private/target-xiaomi-band-10-pro-3-101-043", "canopus-target-generated/target-xiaomi-band-10-pro-3-101-043"]
+
+[dependencies]
+bal2d-core = { path = "../bal2d-core" }
+bal2d-spine = { path = "../bal2d-spine", default-features = false }
+bal2d-render = { path = "../bal2d-render" }
+bal2d-pack = { path = "../bal2d-pack" }
+bal2d-proto = { path = "../bal2d-proto" }
+canopus-abi = { path = "../../../Canopus/sdk/rust/canopus-abi" }
+canopus-runtime = { path = "../../../Canopus/sdk/rust/canopus-runtime" }
+canopus-target-private = { path = "../../../Canopus/sdk/rust/canopus-target-private", optional = true, default-features = false }
+canopus-target-generated = { path = "../../../Canopus/sdk/rust/canopus-target-generated", optional = true, default-features = false }

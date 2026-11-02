@@ -1,0 +1,11 @@
+[package]
+name = "bal2d-link-cli"
+description = "Dev tool: runs the phone side of the BAL2D Connect protocol against a Mirage device through the AstroBox bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bal2d-proto = { path = "../../crates/bal2d-proto" }

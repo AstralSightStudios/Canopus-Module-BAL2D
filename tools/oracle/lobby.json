@@ -1,0 +1,21 @@
+{
+  "dt": 0.0333333,
+  "frames": 600,
+  "dumpEvery": 15,
+  "defaultMix": 0.25,
+  "actions": [
+    {"frame": 0, "op": "set", "track": 0, "anim": "Start_Idle_01", "loop": false},
+    {"frame": 0, "op": "add", "track": 0, "anim": "Idle_01", "loop": true, "delay": 0},
+    {"frame": 300, "op": "set", "track": 1, "anim": "Talk_01_M", "loop": false},
+    {"frame": 300, "op": "set", "track": 2, "anim": "Talk_01_A", "loop": false},
+    {"frame": 300, "op": "addEmpty", "track": 1, "mix": 0.5, "delay": 0},
+    {"frame": 300, "op": "addEmpty", "track": 2, "mix": 0.5, "delay": 0},
+    {"frame": 480, "op": "set", "track": 1, "anim": "Pat_01_M", "loop": true},
+    {"frame": 480, "op": "set", "track": 2, "anim": "Pat_01_A", "loop": true},
+    {"frame": 480, "op": "bone", "name": "Touch_Point", "dx": 30, "dy": -20, "until": 560},
+    {"frame": 560, "op": "set", "track": 1, "anim": "PatEnd_01_M", "loop": false},
+    {"frame": 560, "op": "set", "track": 2, "anim": "PatEnd_01_A", "loop": false},
+    {"frame": 560, "op": "addEmpty", "track": 1, "mix": 0.2, "delay": 0},
+    {"frame": 560, "op": "addEmpty", "track": 2, "mix": 0.2, "delay": 0}
+  ]
+}

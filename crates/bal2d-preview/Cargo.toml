@@ -1,0 +1,17 @@
+[package]
+name = "bal2d-preview"
+description = "Software preview of compiled .bal2d packs: the reference rasterizer the GPU path is compared with"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bal2d-spine = { path = "../bal2d-spine" }
+bal2d-render = { path = "../bal2d-render" }
+bal2d-core = { path = "../bal2d-core" }
+bal2d-pack = { path = "../bal2d-pack" }
+bal2d-compiler = { path = "../bal2d-compiler" }
+
+[dev-dependencies]
+miniz_oxide = "0.8"

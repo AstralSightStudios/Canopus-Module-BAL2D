@@ -1,0 +1,12 @@
+[package]
+name = "bal2d-core"
+description = "Memorial-lobby player: pack loading, animation state and touch interactions (no_std + alloc)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bal2d-spine = { path = "../bal2d-spine", default-features = false }
+bal2d-render = { path = "../bal2d-render" }
+bal2d-pack = { path = "../bal2d-pack" }

@@ -1,0 +1,128 @@
+# BAL2D：手表上的蔚蓝档案记忆大厅
+
+BAL2D 是一个 Canopus 模块（`ba_l2d`）。它让小米手环 10 Pro（固件 3.101.043）把蔚蓝档案的记忆大厅（Spine 4.2 动画）作为表盘的一个图层播放：角色静置时循环待机动画，点一下说话，拖动头部摸头，用 VGLite GC355 GPU 绘制。
+
+**本项目不包含、也不分发任何游戏素材。** 角色素材由用户自己从游戏中提取，在手机上的 AstroBox 插件里编译成手表角色包；素材解包仅限个人使用，请勿分享。
+
+## 组成
+
+| 目录 | 作用 |
+|---|---|
+| `crates/bal2d-spine` | Spine 4.2 运行时（`no_std`）：二进制骨骼读取与写出、动画状态、约束、物理。与官方 spine-core 4.2 逐帧对比（`examples/golden.rs`）。 |
+| `crates/bal2d-render` | 绘制列表（含裁剪附件）、把三角形按仿射聚类成 GPU 路径（`Paths`）。 |
+| `crates/bal2d-pack` | `.bal2d` 角色包格式：骨骼、图集、GPU 贴图页、烘焙背景、互动参数。 |
+| `crates/bal2d-core` | 大厅逻辑：开场 → 待机、点击说话、拖动摸头/视线跟随。 |
+| `crates/bal2d-compiler` | 手机端编译器：模拟所有会播放的动画，剔除看不见的部分（含始终被别的骨骼完全挡住的整个骨骼），按屏幕密度裁切重采样贴图，烘焙静态背景，删除不会播放的动画与无用时间轴。 |
+| `crates/bal2d-preview` | 软件渲染预览（插件预览图、主机工具）。 |
+| `crates/bal2d-face` | 给成品表盘（BIN/MWZ）加入角色图层。 |
+| `crates/bal2d-proto` | 插件与模块之间的 CanopusConnect 协议：编解码、手表端接收、手机端发送。 |
+| `crates/bal2d-device` | 手表模块本体（静态库，Canopus 构建）。 |
+| `plugins/astrobox-bal2d-import` | AstroBox 插件（wasm32-wasip2，API level 4）。 |
+| `tools/bal2d-tool` | 开发工具：渲染、编译、对比、基准、表盘信息与 patch。 |
+| `tools/bal2d-link-cli` | 通过 Mirage 的 AstroBox 桥运行插件同款发送器（安装、列表、统计、批量基准）。 |
+| `scripts/` | Mirage 自动化：部署、截图、录屏、内存读取、常量白名单、图标生成、参考角色包编译、计时模式下的性能测量（`perf.py`）与按指令时间的热点分析（`guestprof.py`）。 |
+| `examples/lua-face` | 带角色图层的 Lua 表盘示例。 |
+| `docs/re/firmware-p0.md` | 固件逆向记录（VGLite、LVGL、表盘渲染器；末尾为上机勘误）。 |
+
+## 使用方式
+
+1. 在手表上安装并启用 `ba_l2d` 模块（Canopus）。
+2. 在 AstroBox 安装插件 `BA 记忆大厅导入器`，连接手表。
+3. **导入角色**：添加某个大厅的 `.skel`、`.atlas` 和全部 `.png`（或一个包含它们的 zip；有背景骨骼的大厅一并加入；可选加入社区整理的 `interactions.json` 获得原版摸头参数）。文件按内容识别，安卓上没有扩展名的文件名也能配对。选择取景与画质后“编译并预览”，确认后“安装到手表”。
+4. **表盘图层**：在“表盘图层”页选择一个成品表盘（`.bin` / `.mwz`），指定角色插在第几层（一般是背景之上），生成后加入安装队列或保存。生成的表盘使用新的表盘 ID（`B2D` 开头）并在名称后加 “ BA”，与原表盘并存，不会因为同 ID 而安装失败。安装并切换到这个表盘，角色就出现在该层：时间等组件叠在角色上方，头部区域仍可摸头，其他区域的滑动照常交给系统。屏幕顶部正中约 80×80 像素是系统的下拉区域，从这里开始的滑动始终归系统（下拉控制中心），摸头请从头部的其他位置开始。
+5. **Lua 表盘 / 其他应用**：任何显示 `/data/canopus/m.ba_l2d/layer.bin` 的 LVGL 图片对象都会被模块接管为角色图层，它在对象树中的位置就是层级（不设置尺寸时占满全屏）。模块启动时会写入这个文件（16×16 透明图），所以模块没运行时表盘照常显示。示例见 `examples/lua-face/main.lua`：
+
+   ```lua
+   lvgl.Image(root, { src = "/data/canopus/m.ba_l2d/layer.bin", x = 0, y = 0 })
+   ```
+6. 没有角色图层的表盘：可在插件“手表上的角色”页或手表上的“BA 大厅”应用里打开“全屏显示”，角色会全屏显示在表盘最上层。
+
+手表上的“BA 大厅”应用显示当前角色、显示方式与性能，并可直接切换到下一个角色。
+
+## 渲染与性能
+
+- **GPU 路径**：每个附件的可见三角形按“同一张纹理、同一个仿射”（误差 ≤ 0.75 像素）聚成一条 VGLite 路径，用 `vg_lite_draw_pattern` 一次画完。路径用 16 位定点坐标（1/8 像素精度），数据量是浮点路径的一半；共享顶点取整一致，不会出现裂缝。插件预览图按同样的聚类方式软件渲染，所见即手表所得。
+- **静态背景烘焙**：编译时找出绘制顺序最底部、在待机/对话/摸头/拖动/物理下都不变的槽位，全精度合成为一张 RGB565 图；手表上每帧先贴这张图再画其余部分。只在开场动画里移动的背景，开场结束后才切换到烘焙图。
+- **贴图**：ARGB8565（565 颜色 + 8 位透明度，与 16 位屏幕精度一致，无抖动颗粒），只保留实际可见的部分，并按屏幕上的最大缩放密度重采样。图集中 90/180/270 度旋转的区域都会还原。
+- **网格裁剪**：编译时记录每个三角形是否出现在屏幕（含 24 像素余量）内，从未出现的三角形及只被它们使用的顶点（连同变形时间轴的对应数据）被删除，手表每帧少做大量蒙皮与剔除（参考大厅的绘制列表三角形减少 5–43%）。
+- **内存**：动画曲线只存 Bezier 控制点（与官方运行时数值一致，内存约为 1/4.5）；不会播放的动画、没有可见内容的槽位/骨骼的时间轴在编译时删除。
+- **帧调度**：最高 30 fps，表盘不在当前屏幕或熄屏时不画。每帧之后测量 LVGL 因这一帧重绘屏幕的耗时（主要是等屏幕的 TE 信号与整屏传输；插件里显示为“屏幕刷新”）。重绘期间界面任务同样被占用，所以之后再让它空闲“本帧 + 重绘”的 1/3（至少 4 ms），手表自身的界面、蓝牙与传感器始终有机会运行。手机没有连着（或刚连上 10 秒内）时，每 2 秒再停画 250 ms，给连接与认证留出完整的时间窗。（Mirage 上曾出现重度角色全屏叠在动态表盘上时手机连不上：原因是模拟器自身的全局锁在 macOS 上不公平，已在模拟器里修复。）
+- **GPU 与 CPU 并行**：背景图贴完、以及每 48 次绘制，就把已有的命令交给 GPU（`vg_lite_flush`），GPU 光栅化的同时 CPU 继续生成后面的路径，帧末等待 GPU 的时间明显缩短。
+- **画质自适应**：仿射聚类误差默认 0.75 像素（“精细”）；如果一帧连同重绘超过约 31 ms（保持不了 24 fps），每 3 秒放宽一级到 1.0 / 1.25 像素（GPU 调用减少 10–40%），有余量时再收回。手表应用里显示当前档位。
+- **为 Cortex-M33 写的数学**：M33 的 FPU 只有单精度，libm 的 `sinf`/`cosf` 内部用双精度，在手表上会变成软件浮点调用（按指令计时的模型里，它们曾占重度大厅全部 CPU 时间的五分之一）。骨骼变换改用单精度实现（误差 < 2e-7，按 90° 精确归约角度）；每帧执行的 crate 按速度编译（Canopus 默认按体积），蒙皮与路径循环去掉了逐元素边界检查。改动前后，8 个参考大厅 150 帧的全部 GPU 调用逐位相同（`examples/calldump.rs`）。
+- **分步加载**：切换角色时，骨骼、每张贴图页、烘焙背景分在不同帧加载，加载期间手表界面不卡死。
+
+## 真机与模拟器
+
+模拟器能跑不等于真机能跑。下面这些差别已经专门处理过：
+
+- **缓存一致性**：真机的 PSRAM 有缓存，Mirage 没有。CPU 写好的贴图、烘焙背景在交给 GPU 前都做缓存回写；GPU 画出的帧只由 GPU 读取（在 Mirage 上对渲染目标加读写观察点运行 20 秒：除 PNG 解码器检查前 8 字节文件头外，没有任何 CPU 访问）；路径数据由驱动复制进命令缓冲，复用安全。
+- **GPU 自检**：模块启动后第一帧，用渲染时依赖的每种功能各画一个 4×4 小方块（S16/FP32 路径、四种贴图格式、PAD 边缘、调色、四种混合、背景贴图、小块与大块贴图的缓存回写），经非缓存地址读回逐一比对。有问题就自动换用备选方案：FP32 路径、绕过缓存写贴图、把该格式的贴图展开为 32 位（内存不够时保持原格式）、透明边缘；结果在插件“手表上的性能”和手表应用里显示。所有备选方案都在 Mirage 上强制启用过（开发文件 `selftest-force`），画面与正常时一致。
+- **按真机速度计时（Mirage 计时模式）**：普通模式下 Mirage 的时间随宿主机走，整数代码比 208 MHz 的 M33 快几倍，GPU 又是瞬间完成，测出的帧率既可能偏高也可能偏低。计时模式（qemu-miwear `bal2d/timing` 分支，说明见其 `emu/TIMING.md`）让每条指令按 130 MIPS 计时（208 MHz、每条约 1.6 个周期，含 PSRAM 缓存未命中），GPU 按 GC355 的建模时间完成，屏幕按 60 Hz TE 加 8 ms 传输。开启方式：在设备 `device.json` 的 `extraArguments` 里加
+  `"-icount", "ips=130000000,align=on,sleep=on,exact-io=off", "-global", "driver=vsi.vglite,property=timing,value=on"`。
+  这些参数来自芯片规格的估算，不是实测；有真机时，用手表上显示的各阶段耗时按 `emu/TIMING.md` 的方法校准。
+
+计时模式下参考大厅（编译为 `review/packs/v7`，Lua 表盘全屏，最终版本的帧调度）的帧率：
+
+| 大厅 | fps | 动画 ms | 绘制 ms（驱动） | 等 GPU ms | 三角形 | GPU 调用 |
+|---|---|---|---|---|---|---|
+| Shiroko | 21.2 | 0 | 12.0（3.3） | 1.0 | 1723 | 89 |
+| CH0335 | 20.1 | 2 | 5.3（3.3） | 8.0 | 208 | 79 |
+| CH0184 | 13.0 | 3 | 21.7（5.7） | 3.7 | 2250 | 144 |
+| Hina | 11.7 | 1 | 16.3（3.0） | 16.3 | 2186 | 113 |
+| CH0348 | 10.6 | 3 | 34.7（17.7） | 0.7 | 1450 | 444 |
+| Hoshino | 8.9 | 8 | 35.0（9.0） | 0.7 | 4095 | 224 |
+| Neru | 8.9 | 6 | 45.7（20.3） | 0 | 3284 | 654 |
+
+（Yuuka 在这次测量前被删除场景删掉了；只按本帧耗时留空闲时测得 18.4 fps，按现在的调度约低两成。）
+
+每帧还有约 18 ms 花在 LVGL 重绘与屏幕传输上。附件多、变形多的大厅（Neru 每帧约 460 个可见附件、CH0348 网格变形大）受驱动每次调用约 37 µs 的开销限制；这部分在固件驱动里，模块不能绕过它自己写 GPU 命令（那样在真机上风险最大）。
+
+## 构建与开发
+
+```sh
+cargo test --workspace --exclude bal2d-device                # 主机测试
+cargo build --release -p bal2d-tool                          # 开发工具
+../Canopus/target/debug/canopus build                       # 手表模块（校验常驻体积与地址白名单）
+python3 scripts/allow-constants.py                           # 校验器误判的常量加入白名单
+cd plugins/astrobox-bal2d-import && cargo build --release    # 插件 wasm
+python3 scripts/make-appicon.py                              # 重新生成图标（原创图形）
+```
+
+Mirage（模拟器，仅供开发验证；GPU 模型与真机不完全相同）：
+
+```sh
+python3 scripts/mirage_session.py 043 create                 # 新设备，配对并安装 Canopus 安装器表盘
+python3 scripts/mirage_session.py 043 deploy                 # 安装当前构建
+python3 scripts/mirage_session.py 043 fast                   # 同版本号直接替换模块（开发）
+python3 scripts/mirage_session.py 043 link hello|list|stats  # 插件同款协议
+python3 scripts/mirage_session.py 043 link bench --wait 14 PACK...   # 多角色包性能对比
+python3 scripts/shot.py bal2d-dev-043 out.png --keep 8       # 截图（屏幕约 5 秒熄灭）
+python3 scripts/record.py bal2d-dev-043 out.mp4 12 --tap 1 168 400 --swipe 3 110 88 230 88 1200
+scripts/build-packs.sh v7                                    # 参考大厅编译到 review/packs/v7（素材在仓库外）
+python3 scripts/scenarios.py review/packs/v7                 # 端到端场景：Lua/成品表盘、互动、切换、全屏、熄屏、传输、删除
+python3 scripts/perf.py --all --label x                      # 已安装角色逐个测帧耗时（计时模式下即为模型时间）
+MIRAGE_PROFILE=build/mirage/profile.txt …                    # 启动 QEMU 时设置：按指令时间采样 PC
+python3 scripts/guestprof.py A.txt B.txt                     # 两次采样之差，按模块/固件函数汇总
+```
+
+主机工具：
+
+```sh
+bal2d-tool compile --skel A.skel [--skel B.skel] --size 336x480 --format argb8565 --budget 800000 --out x.bal2d
+bal2d-tool bench --touch --pack x.bal2d          # 手表每帧 CPU 工作（同一份代码）的主机耗时
+bal2d-tool render --pack x.bal2d --scenario tools/oracle/lobby.json --size 336x480 --out dir
+bal2d-tool face-patch face.mwz --z 1 --rect 0,0,336,480 --out face-bal2d.mwz
+```
+
+`tools/oracle/oracle.mjs` 用官方 spine-core（npm，仓库外安装，仅作对照）生成参考姿态；本项目不复制任何 Spine 运行时代码。
+
+## 已知限制
+
+- **双色染色（Tint Black）**：GPU 的图案填充只支持单色调制，使用暗色通道的槽位按普通染色绘制（插件预览图同样按手表的效果显示）。测试过的 8 个大厅都没有用到非黑色的暗色，因此没有可见差别。
+- **语音**：对话动画会播放，但不播放语音。
+- **性能数据**：上表来自 Mirage 计时模式的估算（CPU、GPU、内存带宽参数未经真机校准）；真机帧率以手表上“BA 大厅”应用或插件里的实时统计为准。模型里没有一个大厅达到 24 fps：轻量的约 20 fps，重度的 9–13 fps。
+
+## 支持范围
+
+只支持小米手环 10 Pro 3.101.043（336×480）。小米手环 11 已放弃：屏幕小，且约 2.7 MB 的空闲堆装不下大多数大厅。

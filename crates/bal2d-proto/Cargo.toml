@@ -1,0 +1,9 @@
+[package]
+name = "bal2d-proto"
+description = "The CanopusConnect protocol between the BAL2D AstroBox plugin and the ba_l2d module: codec, watch-side receiver, phone-side sender (no_std + alloc)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

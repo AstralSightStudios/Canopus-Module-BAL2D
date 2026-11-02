@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/bal2d-spine",
+  "crates/bal2d-render",
+  "crates/bal2d-pack",
+  "crates/bal2d-proto",
+  "crates/bal2d-core",
+  "crates/bal2d-device",
+  "crates/bal2d-face",
+  "crates/bal2d-compiler",
+  "crates/bal2d-preview",
+  "tools/bal2d-tool",
+  "tools/bal2d-link-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0"
+rust-version = "1.85"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
+
+# The Canopus CLI builds modules for size (CARGO_PROFILE_RELEASE_OPT_LEVEL=z); package overrides
+# take precedence over that. The per-frame code is built for speed: at z, small helpers such as
+# Vec indexing stay out-of-line calls in the skinning and path loops.
+[profile.release.package.bal2d-device]
+opt-level = "s"
+[profile.release.package.bal2d-core]
+opt-level = 3
+[profile.release.package.bal2d-spine]
+opt-level = 3
+[profile.release.package.bal2d-render]
+opt-level = 3
+[profile.release.package.libm]
+opt-level = 3
+
+# The host tools run the runtime over whole animations; keep them fast in debug too.
+[profile.dev.package."*"]
+opt-level = 2

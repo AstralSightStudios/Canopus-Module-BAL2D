@@ -1,0 +1,18 @@
+[package]
+name = "bal2d-tool"
+description = "Host tools: preview rendering, golden comparison, pack compilation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bal2d-spine = { path = "../../crates/bal2d-spine" }
+bal2d-render = { path = "../../crates/bal2d-render", features = ["outline"] }
+bal2d-pack = { path = "../../crates/bal2d-pack" }
+bal2d-core = { path = "../../crates/bal2d-core" }
+bal2d-face = { path = "../../crates/bal2d-face" }
+bal2d-compiler = { path = "../../crates/bal2d-compiler" }
+bal2d-preview = { path = "../../crates/bal2d-preview" }
+png = "0.17"
+serde_json = "1"

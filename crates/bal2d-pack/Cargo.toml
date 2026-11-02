@@ -1,0 +1,10 @@
+[package]
+name = "bal2d-pack"
+description = "The .bal2d container: compiled skeletons, atlases, GPU-ready pages and interactions (no_std + alloc)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
