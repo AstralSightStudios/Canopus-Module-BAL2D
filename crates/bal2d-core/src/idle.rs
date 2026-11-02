@@ -39,8 +39,13 @@ impl IdleLayer {
     /// The bake for a layer of `data`, when every shape names a drawable attachment of a slot
     /// and triangles it has.
     pub fn new(bake: IdleBake, data: &SkeletonData) -> Option<IdleLayer> {
-        let mut geo = Vec::with_capacity(bake.shapes.len());
-        let (mut all, mut vert_at) = (Vec::new(), Vec::with_capacity(bake.shapes.len() + 1));
+        let n = bake.shapes.len();
+        let total: usize = bake.shapes.iter().map(|s| s.tris.len() * 3).sum();
+        // Fallible: the watch loads this last, into whatever memory is left.
+        let (mut geo, mut all, mut vert_at) = (Vec::new(), Vec::new(), Vec::new());
+        geo.try_reserve_exact(n).ok()?;
+        all.try_reserve_exact(total).ok()?;
+        vert_at.try_reserve_exact(n + 1).ok()?;
         let mut used: Vec<u16> = Vec::new();
         vert_at.push(0u32);
         for s in &bake.shapes {
@@ -59,7 +64,7 @@ impl IdleLayer {
             all.extend_from_slice(&used);
             vert_at.push(all.len() as u32);
         }
-        let n = bake.shapes.len();
+        all.shrink_to_fit();
         Some(IdleLayer {
             cursor: IdleCursor::new(n),
             frame: None,

@@ -704,7 +704,12 @@ impl IdleBake {
     }
 
     pub fn decode(d: &[u8]) -> Option<IdleBake> {
-        let mut r = Bytes { d, at: 0 };
+        Self::decode_owned(d.to_vec())
+    }
+
+    /// `decode`, keeping the section's own buffer as the stream (no second copy of it).
+    pub fn decode_owned(mut d: Vec<u8>) -> Option<IdleBake> {
+        let mut r = Bytes { d: &d, at: 0 };
         if r.u8()? != 2 {
             return None;
         }
@@ -737,11 +742,12 @@ impl IdleBake {
         }
         let frames = r.u16()?;
         let len = r.u32()? as usize;
-        let stream = d.get(r.at..r.at + len)?.to_vec();
-        if r.at + len != d.len() || frames == 0 {
+        let at = r.at;
+        if at + len != d.len() || frames == 0 {
             return None;
         }
-        Some(IdleBake { animation, rate, period, start, shapes, colors, frames, stream })
+        d.drain(..at);
+        Some(IdleBake { animation, rate, period, start, shapes, colors, frames, stream: d })
     }
 }
 

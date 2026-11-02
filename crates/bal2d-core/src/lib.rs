@@ -144,8 +144,10 @@ pub struct Lobby {
     /// Total animation time (seconds).
     pub time: f32,
     pub bake: Option<Bake>,
-    /// Per layer: its idle loop baked into GPU calls (`idle`), when the pack has one.
+    /// Per layer: its idle loop baked into GPU calls (`idle`), once loaded (`load_idle`).
     pub idle: Vec<Option<idle::IdleLayer>>,
+    /// Per layer: the pack section of its baked idle, if it has one.
+    pub idle_entries: Vec<Option<bal2d_pack::Entry>>,
     /// Per layer: time its baked idle has played that its skeleton has not (`update_with`).
     idle_pending: Vec<f32>,
 }
@@ -160,10 +162,24 @@ pub enum LoadError {
 }
 
 impl Lobby {
-    /// Parses a pack held in memory (host tools).
+    /// Parses a pack held in memory (host tools), its baked idle included.
     pub fn load(bytes: &[u8]) -> Result<(Lobby, Vec<Page>), LoadError> {
         let mut src: &[u8] = bytes;
-        Self::load_from(&mut src)
+        let (mut lobby, pages) = Self::load_from(&mut src)?;
+        for li in 0..lobby.layers.len() {
+            lobby.load_idle(&mut src, li);
+        }
+        Ok((lobby, pages))
+    }
+
+    /// Reads layer `layer`'s baked idle from the pack; false if it has none, it cannot be read
+    /// (memory included) or it does not fit the skeleton (the layer is then animated).
+    pub fn load_idle(&mut self, src: &mut dyn Source, layer: usize) -> bool {
+        let Some(Some(e)) = self.idle_entries.get(layer) else { return false };
+        let Ok(d) = bal2d_pack::read_section_vec(src, e) else { return false };
+        let Some(bake) = bal2d_pack::IdleBake::decode_owned(d) else { return false };
+        self.idle[layer] = idle::IdleLayer::new(bake, &self.layers[layer].data);
+        self.idle[layer].is_some()
     }
 
     /// Parses a pack from a random-access source. Only the skeletons, atlases and tables are
@@ -241,15 +257,10 @@ impl Lobby {
             Some(e) => String::from_utf8(bal2d_pack::read_section_vec(src, e).map_err(LoadError::Pack)?).unwrap_or_default(),
             None => String::new(),
         };
-        // A bake that does not fit its skeleton is ignored (the layer is then animated).
-        let mut idle = Vec::with_capacity(layers.len());
-        for (li, l) in layers.iter().enumerate() {
-            let bake = match idx.find(bal2d_pack::KIND_IDLE, li as u16, 0) {
-                Some(e) => bal2d_pack::read_section_vec(src, e).ok().and_then(|d| bal2d_pack::IdleBake::decode(&d)),
-                None => None,
-            };
-            idle.push(bake.and_then(|b| idle::IdleLayer::new(b, &l.data)));
-        }
+        // The baked idle is read on request (`load_idle`): the watch reads it last, if memory
+        // is left once everything else is in.
+        let idle_entries: Vec<Option<bal2d_pack::Entry>> = (0..layers.len()).map(|li| idx.find(bal2d_pack::KIND_IDLE, li as u16, 0).copied()).collect();
+        let idle = (0..layers.len()).map(|_| None).collect();
         let layers_len = layers.len();
         let mut lobby = Lobby {
             layers,
@@ -271,6 +282,7 @@ impl Lobby {
             bake,
             idle_pending: alloc::vec![0.0; layers_len],
             idle,
+            idle_entries,
         };
         lobby.start();
         Ok((lobby, pages))

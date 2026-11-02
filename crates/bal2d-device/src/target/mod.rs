@@ -23,6 +23,8 @@ use host::Fs;
 
 /// About 30 frames per second while visible.
 const FRAME_MS: u32 = 33;
+/// Heap a baked idle must leave free once read (the frame loop and the watch's own UI).
+const IDLE_HEADROOM: usize = 768 * 1024;
 pub const PACK_DIR: &str = "packs";
 /// The file name of the pack to show (in `PACK_DIR`).
 pub const CURRENT_FILE: &str = "packs/current.txt";
@@ -558,6 +560,17 @@ fn load_step() -> Option<i32> {
     trace(&alloc::format!("buffers: {verts} vertices, {idx} indices, {max_tris} triangles max: {ok}; heap: free {} KB", heap_free_kb()));
     if !ok {
         return Some(-12);
+    }
+    // The baked idle last, only into memory to spare (it is an optimization: without it the
+    // layer is animated). Reading a compressed section holds it twice for a moment.
+    let Some(l) = r.loader.as_mut() else { return Some(-22) };
+    if let Some(lobby) = l.lobby.as_mut() {
+        for li in 0..lobby.layers.len() {
+            let Some(Some(e)) = lobby.idle_entries.get(li).copied() else { continue };
+            let need = e.raw_len as usize + e.stored_len as usize + e.raw_len as usize / 4;
+            let loaded = heap_allows(need + IDLE_HEADROOM) && lobby.load_idle(&mut l.src, li);
+            trace(&alloc::format!("baked idle {li}: {} KB, {}; heap: free {} KB", e.raw_len / 1024, if loaded { "loaded" } else { "skipped" }, heap_free_kb()));
+        }
     }
     let Some(l) = r.loader.take() else { return Some(-22) };
     // Each lobby starts at the most exact clustering and adapts from there (a light one shown
