@@ -82,6 +82,9 @@ pub struct Options {
     pub width: u32,
     pub height: u32,
     pub camera: Option<Camera>,
+    /// Other framings by lobby phase (`bal2d_pack::phase`, not IDLE: that is `camera`). Whatever
+    /// any of them shows is kept, at the largest density any of them draws it.
+    pub phase_cameras: Vec<(u8, Camera)>,
     pub zoom: f32,
     pub format: PageFormat,
     /// Total texel budget across all pages (pixels).
@@ -106,6 +109,7 @@ impl Default for Options {
             width: 336,
             height: 480,
             camera: None,
+            phase_cameras: Vec::new(),
             zoom: 1.0,
             format: PageFormat::Bgra8888,
             budget: 1_200_000,
@@ -511,7 +515,40 @@ fn observe(layer: &Layer, list: &DrawList, cam: Camera, opts: &Options, seen: &m
 }
 
 /// Plays every animation the way the lobby uses it and records what is seen.
+/// [`simulate_one`] through every distinct framing (`cam` and the phase cameras), merged: seen
+/// under any, at the largest density, over the union of the bounds and triangles.
 fn simulate(layer: &Layer, cam: Camera, opts: &Options) -> (Vec<Seen>, trim::TriSeen) {
+    let mut cams = vec![cam];
+    for (_, c) in &opts.phase_cameras {
+        if !cams.contains(c) {
+            cams.push(*c);
+        }
+    }
+    let (mut seen, mut tri) = simulate_one(layer, cams[0], opts);
+    for c in &cams[1..] {
+        let (s2, t2) = simulate_one(layer, *c, opts);
+        for (a, b) in seen.iter_mut().zip(s2) {
+            a.visible |= b.visible;
+            a.density = a.density.max(b.density);
+            a.bounds = [a.bounds[0].min(b.bounds[0]), a.bounds[1].min(b.bounds[1]), a.bounds[2].max(b.bounds[2]), a.bounds[3].max(b.bounds[3])];
+        }
+        for (a, b) in tri.seen.iter_mut().zip(t2.seen) {
+            if a.is_empty() {
+                *a = b;
+            } else {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x |= y;
+                }
+            }
+        }
+        for (a, b) in tri.unknown.iter_mut().zip(t2.unknown) {
+            *a |= b;
+        }
+    }
+    (seen, tri)
+}
+
+fn simulate_one(layer: &Layer, cam: Camera, opts: &Options) -> (Vec<Seen>, trim::TriSeen) {
     let d = &layer.data;
     let mut seen = vec![Seen::default(); d.attachments.len()];
     let mut tri_seen = trim::TriSeen::new(d.attachments.len());
@@ -771,6 +808,16 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
     sections.push(Section { kind: bal2d_pack::KIND_INTERACTIONS, layer: 0, index: 0, data: inter.encode() });
     let name = if opts.name.is_empty() { layers[main].name.clone() } else { opts.name.clone() };
     sections.push(Section { kind: bal2d_pack::KIND_NAME, layer: 0, index: 0, data: name.into_bytes() });
+    let framings: Vec<(u8, f32, f32, f32)> = opts
+        .phase_cameras
+        .iter()
+        .filter(|(p, c)| *p != bal2d_pack::phase::IDLE && *c != cam)
+        .map(|(p, c)| (*p, c.cx, c.cy, c.scale))
+        .collect();
+    if !framings.is_empty() {
+        let data = bal2d_pack::PhaseCameras { cameras: framings }.encode();
+        sections.push(Section { kind: bal2d_pack::KIND_CAMERAS, layer: 0, index: 0, data });
+    }
     let header = Header {
         screen_width: opts.width as u16,
         screen_height: opts.height as u16,

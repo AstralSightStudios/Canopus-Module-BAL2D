@@ -94,6 +94,8 @@ enum DragPhase {
 
 #[derive(Clone, Debug)]
 struct ActiveDrag {
+    /// The camera at the press: the finger maps through it for the whole drag.
+    cam: Camera,
     drag: usize,
     bone: usize,
     phase: DragPhase,
@@ -114,10 +116,22 @@ pub enum Notice {
     TalkStarted(usize),
 }
 
+/// How long the framing takes to move to another phase's camera (seconds).
+pub const CAMERA_BLEND_S: f32 = 0.6;
+
 pub struct Lobby {
     pub layers: Vec<Layer>,
     pub interactions: Interactions,
+    /// The framing now: the current phase's camera, or on the way to it (see `cameras`).
     pub camera: Camera,
+    /// Each phase's camera (`bal2d_pack::phase`); phases a pack does not frame use the idle one.
+    pub cameras: [Camera; bal2d_pack::phase::COUNT],
+    /// The camera blend: from where, to which phase, how far (0..=1).
+    cam_from: Camera,
+    cam_phase: u8,
+    cam_t: f32,
+    /// A talk or a drag the lobby is busy with (its phase), until both tracks are free again.
+    activity: Option<u8>,
     pub width: f32,
     pub height: f32,
     pub name: String,
@@ -206,6 +220,17 @@ impl Lobby {
             }
             None => None,
         };
+        let base = Camera { cx: h.camera_cx, cy: h.camera_cy, scale: h.camera_scale };
+        let mut cameras = [base; bal2d_pack::phase::COUNT];
+        if let Some(e) = idx.find(bal2d_pack::KIND_CAMERAS, 0, 0) {
+            let list = bal2d_pack::PhaseCameras::decode(&bal2d_pack::read_section_vec(src, e).map_err(LoadError::Pack)?)
+                .ok_or(LoadError::MissingSection("cameras", 0))?;
+            for (p, cx, cy, scale) in list.cameras {
+                if let Some(c) = cameras.get_mut(p as usize) {
+                    *c = Camera { cx, cy, scale };
+                }
+            }
+        }
         let name = match idx.find(bal2d_pack::KIND_NAME, 0, 0) {
             Some(e) => String::from_utf8(bal2d_pack::read_section_vec(src, e).map_err(LoadError::Pack)?).unwrap_or_default(),
             None => String::new(),
@@ -213,7 +238,12 @@ impl Lobby {
         let mut lobby = Lobby {
             layers,
             interactions,
-            camera: Camera { cx: h.camera_cx, cy: h.camera_cy, scale: h.camera_scale },
+            camera: base,
+            cameras,
+            cam_from: base,
+            cam_phase: bal2d_pack::phase::IDLE,
+            cam_t: 1.0,
+            activity: None,
             width: h.screen_width as f32,
             height: h.screen_height as f32,
             name,
@@ -268,6 +298,53 @@ impl Lobby {
         self.time = 0.0;
         self.talk_next = 0;
         self.drag = None;
+        self.activity = None;
+        let phase = self.phase();
+        self.camera = self.cameras[phase as usize];
+        self.cam_from = self.camera;
+        self.cam_phase = phase;
+        self.cam_t = 1.0;
+    }
+
+    /// The phase the lobby is in, for its framing (`bal2d_pack::phase`).
+    pub fn phase(&self) -> u8 {
+        if let Some(a) = self.activity {
+            return a;
+        }
+        let l = &self.layers[self.main()];
+        let intro = l.data.find_animation(&self.interactions.intro);
+        let playing = l.state.current(0).map(|e| l.state.entry(e).animation);
+        if intro.is_some() && playing == Some(intro) { bal2d_pack::phase::INTRO } else { bal2d_pack::phase::IDLE }
+    }
+
+    /// Moves the framing towards the current phase's camera (`CAMERA_BLEND_S`, eased). The view
+    /// size (1 / scale) and the centre move linearly: no powers (a software double on the watch).
+    fn update_camera(&mut self, dt: f32) {
+        if self.activity.is_some() && self.drag.is_none() && self.settled() {
+            self.activity = None;
+        }
+        let phase = self.phase();
+        let target = self.cameras[phase as usize];
+        if phase != self.cam_phase {
+            self.cam_phase = phase;
+            if target != self.camera {
+                self.cam_from = self.camera;
+                self.cam_t = 0.0;
+            }
+        }
+        if self.cam_t >= 1.0 {
+            self.camera = target;
+            return;
+        }
+        self.cam_t = (self.cam_t + dt / CAMERA_BLEND_S).min(1.0);
+        let t = self.cam_t * self.cam_t * (3.0 - 2.0 * self.cam_t);
+        let (a, b) = (self.cam_from, target);
+        let size = 1.0 / a.scale + (1.0 / b.scale - 1.0 / a.scale) * t;
+        self.camera = if self.cam_t >= 1.0 {
+            b
+        } else {
+            Camera { cx: a.cx + (b.cx - a.cx) * t, cy: a.cy + (b.cy - a.cy) * t, scale: 1.0 / size }
+        };
     }
 
     /// True once the intro has finished and the idle loop plays on track 0.
@@ -275,6 +352,19 @@ impl Lobby {
         let l = &self.layers[self.main()];
         let idle = l.data.find_animation(&self.interactions.idle);
         l.state.current(0).is_some_and(|e| l.state.entry(e).animation == idle)
+    }
+
+    /// Nothing playing or queued on tracks 1 and 2 (`is_free` also counts a track whose clip is
+    /// still queued behind an empty mix-in as free).
+    fn settled(&self) -> bool {
+        let l = &self.layers[self.main()];
+        [1, 2].iter().all(|&t| match l.state.current(t) {
+            None => true,
+            Some(e) => {
+                let e = l.state.entry(e);
+                e.next.is_none() && (e.animation.is_none() || (!e.looped && e.is_complete()))
+            }
+        })
     }
 
     /// No talk / drag clip is playing on tracks 1 and 2.
@@ -290,7 +380,10 @@ impl Lobby {
     }
 
     pub fn screen_to_world(&self, x: f32, y: f32) -> (f32, f32) {
-        let c = self.camera;
+        self.screen_to_world_with(self.camera, x, y)
+    }
+
+    fn screen_to_world_with(&self, c: Camera, x: f32, y: f32) -> (f32, f32) {
         ((x - self.width * 0.5) / c.scale + c.cx, c.cy - (y - self.height * 0.5) / c.scale)
     }
 
@@ -326,6 +419,7 @@ impl Lobby {
         self.talk_next = i + 1;
         let (m, a) = self.interactions.talks[i].clone();
         self.play_pair(&m, &a, false);
+        self.activity = Some(bal2d_pack::phase::TALK);
         self.notices.push(Notice::TalkStarted(i));
     }
 
@@ -384,7 +478,10 @@ impl Lobby {
 
     /// Feeds a touch at screen coordinates.
     pub fn touch(&mut self, kind: Touch, x: f32, y: f32) {
-        let world = self.screen_to_world(x, y);
+        // A drag follows the finger through the camera it started with: the framing may move to
+        // the touch phase's camera meanwhile.
+        let cam = self.drag.as_ref().filter(|_| kind != Touch::Down).map_or(self.camera, |d| d.cam);
+        let world = self.screen_to_world_with(cam, x, y);
         match kind {
             Touch::Down => {
                 if !self.is_idle() {
@@ -404,6 +501,7 @@ impl Lobby {
                             _ => origin,
                         };
                         self.drag = Some(ActiveDrag {
+                            cam: self.camera,
                             drag: i,
                             bone,
                             phase: DragPhase::Pressing,
@@ -462,6 +560,7 @@ impl Lobby {
         if d.phase == DragPhase::Pressing && d.elapsed >= drag.delay {
             d.phase = DragPhase::Dragging;
             self.play_pair(&drag.ing_m, &drag.ing_a, true);
+            self.activity = Some(bal2d_pack::phase::TOUCH);
         }
         let main = self.main();
         let target = match d.phase {
@@ -497,6 +596,7 @@ impl Lobby {
     pub fn update(&mut self, dt: f32) {
         self.time += dt;
         self.update_drag(dt);
+        self.update_camera(dt);
         let main = self.main();
         let drag = self.drag.as_ref().map(|d| (d.bone, d.pos));
         for (i, l) in self.layers.iter_mut().enumerate() {
@@ -531,6 +631,10 @@ impl Lobby {
     /// Whether the baked image stands in for its slots now: always, or once the intro is over
     /// and the idle loop plays unmixed.
     pub fn bake_active(&self) -> bool {
+        // The image is composited through the idle framing.
+        if self.camera != self.cameras[bal2d_pack::phase::IDLE as usize] {
+            return false;
+        }
         match &self.bake {
             None => false,
             Some(b) if !b.after_intro => true,

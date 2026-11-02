@@ -33,6 +33,8 @@ pub const KIND_INTERACTIONS: u32 = 4;
 pub const KIND_NAME: u32 = 5;
 pub const KIND_BAKE: u32 = 6;
 pub const KIND_BAKE_SLOTS: u32 = 7;
+/// Framing per lobby phase ([`PhaseCameras`]); without it every phase uses the header's camera.
+pub const KIND_CAMERAS: u32 = 8;
 
 /// Page pixel formats (what the GPU samples directly).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -515,6 +517,54 @@ impl BakeSlots {
         }
         let slots = (0..n).map(|i| (le16(d, 5 + i * 4), le16(d, 7 + i * 4))).collect();
         Some(BakeSlots { after_intro: d[0] != 0, slots })
+    }
+}
+
+/// The lobby phases a pack may frame differently (`PhaseCameras`).
+pub mod phase {
+    /// The idle loop (and anything without its own framing): the header's camera.
+    pub const IDLE: u8 = 0;
+    pub const INTRO: u8 = 1;
+    pub const TALK: u8 = 2;
+    /// A drag interaction (head pat and the like), from the drag starting to the spring-back.
+    pub const TOUCH: u8 = 3;
+    pub const COUNT: usize = 4;
+}
+
+/// Per-phase framing: (phase, centre x, centre y, scale), skeleton units like the header's
+/// camera. Phases not listed use the header's camera.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PhaseCameras {
+    pub cameras: Vec<(u8, f32, f32, f32)>,
+}
+
+impl PhaseCameras {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(1 + self.cameras.len() * 13);
+        v.push(self.cameras.len() as u8);
+        for (p, x, y, s) in &self.cameras {
+            v.push(*p);
+            v.extend_from_slice(&x.to_le_bytes());
+            v.extend_from_slice(&y.to_le_bytes());
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v
+    }
+
+    pub fn decode(d: &[u8]) -> Option<PhaseCameras> {
+        let n = *d.first()? as usize;
+        if d.len() != 1 + n * 13 {
+            return None;
+        }
+        let f = |at: usize| f32::from_bits(le32(d, at));
+        let cameras = (0..n)
+            .map(|i| {
+                let o = 1 + i * 13;
+                (d[o], f(o + 1), f(o + 5), f(o + 9))
+            })
+            .filter(|c| c.3.is_finite() && c.3 > 0.0 && c.1.is_finite() && c.2.is_finite())
+            .collect();
+        Some(PhaseCameras { cameras })
     }
 }
 
