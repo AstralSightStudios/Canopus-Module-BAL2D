@@ -192,8 +192,9 @@ pub struct BuildRequest {
     pub high_quality: bool,
 }
 
-/// Compiles the pack and renders a frame after the intro.
-pub fn build(req: &BuildRequest) -> Result<Built, String> {
+/// Compiles the pack and renders a frame after the intro; `progress` gets what it is doing and
+/// the fraction done.
+pub fn build(req: &BuildRequest, progress: &mut dyn FnMut(&str, f32)) -> Result<Built, String> {
     let layers = layers(&req.assets)?;
     let format = PageFormat::Argb8565;
     let name = if req.name.trim().is_empty() { layers.last().map(|l| l.name.clone()).unwrap_or_default() } else { req.name.trim().to_string() };
@@ -208,7 +209,18 @@ pub fn build(req: &BuildRequest) -> Result<Built, String> {
     };
     let inter = interactions(&req.assets, &layers);
     let original: usize = layers.iter().map(|l| l.skel.len() + l.pages.iter().map(|p| p.1.len()).sum::<usize>()).sum();
-    let (bytes, report) = bal2d_compiler::compile(&layers, &opts, inter).map_err(|e| format!("编译失败：{e}"))?;
+    let (bytes, report) = bal2d_compiler::compile_progress(&layers, &opts, inter, &mut |stage, f| {
+        let label = match stage {
+            bal2d_compiler::Stage::Reading => "读取骨骼与图集".to_string(),
+            bal2d_compiler::Stage::Analysing => "分析动画".to_string(),
+            bal2d_compiler::Stage::Textures { page, pages } => format!("提取贴图（第 {page}/{pages} 张）"),
+            bal2d_compiler::Stage::Baking => "合成静态背景".to_string(),
+            bal2d_compiler::Stage::Writing => "写入角色包".to_string(),
+        };
+        progress(&label, f * 0.95);
+    })
+    .map_err(|e| format!("编译失败：{e}"))?;
+    progress("生成预览", 0.96);
     let mut preview = bal2d_preview::PackPreview::load(&bytes).map_err(|e| format!("预览失败：{e:?}"))?;
     preview.advance(7.0);
     let rgba = preview.render();
@@ -290,7 +302,7 @@ mod tests {
             recognise(&name, data, &mut assets);
         }
         let t0 = std::time::Instant::now();
-        let built = build(&BuildRequest { assets, name: String::new(), screen: (336, 480), zoom: 100, high_quality: false }).unwrap();
+        let built = build(&BuildRequest { assets, name: String::new(), screen: (336, 480), zoom: 100, high_quality: false }, &mut |_, _| {}).unwrap();
         eprintln!("built in {:?}: {}", t0.elapsed(), built.summary);
         assert!(built.bytes.starts_with(b"BL2D"));
         assert!(built.preview.starts_with("data:image/png;base64,"));

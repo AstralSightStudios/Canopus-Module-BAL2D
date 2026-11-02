@@ -229,13 +229,26 @@ async fn build() {
         state::set_status("请先连接手表：角色包要按手表的屏幕编译。", true);
         return;
     };
-    state::with_state(|s| s.busy = true);
-    state::set_status("正在编译角色包（可能需要几十秒）…", false);
+    state::with_state(|s| {
+        s.busy = true;
+        s.progress = Some(("准备".into(), 0));
+    });
+    state::set_status("", false);
     rerender();
     let req = assets::BuildRequest { assets: s.assets.clone(), name: s.name.clone(), screen: size, zoom: s.zoom, high_quality: s.high_quality };
-    let result = assets::build(&req);
+    // Each step is shown as it starts (the compile runs in this call; the UI is redrawn from here).
+    let mut shown = (String::new(), u32::MAX);
+    let result = assets::build(&req, &mut |label, f| {
+        let percent = (f * 100.0) as u32;
+        if label != shown.0 || percent != shown.1 {
+            shown = (label.to_string(), percent);
+            state::with_state(|s| s.progress = Some((label.to_string(), percent)));
+            rerender();
+        }
+    });
     state::with_state(|st| {
         st.busy = false;
+        st.progress = None;
         match result {
             Ok(b) => {
                 st.built = Some(b);
@@ -462,6 +475,11 @@ fn import_tab(s: &UiState) -> View {
                 )),
         )
         .child(row().child(button(if s.busy { "正在编译…" } else { "编译并预览" }, EV_BUILD, "solid").disabled_if(!can_build)))
+        .maybe(s.progress.as_ref().map(|(label, percent)| {
+            stack(6)
+                .child(text(&format!("{label} · {percent}%"), 13, tone::MUTED))
+                .child(View::new(Kind::Progress, None).prop("value", &percent.to_string()).prop("max", "100").prop("size", "2"))
+        }))
         .maybe(s.hello.is_none().then(|| text("连接手表后才能编译：角色包按手表的屏幕尺寸生成。", 12, tone::MUTED)));
     let mut out = stack(16).child(assets_card).child(settings);
     if let Some(b) = &s.built {

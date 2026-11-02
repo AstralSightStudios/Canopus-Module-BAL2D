@@ -98,6 +98,8 @@ pub struct UiState {
     pub high_quality: bool,
     pub built: Option<Built>,
     pub busy: bool,
+    /// While compiling: what it is doing and the percent done.
+    pub progress: Option<(String, u32)>,
     pub transfer: Option<Transfer>,
     pub status: String,
     pub error: bool,

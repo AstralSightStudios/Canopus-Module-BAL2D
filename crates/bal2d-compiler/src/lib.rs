@@ -48,6 +48,35 @@ pub struct LayerInput {
     pub pages: Vec<(String, std::sync::Arc<[u8]>)>,
 }
 
+/// What a compile is doing ([`compile_progress`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Reading the skeletons and atlases.
+    Reading,
+    /// Playing the animations to find what shows and how large.
+    Analysing,
+    /// Cutting the regions out of PNG page `page` (1-based) of `pages`.
+    Textures { page: usize, pages: usize },
+    /// Compositing the static background.
+    Baking,
+    /// Encoding and writing the pack.
+    Writing,
+}
+
+/// Progress reports with the overall fraction (0..=1) done.
+struct Progress<'a> {
+    report: &'a mut dyn FnMut(Stage, f32),
+    lo: f32,
+    hi: f32,
+}
+
+impl Progress<'_> {
+    /// `at` (0..=1) of the current compile pass.
+    fn at(&mut self, stage: Stage, at: f32) {
+        (self.report)(stage, self.lo + (self.hi - self.lo) * at.clamp(0.0, 1.0));
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub width: u32,
@@ -159,10 +188,13 @@ const WORK_MAX_PAGE: u32 = 16384;
 /// culled first. The source pages are never decoded whole (the AstroBox plugin has 128 MiB, a
 /// 4096 page alone is 64 MiB). Returns each layer's source texel count and source atlas (for
 /// [`source_atlases`]).
-fn work_atlases(layers: &mut [Layer], inputs: &[LayerInput], cam: Camera, opts: &Options) -> Result<(Vec<u64>, Vec<Atlas>), String> {
+fn work_atlases(layers: &mut [Layer], inputs: &[LayerInput], cam: Camera, opts: &Options, progress: &mut Progress) -> Result<(Vec<u64>, Vec<Atlas>), String> {
     let mut texels = Vec::with_capacity(layers.len());
     let mut sources = Vec::with_capacity(layers.len());
-    for (layer, input) in layers.iter_mut().zip(inputs) {
+    let n = layers.len() as f32;
+    for (li, (layer, input)) in layers.iter_mut().zip(inputs).enumerate() {
+        let (lo, span) = (0.05 + 0.4 * li as f32 / n, 0.4 / n);
+        progress.at(Stage::Analysing, lo);
         texels.push(layer.atlas.regions.iter().map(|r| r.width as u64 * r.height as u64).sum());
         let (seen, _) = simulate(layer, cam, opts);
         cull(&mut layer.data, &seen);
@@ -183,7 +215,9 @@ fn work_atlases(layers: &mut [Layer], inputs: &[LayerInput], cam: Camera, opts: 
             .zip(&scales)
             .map(|(&(region, _, crop), &scale)| pack_atlas::Item { region, scale, rotated: layer.atlas.regions[region].degrees != 0, crop })
             .collect();
-        let images = extract_items(&layer.atlas, input, &items)?;
+        let images = extract_items(&layer.atlas, input, &items, &mut |page, pages| {
+            progress.at(Stage::Textures { page, pages }, lo + span * (0.3 + 0.7 * (page - 1) as f32 / pages.max(1) as f32))
+        })?;
         let packed = pack_atlas::build_images(&layer.atlas, &items, images, WORK_MAX_PAGE)?;
         let atlas = Atlas::parse(&packed.atlas_text);
         // Culled attachments stay in the list (unbound now; never written): only the live ones
@@ -220,9 +254,10 @@ fn source_atlases(layers: &mut [Layer], sources: Vec<Atlas>) {
 
 /// The items' images cut out of the layer's PNG pages row by row ([`stream::extract`]),
 /// premultiplied, at [`pack_atlas::item_size`].
-fn extract_items(atlas: &Atlas, input: &LayerInput, items: &[pack_atlas::Item]) -> Result<Vec<Rgba>, String> {
+fn extract_items(atlas: &Atlas, input: &LayerInput, items: &[pack_atlas::Item], page_done: &mut dyn FnMut(usize, usize)) -> Result<Vec<Rgba>, String> {
     let mut images: Vec<Option<Rgba>> = (0..items.len()).map(|_| None).collect();
     for (pi, page) in atlas.pages.iter().enumerate() {
+        page_done(pi + 1, atlas.pages.len());
         let on_page: Vec<usize> = (0..items.len()).filter(|&i| atlas.regions[items[i].region].page as usize == pi).collect();
         if on_page.is_empty() {
             continue;
@@ -562,14 +597,27 @@ fn cull(d: &mut SkeletonData, seen: &[Seen]) -> usize {
 /// Compiles the layers into a pack. With several skeletons, the ones that never show (see
 /// `hidden`) are found on a first compile without a baked background, and left out.
 pub fn compile(inputs: &[LayerInput], opts: &Options, interactions: Option<Interactions>) -> Result<(Vec<u8>, Report), String> {
+    compile_progress(inputs, opts, interactions, &mut |_, _| {})
+}
+
+/// [`compile`], reporting its stages and the fraction done as it goes.
+pub fn compile_progress(
+    inputs: &[LayerInput],
+    opts: &Options,
+    interactions: Option<Interactions>,
+    report: &mut dyn FnMut(Stage, f32),
+) -> Result<(Vec<u8>, Report), String> {
     if inputs.len() < 2 || std::env::var("BAL2D_KEEP_LAYERS").is_ok() {
-        return compile_once(inputs, opts, interactions);
+        return compile_once(inputs, opts, interactions, &mut Progress { report, lo: 0.0, hi: 1.0 });
     }
+    // A probe compile finds the layers that never show; the final one leaves them out.
     let probe = Options { bake: false, ..opts.clone() };
-    let (pack, _) = compile_once(inputs, &probe, interactions.clone())?;
+    let (pack, _) = compile_once(inputs, &probe, interactions.clone(), &mut Progress { report: &mut *report, lo: 0.0, hi: 0.45 })?;
+    report(Stage::Analysing, 0.47);
     let hidden = hidden::hidden_layers(&pack)?;
+    let mut tail = Progress { report, lo: 0.5, hi: 1.0 };
     if hidden.is_empty() {
-        return compile_once(inputs, opts, interactions);
+        return compile_once(inputs, opts, interactions, &mut tail);
     }
     let kept: Vec<LayerInput> = inputs.iter().enumerate().filter(|(i, _)| !hidden.contains(i)).map(|(_, l)| l.clone()).collect();
     // The interactive layer's index shifts down past the dropped ones below it.
@@ -578,12 +626,13 @@ pub fn compile(inputs: &[LayerInput], opts: &Options, interactions: Option<Inter
         i.layer -= below as u8;
         i
     });
-    let (pack, mut report) = compile_once(&kept, opts, interactions)?;
+    let (pack, mut report) = compile_once(&kept, opts, interactions, &mut tail)?;
     report.hidden_layers = hidden.iter().map(|&i| inputs[i].name.clone()).collect();
     Ok((pack, report))
 }
 
-fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Interactions>) -> Result<(Vec<u8>, Report), String> {
+fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Interactions>, progress: &mut Progress) -> Result<(Vec<u8>, Report), String> {
+    progress.at(Stage::Reading, 0.0);
     if inputs.is_empty() {
         return Err("no skeletons".into());
     }
@@ -599,7 +648,8 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
         .map(|(li, l)| if no_prune { 0 } else { prune::played_only(&mut l.data, li == main, &inter) })
         .collect();
     let drag_bones: Vec<&str> = inter.drags.iter().map(|d| d.bone.as_str()).collect();
-    let (source_texels, sources) = work_atlases(&mut layers, inputs, cam, opts)?;
+    let (source_texels, sources) = work_atlases(&mut layers, inputs, cam, opts, progress)?;
+    progress.at(Stage::Baking, 0.45);
     let baked = if opts.bake { bake::bake(&mut layers, main, &inter, cam, opts) } else { None };
     if let Some(b) = &baked {
         let h = b.header;
@@ -608,6 +658,7 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
     source_atlases(&mut layers, sources);
 
     // Observe, cull, and gather per-region scale requirements.
+    progress.at(Stage::Analysing, 0.55);
     struct RegionNeed {
         layer: usize,
         region: usize,
@@ -687,7 +738,10 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
             let r = &layer.atlas.regions[n.region];
             items.push(pack_atlas::Item { region: n.region, scale: *s, rotated: r.degrees != 0, crop: n.crop });
         }
-        let images = extract_items(&layer.atlas, &inputs[li], &items)?;
+        let (lo, span) = (0.65 + 0.3 * li as f32 / layers.len() as f32, 0.3 / layers.len() as f32);
+        let images = extract_items(&layer.atlas, &inputs[li], &items, &mut |page, pages| {
+            progress.at(Stage::Textures { page, pages }, lo + span * (page - 1) as f32 / pages.max(1) as f32)
+        })?;
         let packed = pack_atlas::build_images(&layer.atlas, &items, images, opts.max_page)?;
         let skel = writer::write_skeleton(&layer.data, 1.0);
         // Verify the re-encoded skeleton binds to the new atlas before shipping it.
@@ -726,6 +780,7 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
         layer_count: layers.len() as u8,
         page_format: opts.format,
     };
+    progress.at(Stage::Writing, 0.97);
     let bytes = bal2d_pack::write(&header, &sections, 9);
     report.pack_bytes = bytes.len();
     Ok((bytes, report))
