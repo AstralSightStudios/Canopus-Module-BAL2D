@@ -367,10 +367,10 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
         gpu::MIRROR_NC.store(true, Ordering::Relaxed);
         out.flags |= flag::MIRROR;
     }
-    // Region blits are an optimization: without a clean pass they stay off (paths draw them).
-    if passed & (probe::BLIT_REGION | probe::OUTSIDE) == probe::BLIT_REGION | probe::OUTSIDE && passed & probe::LARGE != 0 {
-        renderer.paths.blits = true;
-    }
+    // Region blits stay off: in the timing model they saved nothing (a blit costs the driver
+    // what a path does), and the first real watch reported its draw results off. The probe still
+    // runs and reports.
+    let _ = &renderer.paths.blits;
     let s16_ok = passed & probe::S16 != 0 || (passed & probe::MIRROR_SMALL != 0);
     if !s16_ok && passed & probe::FP32 != 0 {
         renderer.use_fp32_paths();

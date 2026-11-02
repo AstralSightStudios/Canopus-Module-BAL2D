@@ -230,6 +230,7 @@ pub fn stats() -> bal2d_proto::Stats {
             | (r.boot_error.unsigned_abs().min(255)) << 8
             | r.selftest.map(|t| t.flags).unwrap_or(0),
         ui_ms: r.refresh_ms,
+        selftest: r.selftest.map_or(0, |t| t.passed),
     }
 }
 
@@ -455,7 +456,12 @@ fn load_step() -> Option<i32> {
     };
     let Some(lobby) = l.lobby.as_ref() else {
         match Lobby::load_from(&mut l.src) {
-            Ok((lobby, pages)) => {
+            Ok((mut lobby, pages)) => {
+                // The background image is drawn with a blit: without a working one (self-test),
+                // the baked slots are drawn as they are.
+                if r.selftest.is_some_and(|t| t.flags & selftest::flag::RAN != 0 && t.passed & selftest::probe::BLIT == 0) {
+                    lobby.bake = None;
+                }
                 trace(&alloc::format!("parsed in {} ms; {} pages; heap: free {} KB, largest {} KB", lv::now_ms().wrapping_sub(l.t0), pages.len(), heap_free_kb(), largest_block_kb()));
                 l.per_layer = (0..lobby.layers.len()).map(|_| Vec::new()).collect();
                 l.lobby = Some(lobby);
@@ -868,6 +874,9 @@ extern "C" fn frame(timer: *mut c_void) {
     }
     let t2 = lv::now_ms();
     r.renderer.finish();
+    // Whatever reads the frame with the CPU (LVGL's software path) must not see cached lines of
+    // an earlier one: the GPU writes memory behind the cache.
+    fw::cache_flush_invalidate(target.pixels, target.buffer.stride as usize * target.buffer.height as usize);
     let t3 = lv::now_ms();
     r.frame_start = now;
     r.frame_end = t3;

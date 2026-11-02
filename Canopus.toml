@@ -19,6 +19,8 @@ allowed_constants = [
   # disp_def (default display).
   "0x0c187bb1", "0x0c1877e9", "0x0c187ab1", "0x0c187a59", "0x0c187f01", "0x0c1876f9", "0x0c187a49",
   "0x0c187d21",
+  # p67 hal_cache sync-and-invalidate (flash veneer of RAM 0x0029D36C).
+  "0x0c588449",
   "0x2cdbdc40", "0x2010318c",
   # mm_mallinfo and the user heap pointer (the module checks free memory: malloc asserts on failure).
   "0x0c1f8029", "0x200f4c28",

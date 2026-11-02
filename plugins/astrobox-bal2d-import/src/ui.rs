@@ -803,7 +803,7 @@ fn watch_tab(s: &UiState) -> View {
             st.calls,
             if st.flags & 1 != 0 { " · 背景已烘焙" } else { "" },
             st.heap_free_kib as f64 / 1024.0,
-            selftest_note(st.flags)
+            selftest_note(st.flags, st.selftest)
         ),
         Some(st) if st.flags & 2 == 0 => "当前没有显示：表盘没有角色图层且未开启全屏显示。".into(),
         Some(_) => "角色暂停中（熄屏或不在表盘上）。".into(),
@@ -892,7 +892,40 @@ fn face_tab(s: &UiState) -> View {
 }
 
 /// What the watch's GPU self-test changed (Stats flags bits 16..23), for the performance card.
-fn selftest_note(flags: u32) -> String {
+/// The GPU self-test probes (module selftest.rs `probe`), bit by bit.
+const PROBES: [&str; 17] = [
+    "FP32 路径",
+    "S16 路径",
+    "大贴图",
+    "ARGB4444 贴图",
+    "ARGB8565 贴图",
+    "索引色贴图",
+    "PAD 边缘",
+    "调色",
+    "叠加混合",
+    "正片叠底",
+    "滤色混合",
+    "半透明",
+    "整页贴图",
+    "小贴图直写",
+    "大贴图直写",
+    "越界检查",
+    "区域贴图",
+];
+
+fn selftest_note(flags: u32, passed: u32) -> String {
+    let base = selftest_flags_note(flags);
+    if passed == 0 || flags & (0x7F << 17) == 0 {
+        return base;
+    }
+    let failed: Vec<&str> = PROBES.iter().enumerate().filter(|(i, _)| passed & (1 << i) == 0).map(|(_, n)| *n).collect();
+    if failed.is_empty() {
+        return base;
+    }
+    format!("{base}（未通过：{}；0x{passed:05x}）", failed.join("、"))
+}
+
+fn selftest_flags_note(flags: u32) -> String {
     if flags & (1 << 16) == 0 {
         return String::new();
     }

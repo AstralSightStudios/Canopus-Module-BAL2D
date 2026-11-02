@@ -130,10 +130,13 @@ pub struct Stats {
     /// Average milliseconds LVGL takes to redraw the screen after a frame (the watch's own
     /// share of every frame). Optional on the wire (0 from older modules).
     pub ui_ms: u32,
+    /// The GPU self-test's probes that passed (bit per probe, see the module's selftest.rs; 0
+    /// from older modules or before it ran).
+    pub selftest: u32,
 }
 
 impl Stats {
-    const WORDS: usize = 13;
+    const WORDS: usize = 14;
     /// Words every reply has (`ui_ms` came later).
     const REQUIRED: usize = 12;
 
@@ -152,6 +155,7 @@ impl Stats {
             self.pack,
             self.flags,
             self.ui_ms,
+            self.selftest,
         ]
     }
 
@@ -170,6 +174,7 @@ impl Stats {
             pack: w[10],
             flags: w[11],
             ui_ms: w[12],
+            selftest: w[13],
         }
     }
 }

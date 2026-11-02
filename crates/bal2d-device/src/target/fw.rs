@@ -19,6 +19,7 @@ mod addr {
     pub const VG_SET_SCISSOR: usize = 0x0C18_76F9;
     pub const VG_ENABLE_SCISSOR: usize = 0x0C18_7A49;
     pub const VG_SET_CLUT: usize = 0x0C18_7D21;
+    pub const CACHE_FLUSH_INVALIDATE: usize = 0x0C58_8449;
     pub const WFIMG_CLASS: usize = 0x2CDB_DC40;
     /// `disp_def` (the literal in `lv_display_get_layer_top`: 0x20103174 + 0x18).
     pub const DISPLAY_DEFAULT: usize = 0x2010_318C;
@@ -97,6 +98,15 @@ pub fn vg_set_clut(count: u32, colors: *const u32) -> i32 {
 }
 
 /// Makes CPU writes to `[addr, addr + len)` visible to the GPU.
+/// Writes back and invalidates the PSRAM data cache over [addr, addr + len): later CPU reads
+/// fetch what the GPU wrote (above 32 KB the firmware does the whole cache). Flash veneer of the
+/// firmware's `hal_cache` sync-and-invalidate (RAM 0x0029D36C), next to `cache_clean`'s.
+pub fn cache_flush_invalidate(addr: *const u8, len: usize) {
+    unsafe { core::arch::asm!("dsb sy") };
+    call!(CACHE_FLUSH_INVALIDATE, fn(u32, *const u8, u32) -> i32, 1, addr, len as u32);
+    unsafe { core::arch::asm!("dsb sy", "isb sy") };
+}
+
 pub fn cache_clean(addr: *const u8, len: usize) {
     unsafe { core::arch::asm!("dsb sy") };
     call!(fwgen::CANOPUS_FW_P67_BLUR_CACHE_CLEAN_CALLABLE, fn(u32, *const u8, u32) -> i32, 1, addr, len as u32);
