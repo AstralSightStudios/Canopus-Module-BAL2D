@@ -21,7 +21,6 @@ fn main() {
         let mut list = bal2d_render::DrawList::default();
         let mut paths = bal2d_render::Paths::new();
         paths.blits = true;
-        paths.refits = std::env::var("REFITS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         paths.tolerance = std::env::var("TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.75);
         let (mut tu, mut tb, mut tp) = (0f64, 0f64, 0f64);
         let (mut calls, mut words) = (0usize, 0usize);

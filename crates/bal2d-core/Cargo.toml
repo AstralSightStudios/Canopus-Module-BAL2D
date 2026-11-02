@@ -10,3 +10,6 @@ rust-version.workspace = true
 bal2d-spine = { path = "../bal2d-spine", default-features = false }
 bal2d-render = { path = "../bal2d-render" }
 bal2d-pack = { path = "../bal2d-pack" }
+
+[dev-dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

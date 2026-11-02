@@ -26,6 +26,7 @@ dependencies = [
  "bal2d-pack",
  "bal2d-render",
  "bal2d-spine",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]

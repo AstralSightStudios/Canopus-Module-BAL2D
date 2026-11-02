@@ -140,7 +140,7 @@ pub fn draw_as_gpu(fb: &mut Framebuffer, list: &DrawList, pages: &[Texture], cam
             }
             tris.push(tri);
         }
-        bal2d_render::cluster_refit(&tris, tol, bal2d_render::REFITS, &mut order, &mut clusters);
+        bal2d_render::cluster(&tris, tol, &mut order, &mut clusters);
         for c in &clusters {
             let m = c.m;
             let det = m[0] * m[4] - m[1] * m[3];
@@ -156,11 +156,40 @@ pub fn draw_as_gpu(fb: &mut Framebuffer, list: &DrawList, pages: &[Texture], cam
             for &ti in &order[c.start as usize..(c.start + c.count) as usize] {
                 let t = &tris[ti as usize];
                 stats.triangles += 1;
-                stats.pixels += raster_triangle(fb, &t.s, &[[0.0; 2]; 3], Some(&to_uv), tex, &tint, b);
+                stats.pixels += raster_triangle(fb, &t.s, &[[0.0; 2]; 3], Some(&to_uv), tex, &tint, b.blend);
             }
         }
     }
     stats
+}
+
+/// Draws one GPU call (a path of triangles in target path units, filled with its page through
+/// the call's texel -> target affine), as the watch does.
+pub fn draw_call(fb: &mut Framebuffer, call: &bal2d_render::Call, tex: &Texture) -> usize {
+    let m = call.matrix;
+    let det = m[0] * m[4] - m[1] * m[3];
+    if det.abs() < 1e-12 {
+        return 0;
+    }
+    let (pw, ph) = (tex.width as f32, tex.height as f32);
+    let inv = [m[4] / det / pw, -m[1] / det / pw, -m[3] / det / ph, m[0] / det / ph];
+    let to_uv = |x: f32, y: f32| {
+        let (dx, dy) = (x - m[2], y - m[5]);
+        [inv[0] * dx + inv[1] * dy, inv[2] * dx + inv[3] * dy]
+    };
+    let [r, g, bl, a] = call.color;
+    let alpha = if call.blend == BlendMode::Additive { 0.0 } else { a };
+    let tint = Tint { light: [r * a, g * a, bl * a, alpha], dark: None };
+    let k = 1.0 / bal2d_render::PATH_SCALE;
+    let mut n = 0;
+    for t in call.path.chunks_exact(10) {
+        if t[0] != bal2d_render::PATH_MOVE as i16 {
+            break;
+        }
+        let p = [[t[1] as f32 * k, t[2] as f32 * k], [t[4] as f32 * k, t[5] as f32 * k], [t[7] as f32 * k, t[8] as f32 * k]];
+        n += raster_triangle(fb, &p, &[[0.0; 2]; 3], Some(&to_uv), tex, &tint, call.blend);
+    }
+    n
 }
 
 fn draw_exact(fb: &mut Framebuffer, list: &DrawList, pages: &[Texture], cam: Camera) -> Stats {
@@ -181,7 +210,7 @@ fn draw_exact(fb: &mut Framebuffer, list: &DrawList, pages: &[Texture], cam: Cam
                 uv[k] = [list.uvs[vi * 2], list.uvs[vi * 2 + 1]];
             }
             stats.triangles += 1;
-            stats.pixels += raster_triangle(fb, &sp, &uv, None, tex, &tint, b);
+            stats.pixels += raster_triangle(fb, &sp, &uv, None, tex, &tint, b.blend);
         }
     }
     stats
@@ -210,7 +239,7 @@ fn is_top_left(a: [f32; 2], b: [f32; 2], ccw: bool) -> bool {
 }
 
 /// `to_uv`: texture coordinates from the pixel center instead of interpolating `uv`.
-fn raster_triangle(fb: &mut Framebuffer, p: &[[f32; 2]; 3], uv: &[[f32; 2]; 3], to_uv: Option<&dyn Fn(f32, f32) -> [f32; 2]>, tex: &Texture, tint: &Tint, b: &Batch) -> usize {
+fn raster_triangle(fb: &mut Framebuffer, p: &[[f32; 2]; 3], uv: &[[f32; 2]; 3], to_uv: Option<&dyn Fn(f32, f32) -> [f32; 2]>, tex: &Texture, tint: &Tint, blend: BlendMode) -> usize {
     let area = edge(p[0], p[1], p[2]);
     if area.abs() < 1e-9 {
         return 0;
@@ -260,7 +289,7 @@ fn raster_triangle(fb: &mut Framebuffer, p: &[[f32; 2]; 3], uv: &[[f32; 2]; 3], 
                 }
             };
             let d = &mut fb.pixels[y as usize * fb.width + x as usize];
-            match b.blend {
+            match blend {
                 BlendMode::Normal | BlendMode::Additive => {
                     for k in 0..4 {
                         d[k] = src[k] + d[k] * (1.0 - src[3]);

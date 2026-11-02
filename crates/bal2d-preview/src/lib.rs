@@ -18,6 +18,8 @@ pub struct PackPreview {
     /// Draw like the watch's GPU with this clustering tolerance (`raster::draw_as_gpu`); `None`:
     /// exact texture mapping.
     pub gpu_tolerance: Option<f32>,
+    /// Draw from the baked idle when the lobby is in it, as the watch does.
+    pub use_idle: bool,
 }
 
 /// Decodes a BAKE section into framebuffer pixels.
@@ -68,7 +70,7 @@ impl PackPreview {
         };
         lobby.start();
         let gpu_tolerance = Some(bal2d_render::Paths::new().tolerance);
-        Ok(PackPreview { lobby, pages: per_layer, list: DrawList::default(), bake, gpu_tolerance })
+        Ok(PackPreview { lobby, pages: per_layer, list: DrawList::default(), bake, gpu_tolerance, use_idle: true })
     }
 
     /// Layer `layer`'s decoded pages.
@@ -94,6 +96,18 @@ impl PackPreview {
         self.lobby.touch(kind, x, y);
     }
 
+    /// Layer `layer`'s baked idle calls now, each with its page.
+    pub fn idle_calls(&mut self, layer: usize, mut f: impl FnMut(&bal2d_render::Call, &Texture)) {
+        let (w, h) = self.size();
+        let pages = &self.pages[layer];
+        let size = |p: u32| pages.get(p as usize).map(|t| (t.width as f32, t.height as f32));
+        self.lobby.draw_idle(layer, (0.0, 0.0), (w as f32, h as f32), &size, &mut |call| {
+            if let Some(t) = pages.get(call.page as usize) {
+                f(call, t);
+            }
+        });
+    }
+
     /// The current pose, opaque RGBA8 over black.
     pub fn render(&mut self) -> Vec<u8> {
         self.render_layers(u32::MAX)
@@ -108,8 +122,19 @@ impl PackPreview {
         }
         let c = self.lobby.camera;
         let cam = Camera { cx: c.cx, cy: c.cy, scale: c.scale };
+        let baked = self.use_idle && self.lobby.idle_ready();
         for li in 0..self.lobby.layers.len() {
             if mask & (1 << li) == 0 {
+                continue;
+            }
+            if baked {
+                let pages = &self.pages[li];
+                let size = |p: u32| pages.get(p as usize).map(|t| (t.width as f32, t.height as f32));
+                self.lobby.draw_idle(li, (0.0, 0.0), (w as f32, h as f32), &size, &mut |call| {
+                    if let Some(t) = pages.get(call.page as usize) {
+                        raster::draw_call(&mut fb, call, t);
+                    }
+                });
                 continue;
             }
             self.lobby.draw_list(li, &mut self.list);

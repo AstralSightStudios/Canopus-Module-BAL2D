@@ -15,7 +15,9 @@
 pub mod image;
 mod bake;
 mod hidden;
+pub mod idle;
 mod prune;
+mod simplify;
 mod trim;
 pub mod interactions;
 pub mod raster;
@@ -59,6 +61,8 @@ pub enum Stage {
     Textures { page: usize, pages: usize },
     /// Compositing the static background.
     Baking,
+    /// Playing the idle loops into ready GPU calls.
+    Idle,
     /// Encoding and writing the pack.
     Writing,
 }
@@ -104,6 +108,14 @@ pub struct Options {
     /// Keep every layer: no probe compile to find layers that never show (faster; for
     /// overviews of the whole scene).
     pub keep_layers: bool,
+    /// Mesh simplification tolerance in target pixels (0: off): interior vertices go while no
+    /// point of the mesh moves further than this in any simulated frame (see `simplify`).
+    pub simplify: f32,
+    /// Bake the idle loops into GPU calls (see `idle`).
+    pub idle: bool,
+    /// Pack size the idle bake may grow the pack to (it is baked less often a second if the
+    /// pack would be larger; packs go to the watch at some 40-60 KB/s).
+    pub max_pack_bytes: usize,
 }
 
 impl Default for Options {
@@ -124,6 +136,9 @@ impl Default for Options {
             name: String::new(),
             bake: true,
             keep_layers: false,
+            simplify: 0.5,
+            idle: true,
+            max_pack_bytes: 2_000_000,
         }
     }
 }
@@ -137,6 +152,9 @@ pub struct LayerReport {
     /// Mesh triangles never on screen, and the vertices only they used, removed.
     pub triangles_trimmed: usize,
     pub vertices_trimmed: usize,
+    /// Removed by mesh simplification.
+    pub triangles_simplified: usize,
+    pub vertices_simplified: usize,
     pub attachments: usize,
     pub kept: usize,
     pub regions_before: usize,
@@ -158,6 +176,8 @@ pub struct Report {
     pub baked: Option<(usize, usize, [u16; 4], bool)>,
     /// Skeletons left out because they never show (always behind another layer).
     pub hidden_layers: Vec<String>,
+    /// The baked idle (see `idle`).
+    pub idle: idle::IdleReport,
 }
 
 struct Layer {
@@ -204,7 +224,7 @@ fn work_atlases(layers: &mut [Layer], inputs: &[LayerInput], cam: Camera, opts: 
         let (lo, span) = (0.05 + 0.4 * li as f32 / n, 0.4 / n);
         progress.at(Stage::Analysing, lo);
         texels.push(layer.atlas.regions.iter().map(|r| r.width as u64 * r.height as u64).sum());
-        let (seen, _) = simulate(layer, cam, opts);
+        let (seen, _) = simulate(layer, cam, opts, &mut None);
         cull(&mut layer.data, &seen);
         let needs = region_needs(layer, &seen);
         let mut scales: Vec<f32> = needs.iter().map(|n| (n.1 * opts.quality).clamp(1.0 / 64.0, 1.0)).collect();
@@ -428,7 +448,18 @@ fn sigma_max(j: [f32; 4]) -> f32 {
     ((s1 + disc) * 0.5).sqrt()
 }
 
-fn observe(layer: &Layer, list: &DrawList, cam: Camera, opts: &Options, seen: &mut [Seen], tri_seen: &mut trim::TriSeen, weight: f32, regions: &[Option<usize>]) {
+#[allow(clippy::too_many_arguments)]
+fn observe(
+    layer: &Layer,
+    list: &DrawList,
+    cam: Camera,
+    opts: &Options,
+    seen: &mut [Seen],
+    tri_seen: &mut trim::TriSeen,
+    weight: f32,
+    regions: &[Option<usize>],
+    samples: &mut Option<simplify::Samples>,
+) {
     let (w2, h2) = (opts.width as f32 * 0.5, opts.height as f32 * 0.5);
     let (minx, miny) = (-opts.margin, -opts.margin);
     let (maxx, maxy) = (opts.width as f32 + opts.margin, opts.height as f32 + opts.margin);
@@ -442,6 +473,10 @@ fn observe(layer: &Layer, list: &DrawList, cam: Camera, opts: &Options, seen: &m
         let mut tri_flags = match &layer.data.attachments[ai].kind {
             AttachmentKind::Mesh(m) if !tri_seen.unknown[ai] => {
                 if m.triangles.as_slice() == idx && b.vertex_count as usize == m.vertices.vertex_count() {
+                    if let Some(s) = samples.as_mut() {
+                        let v0 = b.first_vertex as usize * 2;
+                        s.offer(ai, &list.positions[v0..v0 + b.vertex_count as usize * 2]);
+                    }
                     let f = &mut tri_seen.seen[ai];
                     if f.len() != idx.len() / 3 {
                         *f = vec![false; idx.len() / 3];
@@ -521,16 +556,18 @@ fn observe(layer: &Layer, list: &DrawList, cam: Camera, opts: &Options, seen: &m
 /// Plays every animation the way the lobby uses it and records what is seen.
 /// [`simulate_one`] through every distinct framing (`cam` and the phase cameras), merged: seen
 /// under any, at the largest density, over the union of the bounds and triangles.
-fn simulate(layer: &Layer, cam: Camera, opts: &Options) -> (Vec<Seen>, trim::TriSeen) {
+/// With `samples`, the mesh vertices' world positions are recorded too (one framing: they do
+/// not depend on it).
+fn simulate(layer: &Layer, cam: Camera, opts: &Options, samples: &mut Option<simplify::Samples>) -> (Vec<Seen>, trim::TriSeen) {
     let mut cams = vec![cam];
     for (_, c) in &opts.phase_cameras {
         if !cams.contains(c) {
             cams.push(*c);
         }
     }
-    let (mut seen, mut tri) = simulate_one(layer, cams[0], opts);
+    let (mut seen, mut tri) = simulate_one(layer, cams[0], opts, samples);
     for c in &cams[1..] {
-        let (s2, t2) = simulate_one(layer, *c, opts);
+        let (s2, t2) = simulate_one(layer, *c, opts, &mut None);
         for (a, b) in seen.iter_mut().zip(s2) {
             a.visible |= b.visible;
             a.density = a.density.max(b.density);
@@ -552,7 +589,7 @@ fn simulate(layer: &Layer, cam: Camera, opts: &Options) -> (Vec<Seen>, trim::Tri
     (seen, tri)
 }
 
-fn simulate_one(layer: &Layer, cam: Camera, opts: &Options) -> (Vec<Seen>, trim::TriSeen) {
+fn simulate_one(layer: &Layer, cam: Camera, opts: &Options, samples: &mut Option<simplify::Samples>) -> (Vec<Seen>, trim::TriSeen) {
     let d = &layer.data;
     let mut seen = vec![Seen::default(); d.attachments.len()];
     let mut tri_seen = trim::TriSeen::new(d.attachments.len());
@@ -592,7 +629,7 @@ fn simulate_one(layer: &Layer, cam: Camera, opts: &Options) -> (Vec<Seen>, trim:
             sk.update_world_transform(d, Physics::Update);
             st.output.clear();
             bal2d_render::build(d, &sk, &mut list);
-            observe(layer, &list, cam, opts, &mut seen, &mut tri_seen, weight, &regions);
+            observe(layer, &list, cam, opts, &mut seen, &mut tri_seen, weight, &regions, samples);
             t += opts.step;
         }
     }
@@ -709,10 +746,28 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
     }
     let mut needs: Vec<RegionNeed> = Vec::new();
     for (li, layer) in layers.iter_mut().enumerate() {
-        let (seen, tri_seen) = simulate(layer, cam, opts);
+        // The largest scale any framing draws at: simplification tolerances are in its pixels.
+        let max_scale = opts.phase_cameras.iter().map(|(_, c)| c.scale).fold(cam.scale, f32::max);
+        let mut samples = (opts.simplify > 0.0).then(|| simplify::Samples::new(layer.data.attachments.len(), 0.02 / max_scale));
+        let (seen, tri_seen) = simulate(layer, cam, opts, &mut samples);
         let total = layer.data.attachments.len();
         let kept = cull(&mut layer.data, &seen);
-        let (tris_trimmed, verts_trimmed) = if std::env::var("BAL2D_NO_TRIM").is_ok() { (0, 0) } else { trim::trim_meshes(&mut layer.data, &tri_seen) };
+        let (tris_trimmed, verts_trimmed, maps) =
+            if std::env::var("BAL2D_NO_TRIM").is_ok() { (0, 0, Vec::new()) } else { trim::trim_meshes(&mut layer.data, &tri_seen) };
+        let (tris_simplified, verts_simplified) = match samples.as_mut() {
+            Some(s) => {
+                for (id, map) in maps.iter().enumerate() {
+                    if let Some(map) = map {
+                        s.remap(id, map);
+                    }
+                }
+                let shared = trim::shared_meshes(&layer.data);
+                let skip: Vec<bool> = shared.iter().zip(&tri_seen.unknown).map(|(a, b)| *a || *b).collect();
+                simplify::simplify_meshes(&mut layer.data, s, opts.simplify / max_scale, &skip)
+            }
+            None => (0, 0),
+        };
+        drop(samples);
         let timelines_dropped = if no_prune { 0 } else { prune::dead_timelines(&mut layer.data, if li == main { &drag_bones } else { &[] }) };
         let region_list = region_needs(layer, &seen);
         let before = source_texels[li];
@@ -727,6 +782,8 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
             timelines_dropped,
             triangles_trimmed: tris_trimmed,
             vertices_trimmed: verts_trimmed,
+            triangles_simplified: tris_simplified,
+            vertices_simplified: verts_simplified,
             ..Default::default()
         });
         for (ri, d, crop) in region_list {
@@ -831,8 +888,31 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
         layer_count: layers.len() as u8,
         page_format: opts.format,
     };
-    progress.at(Stage::Writing, 0.97);
-    let bytes = bal2d_pack::write(&header, &sections, 9);
+    if !opts.idle {
+        progress.at(Stage::Writing, 0.97);
+        let bytes = bal2d_pack::write(&header, &sections, 9);
+        report.pack_bytes = bytes.len();
+        return Ok((bytes, report));
+    }
+    progress.at(Stage::Idle, 0.9);
+    let probe = bal2d_pack::write(&header, &sections, 1);
+    let mut rate = idle::RATE;
+    let bytes = loop {
+        let (bakes, mut rep) = idle::bake(&probe, rate);
+        rep.rate = rate;
+        let mut with = sections.clone();
+        for (li, b) in bakes {
+            with.push(Section { kind: bal2d_pack::KIND_IDLE, layer: li, index: 0, data: b.encode() });
+        }
+        report.idle = rep;
+        progress.at(Stage::Writing, 0.97);
+        let bytes = bal2d_pack::write(&header, &with, 9);
+        if bytes.len() <= opts.max_pack_bytes || rate <= idle::RATE / 4.0 + 0.01 {
+            break bytes;
+        }
+        rate *= 0.5;
+        progress.at(Stage::Idle, 0.93);
+    };
     report.pack_bytes = bytes.len();
     Ok((bytes, report))
 }

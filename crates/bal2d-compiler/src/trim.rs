@@ -20,9 +20,9 @@ impl TriSeen {
     }
 }
 
-/// Trims every eligible mesh; returns (triangles, vertices) removed.
-pub fn trim_meshes(d: &mut SkeletonData, tri: &TriSeen) -> (usize, usize) {
-    // Meshes sharing geometry (linked meshes and their parents) are left alone.
+/// Attachments whose geometry other attachments share (linked meshes and their parents):
+/// trimming or simplifying one would change the other.
+pub fn shared_meshes(d: &SkeletonData) -> Vec<bool> {
     let mut shared = vec![false; d.attachments.len()];
     for (i, a) in d.attachments.iter().enumerate() {
         if let AttachmentKind::Mesh(m) = &a.kind {
@@ -32,7 +32,15 @@ pub fn trim_meshes(d: &mut SkeletonData, tri: &TriSeen) -> (usize, usize) {
             }
         }
     }
+    shared
+}
+
+/// Trims every eligible mesh; returns (triangles, vertices) removed and each trimmed mesh's
+/// old -> new vertex map (by attachment).
+pub fn trim_meshes(d: &mut SkeletonData, tri: &TriSeen) -> (usize, usize, Vec<Option<Vec<Option<u16>>>>) {
+    let shared = shared_meshes(d);
     let (mut tris_removed, mut verts_removed) = (0, 0);
+    let mut maps = vec![None; d.attachments.len()];
     for i in 0..d.attachments.len() {
         if shared[i] || tri.unknown[i] {
             continue;
@@ -43,25 +51,24 @@ pub fn trim_meshes(d: &mut SkeletonData, tri: &TriSeen) -> (usize, usize) {
         if seen.len() != n || !seen.iter().any(|s| *s) || seen.iter().all(|s| *s) {
             continue;
         }
-        let Some((map, kept)) = trim_mesh(d, i as u32, seen) else { continue };
+        let kept: Vec<u16> = m.triangles.chunks_exact(3).zip(seen).filter(|(_, s)| **s).flat_map(|(t, _)| t.iter().copied()).collect();
+        let Some((map, kept)) = rebuild(d, i as u32, &kept) else { continue };
         tris_removed += n - kept;
         verts_removed += map.iter().filter(|m| m.is_none()).count();
+        maps[i] = Some(map);
     }
-    (tris_removed, verts_removed)
+    (tris_removed, verts_removed, maps)
 }
 
-/// Removes attachment `id`'s unseen triangles and unused vertices, and remaps its deform
-/// timelines. Returns the old -> new vertex map and the triangles kept.
-fn trim_mesh(d: &mut SkeletonData, id: u32, seen: &[bool]) -> Option<(Vec<Option<u16>>, usize)> {
+/// Gives attachment `id` the triangles `tris` (its own vertex numbers, three per triangle),
+/// drops the vertices none of them uses, and remaps its deform timelines. Returns the old -> new
+/// vertex map and the triangle count.
+pub fn rebuild(d: &mut SkeletonData, id: u32, tris: &[u16]) -> Option<(Vec<Option<u16>>, usize)> {
     let AttachmentKind::Mesh(m) = &mut d.attachments[id as usize].kind else { return None };
     let nv = m.vertices.vertex_count();
     let mut used = vec![false; nv];
-    for (t, s) in m.triangles.chunks_exact(3).zip(seen) {
-        if *s {
-            for &v in t {
-                used[v as usize] = true;
-            }
-        }
+    for &v in tris {
+        *used.get_mut(v as usize)? = true;
     }
     let mut map: Vec<Option<u16>> = vec![None; nv];
     let mut next = 0u16;
@@ -71,13 +78,7 @@ fn trim_mesh(d: &mut SkeletonData, id: u32, seen: &[bool]) -> Option<(Vec<Option
             next += 1;
         }
     }
-    // Triangles.
-    let mut triangles = Vec::with_capacity(m.triangles.len());
-    for (t, s) in m.triangles.chunks_exact(3).zip(seen) {
-        if *s {
-            triangles.extend(t.iter().map(|&v| map[v as usize].unwrap()));
-        }
-    }
+    let triangles: Vec<u16> = tris.iter().map(|&v| map[v as usize].unwrap()).collect();
     let kept = triangles.len() / 3;
     // The binary format derives the triangle count from the vertex and hull counts
     // (T = 2V - h - 2): the hull, editor-only data, is set to whatever makes that hold.

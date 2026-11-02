@@ -445,102 +445,130 @@ pub fn quad_blit(screen: &[[f32; 2]], texel: &[[f32; 2]]) -> Option<([i32; 4], [
     Some(([x0, y0, (u0 - u2).abs(), (v0 - v2).abs()], m))
 }
 
-/// Least-squares refits per group the watch uses (`Paths::new`) and the previews follow.
-pub const REFITS: u8 = 0;
-
-/// [`cluster`] as [`Paths`] groups (the same code), with `refits` least-squares refits per
-/// group: what the watch draws, for previews.
-pub fn cluster_refit(tris: &[Tri], tol: f32, refits: u8, order: &mut Vec<u32>, out: &mut Vec<Cluster>) {
-    let mut p = Paths { tolerance: tol, refits, ..Default::default() };
-    p.tris.extend_from_slice(tris);
-    p.group();
-    order.clear();
-    order.extend_from_slice(&p.order);
-    out.clear();
-    out.extend(p.clusters.iter().map(|c| Cluster { start: c.start, count: c.count, m: c.m }));
-}
-
-/// Groups smaller than this are not refitted (little to gain for a whole extra scan).
-pub const REFIT_MIN: usize = 3;
-
-/// The least-squares texel -> screen affine over the corners of `members` (texels centred on
-/// their mean, in f32: the watch has no double-precision FPU). `None` when the corners are
-/// collinear in texel space.
-pub fn fit_affine(tris: &[Tri], members: &[u32]) -> Option<[f32; 6]> {
-    let n = members.len() as f32 * 3.0;
-    let (mut mu, mut mv) = (0.0f32, 0.0f32);
-    for &i in members {
-        let t = &tris[i as usize].t;
-        mu += t[0][0] + t[1][0] + t[2][0];
-        mv += t[0][1] + t[1][1] + t[2][1];
-    }
-    mu /= n;
-    mv /= n;
-    let (mut suu, mut suv, mut svv) = (0.0f32, 0.0f32, 0.0f32);
-    let (mut sux, mut svx, mut suy, mut svy, mut sx, mut sy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
-    for &i in members {
-        let tri = &tris[i as usize];
-        for k in 0..3 {
-            let (u, v) = (tri.t[k][0] - mu, tri.t[k][1] - mv);
-            let (x, y) = (tri.s[k][0], tri.s[k][1]);
-            suu += u * u;
-            suv += u * v;
-            svv += v * v;
-            sux += u * x;
-            svx += v * x;
-            suy += u * y;
-            svy += v * y;
-            sx += x;
-            sy += y;
-        }
-    }
-    let det = suu * svv - suv * suv;
-    if !(det > 1e-6 * suu * svv) {
-        return None;
-    }
-    let inv = 1.0 / det;
-    let a = (sux * svv - svx * suv) * inv;
-    let b = (svx * suu - sux * suv) * inv;
-    let d = (suy * svv - svy * suv) * inv;
-    let e = (svy * suu - suy * suv) * inv;
-    Some([a, b, sx / n - a * mu - b * mv, d, e, sy / n - d * mu - e * mv])
-}
-
-/// Greedily groups triangles that one affine draws within `tol` screen pixels. A cluster's
-/// affine is its first triangle's; a triangle joins the current cluster if that affine places
-/// its corners within tolerance, else starts the next one. `tris` is the batch's visible,
-/// non-degenerate triangles; `order` receives their indices grouped by cluster.
+/// Groups triangles that one affine draws within `tol` screen pixels, as the watch does: a
+/// group's affine is its first triangle's; every triangle joins the first group whose affine
+/// places its corners within tolerance, else starts the next one. `tris` is the batch's visible
+/// triangles (degenerate ones join a group or are dropped); `order` receives their indices
+/// grouped by cluster.
 pub fn cluster(tris: &[Tri], tol: f32, order: &mut Vec<u32>, out: &mut Vec<Cluster>) {
-    cluster_with(tris, tol, order, out, &mut Vec::new(), &mut Vec::new());
-}
-
-/// [`cluster`] with caller-owned scratch lists (no allocation once they are big enough).
-pub fn cluster_with(tris: &[Tri], tol: f32, order: &mut Vec<u32>, out: &mut Vec<Cluster>, pending: &mut Vec<u32>, rest: &mut Vec<u32>) {
     order.clear();
     out.clear();
-    pending.clear();
-    pending.extend(0..tris.len() as u32);
-    let mut head = 0;
-    while head < pending.len() {
-        let first = pending[head];
-        let Some(m) = tris[first as usize].affine() else {
-            head += 1;
-            continue;
-        };
-        let start = order.len() as u32;
-        rest.clear();
-        // The first one always joins (its own affine places it exactly, up to rounding).
-        order.push(first);
-        for &i in &pending[head + 1..] {
-            if tris[i as usize].fits(&m, tol) {
-                order.push(i);
-            } else {
-                rest.push(i);
+    let mut g = Grouper::default();
+    let (mut screen, mut texel, mut idx) = (Vec::new(), Vec::new(), Vec::new());
+    // Batches of indices are 16-bit: long lists go in runs.
+    for (r, run) in tris.chunks(21_000).enumerate() {
+        screen.clear();
+        texel.clear();
+        idx.clear();
+        for t in run {
+            for k in 0..3 {
+                idx.push(screen.len() as u16);
+                screen.push(t.s[k]);
+                texel.push(t.t[k]);
             }
         }
-        out.push(Cluster { start, count: order.len() as u32 - start, m });
-        core::mem::swap(pending, rest);
-        head = 0;
+        g.group(&screen, &texel, &idx, tol, None);
+        let base = (r * 21_000) as u32;
+        for c in 0..g.ms.len() {
+            let start = order.len() as u32;
+            order.extend(g.members(c).iter().map(|&v| base + g.vis[v as usize] as u32));
+            out.push(Cluster { start, count: order.len() as u32 - start, m: g.ms[c] });
+        }
+    }
+}
+
+/// The grouping of one batch (scratch kept across batches and frames).
+#[derive(Default)]
+struct Grouper {
+    /// Visible triangles (numbers within the batch) and the group each joined.
+    vis: Vec<u16>,
+    of: Vec<u16>,
+    /// Each group's affine, texel -> target pixels.
+    ms: Vec<[f32; 6]>,
+    /// Members grouped: group `g` is `order[starts[g]..starts[g + 1]]` (indices into `vis`).
+    starts: Vec<u32>,
+    order: Vec<u32>,
+}
+
+impl Grouper {
+    fn reserve(&mut self, n: usize) -> bool {
+        fn grow<T>(v: &mut Vec<T>, n: usize) -> bool {
+            v.try_reserve_exact(n.saturating_sub(v.capacity())).is_ok()
+        }
+        grow(&mut self.vis, n) && grow(&mut self.of, n) && grow(&mut self.ms, n) && grow(&mut self.starts, n + 1) && grow(&mut self.order, n)
+    }
+
+    fn members(&self, g: usize) -> &[u32] {
+        &self.order[self.starts[g] as usize..self.starts[g + 1] as usize]
+    }
+
+    /// Groups the triangles of `idx` (vertex triples into `screen` / `texel`, every index in
+    /// range), keeping only those that reach `cull` (the target's size in pixels) when given. One pass: each triangle is read once and tried against the group it joined last,
+    /// then the others in order (the groups come out as scanning what is left once per group
+    /// makes them: a triangle that fits no earlier group starts one in both).
+    fn group(&mut self, screen: &[[f32; 2]], texel: &[[f32; 2]], idx: &[u16], tol: f32, cull: Option<(f32, f32)>) {
+        self.vis.clear();
+        self.of.clear();
+        self.ms.clear();
+        let mut last = 0usize;
+        for (n, t) in idx.chunks_exact(3).enumerate() {
+            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+            // SAFETY: the caller checked every index against the vertex lists.
+            let p = unsafe { [*screen.get_unchecked(a), *screen.get_unchecked(b), *screen.get_unchecked(c)] };
+            if let Some((lx, ly)) = cull {
+                if p[0][0].max(p[1][0]).max(p[2][0]) < 0.0 || p[0][1].max(p[1][1]).max(p[2][1]) < 0.0 || p[0][0].min(p[1][0]).min(p[2][0]) > lx || p[0][1].min(p[1][1]).min(p[2][1]) > ly {
+                    continue;
+                }
+            }
+            let tx = unsafe { [*texel.get_unchecked(a), *texel.get_unchecked(b), *texel.get_unchecked(c)] };
+            let fits = |m: &[f32; 6]| {
+                for k in 0..3 {
+                    let dx = m[0] * tx[k][0] + m[1] * tx[k][1] + m[2] - p[k][0];
+                    let dy = m[3] * tx[k][0] + m[4] * tx[k][1] + m[5] - p[k][1];
+                    if !(dx.abs() <= tol && dy.abs() <= tol) {
+                        return false;
+                    }
+                }
+                true
+            };
+            let g = if self.ms.get(last).is_some_and(|m| fits(m)) {
+                last
+            } else if let Some(g) = self.ms.iter().enumerate().position(|(g, m)| g != last && fits(m)) {
+                g
+            } else if let Some(m) = (Tri { s: p, t: tx, v: [0; 3] }).affine() {
+                if self.ms.len() >= u16::MAX as usize {
+                    continue;
+                }
+                self.ms.push(m);
+                self.ms.len() - 1
+            } else {
+                continue;
+            };
+            last = g;
+            self.vis.push(n as u16);
+            self.of.push(g as u16);
+        }
+        // Members by group (counting sort; in triangle order within a group).
+        self.starts.clear();
+        self.starts.resize(self.ms.len() + 1, 0);
+        for &g in &self.of {
+            self.starts[g as usize + 1] += 1;
+        }
+        for g in 0..self.ms.len() {
+            self.starts[g + 1] += self.starts[g];
+        }
+        self.order.clear();
+        self.order.resize(self.of.len(), 0);
+        // `starts[g]` runs ahead while filling, then is put back.
+        for (i, &g) in self.of.iter().enumerate() {
+            let s = &mut self.starts[g as usize];
+            self.order[*s as usize] = i as u32;
+            *s += 1;
+        }
+        for g in (1..=self.ms.len()).rev() {
+            self.starts[g] = self.starts[g - 1];
+        }
+        self.starts[0] = 0;
     }
 }
 
@@ -578,7 +606,7 @@ pub struct Call<'a> {
 }
 
 /// Turns draw lists into GPU calls: the visible triangles of each batch, grouped by affine
-/// ([`cluster_with`]) into one path per call. (Re-using last frame's groups was tried: cheaper to
+/// ([`cluster`]) into one path per call. (Re-using last frame's groups was tried: cheaper to
 /// build, but groups split as meshes deform and cost 15-50% more calls.) Everything is kept
 /// across frames: after [`Paths::reserve`] drawing does not allocate.
 #[derive(Default)]
@@ -587,13 +615,9 @@ pub struct Paths {
     screen: Vec<[f32; 2]>,
     fixed: Vec<[i16; 2]>,
     texel: Vec<[f32; 2]>,
+    groups: Grouper,
+    #[cfg(feature = "outline")]
     tris: Vec<Tri>,
-    order: Vec<u32>,
-    clusters: Vec<Cluster>,
-    pending: Vec<u32>,
-    rest: Vec<u32>,
-    alt: Vec<u32>,
-    alt_rest: Vec<u32>,
     #[cfg(feature = "outline")]
     outline: Outline,
     data: Vec<i16>,
@@ -606,8 +630,6 @@ pub struct Paths {
     pub blits: bool,
     /// Calls given as rectangles since [`Paths::reset_stats`].
     pub rects: u32,
-    /// Least-squares refits tried per group (0: the seed triangle's affine only).
-    pub refits: u8,
     /// Visible triangles and calls since [`Paths::reset_stats`].
     pub triangles: u32,
     pub calls: u32,
@@ -615,28 +637,16 @@ pub struct Paths {
 
 impl Paths {
     pub fn new() -> Paths {
-        Paths { tolerance: 0.75, refits: REFITS, ..Default::default() }
+        Paths { tolerance: 0.75, ..Default::default() }
     }
 
-    /// Room for batches of up to `max_triangles` triangles and `max_vertices` vertices.
+    /// Room for batches of up to `max_triangles` triangles.
     pub fn reserve(&mut self, max_triangles: usize) -> bool {
         let n = max_triangles;
         fn grow<T>(v: &mut Vec<T>, n: usize) -> bool {
             v.try_reserve_exact(n.saturating_sub(v.capacity())).is_ok()
         }
-        grow(&mut self.tris, n)
-
-            && grow(&mut self.screen, n * 3)
-            && grow(&mut self.fixed, n * 3)
-            && grow(&mut self.texel, n * 3)
-            && grow(&mut self.order, n)
-            && grow(&mut self.clusters, n)
-            && grow(&mut self.pending, n)
-            && grow(&mut self.rest, n)
-            && grow(&mut self.alt, n)
-            && grow(&mut self.alt_rest, n)
-            && grow(&mut self.data, n * 10 + 2)
-            && self.reserve_outline(n)
+        grow(&mut self.screen, n * 3) && grow(&mut self.fixed, n * 3) && grow(&mut self.texel, n * 3) && self.groups.reserve(n) && grow(&mut self.data, n * 10 + 2) && self.reserve_outline(n)
     }
 
     #[cfg(feature = "outline")]
@@ -653,82 +663,6 @@ impl Paths {
         self.triangles = 0;
         self.calls = 0;
         self.rects = 0;
-    }
-
-    /// Clusters the batch's visible triangles into `order` / `clusters` (as [`cluster_with`]).
-    fn group(&mut self) {
-        self.pending.clear();
-        self.pending.extend(0..self.tris.len() as u32);
-        let tol = self.tolerance;
-        self.order.clear();
-        self.clusters.clear();
-        self.order.reserve(self.pending.len());
-        self.rest.reserve(self.pending.len());
-        let mut head = 0;
-        while head < self.pending.len() {
-            let first = self.pending[head];
-            let Some(m) = self.tris[first as usize].affine() else {
-                head += 1;
-                continue;
-            };
-            let start = self.order.len();
-            self.order.push(first);
-            // Branch-free partition of the rest into members and the next round's candidates:
-            // every candidate is written to both lists, only one of them advances.
-            let candidates = &self.pending[head + 1..];
-            let (mut taken, mut left) = (self.order.len(), 0usize);
-            let (order, rest) = (self.order.as_mut_ptr(), self.rest.as_mut_ptr());
-            // A slice (pointer and length in registers), not the Vec: its header would be reloaded
-            // after every store through the raw pointers.
-            let tris: &[Tri] = &self.tris;
-            for &i in candidates {
-                // SAFETY: `pending` only holds indices of `tris`.
-                let fit = unsafe { tris.get_unchecked(i as usize) }.fits(&m, tol);
-                // SAFETY: both lists have room for every candidate (reserved above; `order` holds
-                // at most all pending triangles, `rest` at most the candidates).
-                unsafe {
-                    *order.add(taken) = i;
-                    *rest.add(left) = i;
-                }
-                taken += fit as usize;
-                left += !fit as usize;
-            }
-            // SAFETY: the first `taken` / `left` entries were written just above.
-            unsafe {
-                self.order.set_len(taken);
-                self.rest.set_len(left);
-            }
-            let mut m = m;
-            // Refits: one affine fitted to all the members' corners usually places more of this
-            // round's triangles within tolerance than the seed's own does (10-25% fewer calls).
-            for _ in 0..self.refits {
-                if taken - start < REFIT_MIN || self.rest.is_empty() {
-                    break;
-                }
-                let Some(m2) = fit_affine(&self.tris, &self.order[start..taken]) else { break };
-                self.alt.clear();
-                self.alt_rest.clear();
-                for &i in self.order[start..taken].iter().chain(self.rest.iter()) {
-                    // SAFETY: both lists only hold indices of `tris`.
-                    if unsafe { self.tris.get_unchecked(i as usize) }.fits(&m2, tol) {
-                        self.alt.push(i);
-                    } else {
-                        self.alt_rest.push(i);
-                    }
-                }
-                if self.alt.len() <= taken - start {
-                    break;
-                }
-                self.order.truncate(start);
-                self.order.extend_from_slice(&self.alt);
-                core::mem::swap(&mut self.rest, &mut self.alt_rest);
-                taken = self.order.len();
-                m = m2;
-            }
-            self.clusters.push(Cluster { start: start as u32, count: (taken - start) as u32, m });
-            core::mem::swap(&mut self.pending, &mut self.rest);
-            head = 0;
-        }
     }
 
     /// Emits the calls for layer `layer`'s `list`. `cam` maps skeleton to target pixels:
@@ -811,7 +745,7 @@ impl Paths {
             }
             let all_in = lo[0] >= 0 && lo[1] >= 0 && hi[0] <= limit_x && hi[1] <= limit_y;
             // A region attachment (or a one-quad mesh): one atlas rectangle drawn rigidly is a
-            // blit, found from its four corners without building triangles or clustering.
+            // blit, found from its four corners without grouping.
             if self.blits && b.vertex_count == 4 && idx.len() == 6 {
                 let quad = quad_order(idx).and_then(|o| quad_blit(&o.map(|k| self.screen[k]), &o.map(|k| self.texel[k])));
                 if let Some((rect, m)) = quad {
@@ -822,73 +756,57 @@ impl Paths {
                     continue;
                 }
             }
-            self.tris.clear();
-            self.tris.reserve(idx.len() / 3);
-            let mut kept = 0;
-            {
-                let (screen, fixed, texel) = (&self.screen[..], &self.fixed[..], &self.texel[..]);
-                let out = self.tris.spare_capacity_mut();
-                for t in idx.chunks_exact(3) {
-                    let (a, bb, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
-                    // SAFETY: every index is below `n` (checked above), the length of the three.
-                    let (qa, qb, qc) = unsafe { (*fixed.get_unchecked(a), *fixed.get_unchecked(bb), *fixed.get_unchecked(c)) };
-                    let vis = all_in
-                        || !(qa[0].max(qb[0]).max(qc[0]) < 0
-                            || qa[1].max(qb[1]).max(qc[1]) < 0
-                            || qa[0].min(qb[0]).min(qc[0]) > limit_x
-                            || qa[1].min(qb[1]).min(qc[1]) > limit_y);
-                    if !vis {
+            self.groups.group(&self.screen, &self.texel, idx, self.tolerance, (!all_in).then_some(size));
+            let g = &self.groups;
+            self.triangles += g.vis.len() as u32;
+            for c in 0..g.ms.len() {
+                let members = g.members(c);
+                if members.is_empty() {
+                    continue;
+                }
+                let matrix = g.ms[c];
+                let corners = |m: u32| {
+                    let t = g.vis[m as usize] as usize * 3;
+                    [idx[t] as usize, idx[t + 1] as usize, idx[t + 2] as usize]
+                };
+                let tri = |m: u32| {
+                    let v = corners(m);
+                    Tri { s: v.map(|k| self.screen[k]), t: v.map(|k| self.texel[k]), v: v.map(|k| k as u32) }
+                };
+                if self.blits && members.len() == 2 {
+                    let pair = [tri(members[0]), tri(members[1])];
+                    // Drawn by the affine alone, so its corners must land where the mesh has them.
+                    if let Some(rect) = texel_rect(&pair).filter(|_| pair.iter().all(|t| t.error(&matrix) <= BLIT_ERROR)) {
+                        self.calls += 1;
+                        self.rects += 1;
+                        emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &[], bounds: [0; 4], matrix, rect: Some(rect) });
                         continue;
                     }
-                    // SAFETY: as above; `kept` < idx.len() / 3, the room reserved.
-                    unsafe {
-                        out.get_unchecked_mut(kept).write(Tri {
-                            s: [*screen.get_unchecked(a), *screen.get_unchecked(bb), *screen.get_unchecked(c)],
-                            t: [*texel.get_unchecked(a), *texel.get_unchecked(bb), *texel.get_unchecked(c)],
-                            v: [a as u32, bb as u32, c as u32],
-                        });
-                    }
-                    kept += 1;
                 }
-            }
-            // SAFETY: the first `kept` entries were written just above.
-            unsafe { self.tris.set_len(kept) };
-            if self.tris.is_empty() {
-                continue;
-            }
-            self.group();
-            self.triangles += self.order.len() as u32;
-            for c in &self.clusters {
                 let d = &mut self.data;
                 d.clear();
                 let mut lo = [i16::MAX; 2];
                 let mut hi = [i16::MIN; 2];
-                let members = &self.order[c.start as usize..(c.start + c.count) as usize];
-                if self.blits && c.count == 2 {
-                    let pair = [self.tris[members[0] as usize], self.tris[members[1] as usize]];
-                    // Drawn by the affine alone, so its corners must land where the mesh has them.
-                    if let Some(rect) = texel_rect(&pair).filter(|_| pair.iter().all(|t| t.error(&c.m) <= BLIT_ERROR)) {
-                        self.calls += 1;
-                        self.rects += 1;
-                        emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &[], bounds: [0; 4], matrix: c.m, rect: Some(rect) });
-                        continue;
-                    }
-                }
                 #[cfg(feature = "outline")]
                 let outlined = self.outline_paths;
                 #[cfg(not(feature = "outline"))]
                 let outlined = false;
                 if outlined {
                     #[cfg(feature = "outline")]
-                    outline(&self.tris, members, &mut self.outline, |op, x, y| {
-                        d.push(op as i16);
-                        if op != PATH_CLOSE {
-                            let q = [path_coord(x), path_coord(y)];
-                            d.extend_from_slice(&q);
-                            lo = [lo[0].min(q[0]), lo[1].min(q[1])];
-                            hi = [hi[0].max(q[0]), hi[1].max(q[1])];
-                        }
-                    });
+                    {
+                        self.tris.clear();
+                        self.tris.extend(members.iter().map(|&m| tri(m)));
+                        let all: Vec<u32> = (0..self.tris.len() as u32).collect();
+                        outline(&self.tris, &all, &mut self.outline, |op, x, y| {
+                            d.push(op as i16);
+                            if op != PATH_CLOSE {
+                                let q = [path_coord(x), path_coord(y)];
+                                d.extend_from_slice(&q);
+                                lo = [lo[0].min(q[0]), lo[1].min(q[1])];
+                                hi = [hi[0].max(q[0]), hi[1].max(q[1])];
+                            }
+                        });
+                    }
                 } else {
                     const MOVE: i16 = PATH_MOVE as i16;
                     const LINE: i16 = PATH_LINE as i16;
@@ -896,12 +814,11 @@ impl Paths {
                     // Ten elements per triangle, written straight into reserved room.
                     let len = members.len() * 10;
                     d.reserve(len + 2);
-                    let (tris, fixed) = (&self.tris, &self.fixed);
-                    for (out, &ti) in d.spare_capacity_mut()[..len].chunks_exact_mut(10).zip(members) {
-                        // SAFETY: cluster members index `tris` (they come from `group`), and every
-                        // triangle's vertices indexed `fixed` (checked) when it was made.
-                        let v = unsafe { tris.get_unchecked(ti as usize) }.v;
-                        let (p, q, r) = unsafe { (*fixed.get_unchecked(v[0] as usize), *fixed.get_unchecked(v[1] as usize), *fixed.get_unchecked(v[2] as usize)) };
+                    let fixed = &self.fixed;
+                    for (out, &m) in d.spare_capacity_mut()[..len].chunks_exact_mut(10).zip(members) {
+                        let v = corners(m);
+                        // SAFETY: every index was checked against the vertex lists above.
+                        let (p, q, r) = unsafe { (*fixed.get_unchecked(v[0]), *fixed.get_unchecked(v[1]), *fixed.get_unchecked(v[2])) };
                         for (o, e) in out.iter_mut().zip([MOVE, p[0], p[1], LINE, q[0], q[1], LINE, r[0], r[1], CLOSE]) {
                             o.write(e);
                         }
@@ -917,7 +834,7 @@ impl Paths {
                     d.push(0);
                 }
                 self.calls += 1;
-                emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &self.data, bounds: [lo[0], lo[1], hi[0], hi[1]], matrix: c.m, rect: None });
+                emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &self.data, bounds: [lo[0], lo[1], hi[0], hi[1]], matrix, rect: None });
             }
         }
     }

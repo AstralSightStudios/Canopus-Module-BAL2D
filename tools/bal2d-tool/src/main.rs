@@ -288,6 +288,10 @@ fn compile(args: &[String]) {
         opts.name = n;
     }
     opts.bake = !args.iter().any(|a| a == "--no-bake");
+    if let Some(t) = arg(args, "--simplify") {
+        opts.simplify = t.parse().unwrap();
+    }
+    opts.idle = !args.iter().any(|a| a == "--no-idle");
     opts.format = match arg(args, "--format").as_deref() {
         Some("argb4444") => bal2d_pack::PageFormat::Argb4444,
         Some("index8") => bal2d_pack::PageFormat::Index8,
@@ -338,9 +342,15 @@ fn compile(args: &[String]) {
             if after_intro { ", used after the intro" } else { "" }
         );
     }
+    if report.idle.layers.is_empty() {
+        println!("  idle bake: none ({})", report.idle.skipped);
+    }
+    for (li, (frames, calls, shapes, bytes)) in report.idle.layers.iter().enumerate() {
+        println!("  idle bake layer {li}: {frames} frames (up to {} fps), {calls:.0} calls/frame, {shapes} shapes, {} KB raw", report.idle.rate, bytes / 1024);
+    }
     for l in &report.layers {
         println!(
-            "  {}: attachments {} -> {}, regions {} -> {}, texels {:.2} -> {:.2} Mpx, pages {:?}, skel {} B; dropped {} animations, {} timelines; trimmed {} triangles, {} vertices",
+            "  {}: attachments {} -> {}, regions {} -> {}, texels {:.2} -> {:.2} Mpx, pages {:?}, skel {} B; dropped {} animations, {} timelines; trimmed {} triangles, {} vertices; simplified away {} triangles, {} vertices",
             l.name,
             l.attachments,
             l.kept,
@@ -353,7 +363,9 @@ fn compile(args: &[String]) {
             l.animations_dropped,
             l.timelines_dropped,
             l.triangles_trimmed,
-            l.vertices_trimmed
+            l.vertices_trimmed,
+            l.triangles_simplified,
+            l.vertices_simplified
         );
     }
 }

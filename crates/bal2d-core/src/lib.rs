@@ -8,6 +8,8 @@
 
 extern crate alloc;
 
+pub mod idle;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -142,6 +144,10 @@ pub struct Lobby {
     /// Total animation time (seconds).
     pub time: f32,
     pub bake: Option<Bake>,
+    /// Per layer: its idle loop baked into GPU calls (`idle`), when the pack has one.
+    pub idle: Vec<Option<idle::IdleLayer>>,
+    /// Time the baked idle has played that the skeletons have not (see `advance_idle`).
+    idle_pending: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -235,6 +241,15 @@ impl Lobby {
             Some(e) => String::from_utf8(bal2d_pack::read_section_vec(src, e).map_err(LoadError::Pack)?).unwrap_or_default(),
             None => String::new(),
         };
+        // A bake that does not fit its skeleton is ignored (the layer is then animated).
+        let mut idle = Vec::with_capacity(layers.len());
+        for (li, l) in layers.iter().enumerate() {
+            let bake = match idx.find(bal2d_pack::KIND_IDLE, li as u16, 0) {
+                Some(e) => bal2d_pack::read_section_vec(src, e).ok().and_then(|d| bal2d_pack::IdleBake::decode(&d)),
+                None => None,
+            };
+            idle.push(bake.and_then(|b| idle::IdleLayer::new(b, &l.data)));
+        }
         let mut lobby = Lobby {
             layers,
             interactions,
@@ -253,6 +268,8 @@ impl Lobby {
             notices: Vec::new(),
             time: 0.0,
             bake,
+            idle,
+            idle_pending: 0.0,
         };
         lobby.start();
         Ok((lobby, pages))
@@ -296,6 +313,7 @@ impl Lobby {
             }
         }
         self.time = 0.0;
+        self.idle_pending = 0.0;
         self.talk_next = 0;
         self.drag = None;
         self.activity = None;
@@ -626,6 +644,70 @@ impl Lobby {
                 }
             }
         }
+    }
+
+    /// Whether only the idle loops play, as the baked idle has them: every layer has a bake of
+    /// the looping animation its track 0 plays unmixed, nothing else plays or is queued, no
+    /// finger is down, and the framing is the idle one (with the baked image in place when the
+    /// pack has one). The lobby can then be drawn from the bakes (`draw_idle`).
+    pub fn idle_ready(&self) -> bool {
+        if self.idle.is_empty() || self.drag.is_some() || self.activity.is_some() || self.pending_tap || self.cam_t < 1.0 {
+            return false;
+        }
+        if self.bake.is_some() && !self.bake_active() {
+            return false;
+        }
+        if self.camera != self.cameras[bal2d_pack::phase::IDLE as usize] {
+            return false;
+        }
+        self.layers.iter().zip(&self.idle).all(|(l, b)| {
+            let Some(b) = b else { return false };
+            let Some(e) = l.state.current(0) else { return false };
+            let e = l.state.entry(e);
+            if e.animation != Some(b.bake.animation as usize) || !e.looped || e.mixing_from.is_some() || e.next.is_some() {
+                return false;
+            }
+            (1..4).all(|t| match l.state.current(t) {
+                None => true,
+                Some(e) => {
+                    let e = l.state.entry(e);
+                    e.animation.is_none() && e.mixing_from.is_none() && e.next.is_none()
+                }
+            })
+        })
+    }
+
+    /// Plays `dt` of the baked idle: only the clock moves (the skeletons catch up in `resume`).
+    pub fn advance_idle(&mut self, dt: f32) {
+        self.idle_pending += dt;
+        self.time += dt;
+    }
+
+    /// Brings the skeletons to where the baked idle has played to (before animating again).
+    pub fn resume(&mut self) {
+        if self.idle_pending <= 0.0 {
+            return;
+        }
+        let dt = self.idle_pending;
+        self.idle_pending = 0.0;
+        for l in &mut self.layers {
+            l.state.update(&l.data, dt);
+            l.state.apply(&l.data, &mut l.skeleton);
+            // Physics takes the step a frame would: a long one would throw it.
+            l.skeleton.update(dt.min(1.0 / 30.0));
+            l.skeleton.update_world_transform(&l.data, Physics::Update);
+            l.state.output.clear();
+        }
+    }
+
+    /// Draws layer `layer` from its baked idle (see `idle_ready`) into a target of `size` whose
+    /// top-left is `origin` on the pack's screen. Returns the triangles drawn.
+    pub fn draw_idle(&mut self, layer: usize, origin: (f32, f32), size: (f32, f32), page_size: &dyn Fn(u32) -> Option<(f32, f32)>, emit: &mut dyn FnMut(&bal2d_render::Call)) -> u32 {
+        let pending = self.idle_pending;
+        let (Some(l), Some(Some(b))) = (self.layers.get(layer), self.idle.get_mut(layer)) else { return 0 };
+        let Some(e) = l.state.current(0) else { return 0 };
+        let tau = idle::wrap(l.state.entry(e).track_time + pending - b.bake.start, b.bake.period);
+        b.draw(&l.data, tau, origin, size, page_size, emit)
     }
 
     /// Whether the baked image stands in for its slots now: always, or once the intro is over

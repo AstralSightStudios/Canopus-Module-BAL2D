@@ -35,6 +35,8 @@ pub const KIND_BAKE: u32 = 6;
 pub const KIND_BAKE_SLOTS: u32 = 7;
 /// Framing per lobby phase ([`PhaseCameras`]); without it every phase uses the header's camera.
 pub const KIND_CAMERAS: u32 = 8;
+/// A layer's idle loop as ready GPU calls ([`IdleBake`]; section layer = the layer).
+pub const KIND_IDLE: u32 = 9;
 
 /// Page pixel formats (what the GPU samples directly).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -568,6 +570,279 @@ impl PhaseCameras {
     }
 }
 
+// ---- baked idle ----
+
+/// Triangles of one attachment drawn with one affine in a baked idle.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IdleShape {
+    pub slot: u16,
+    pub attachment: u32,
+    /// Texel the call matrices are anchored at (page texels; the centre of the group's box)
+    /// and the box's half size (at least a texel each way).
+    pub anchor: [f32; 2],
+    pub span: [f32; 2],
+    /// Triangle numbers within the attachment's own triangle list.
+    pub tris: Vec<u16>,
+}
+
+/// One call of a baked idle frame: shape, tint (index into [`IdleBake::colors`]) and the
+/// texel -> screen affine at the frame ([`IdleBake::matrix`] decodes it) and at the next one
+/// (`None`: the same shape's in the next frame).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IdleCall {
+    pub shape: u16,
+    pub color: u16,
+    pub m0: [i16; 6],
+    pub m1: Option<[i16; 6]>,
+}
+
+/// A layer's idle loop baked into GPU calls by the compiler: the watch draws them, the
+/// matrices interpolated between frames, instead of animating, skinning and grouping. Frame `f`
+/// is the pose at track time `start + f / rate` of `animation` (looping, `period` seconds);
+/// its calls hold over the interval up to frame `f + 1`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IdleBake {
+    pub animation: u16,
+    pub rate: f32,
+    pub period: f32,
+    pub start: f32,
+    pub shapes: Vec<IdleShape>,
+    /// Straight RGBA8 tints (R in the low byte).
+    pub colors: Vec<u32>,
+    pub frames: u16,
+    /// The frames' calls (see [`IdleCursor`]).
+    pub stream: Vec<u8>,
+}
+
+/// Fixed-point scale of [`IdleCall`] matrices: they are the screen positions (x, y) of three
+/// texels of the shape, its anchor and the anchor moved by its span along x and along y.
+pub const IDLE_POSITION: f32 = 16.0;
+
+impl IdleBake {
+    /// The texel -> screen affine of parameters `p` (fixed point, possibly interpolated) for
+    /// shape `s` (x' = m[0] tx + m[1] ty + m[2], ...).
+    pub fn matrix(s: &IdleShape, p: &[f32; 6]) -> [f32; 6] {
+        let k = 1.0 / IDLE_POSITION;
+        let (x0, y0) = (p[0] * k, p[1] * k);
+        let (a, c) = ((p[2] * k - x0) / s.span[0], (p[3] * k - y0) / s.span[0]);
+        let (b, d) = ((p[4] * k - x0) / s.span[1], (p[5] * k - y0) / s.span[1]);
+        [a, b, x0 - a * s.anchor[0] - b * s.anchor[1], c, d, y0 - c * s.anchor[0] - d * s.anchor[1]]
+    }
+
+    /// Fixed-point parameters of the affine `m` for shape `s` (the inverse of [`IdleBake::matrix`]).
+    pub fn params(s: &IdleShape, m: &[f32; 6]) -> [i16; 6] {
+        let q = |v: f32| {
+            let x = v * IDLE_POSITION;
+            (if x >= 0.0 { x + 0.5 } else { x - 0.5 }).clamp(-32768.0, 32767.0) as i16
+        };
+        let at = |tx: f32, ty: f32| [m[0] * tx + m[1] * ty + m[2], m[3] * tx + m[4] * ty + m[5]];
+        let (ax, ay) = (s.anchor[0], s.anchor[1]);
+        let (p0, p1, p2) = (at(ax, ay), at(ax + s.span[0], ay), at(ax, ay + s.span[1]));
+        [q(p0[0]), q(p0[1]), q(p1[0]), q(p1[1]), q(p2[0]), q(p2[1])]
+    }
+
+    /// Encodes `frames` (each a list of calls) as the stream: per frame a call count, per call
+    /// shape, color, flags (1: m0 is a delta from the shape's m0 in the previous frame, 2: m1
+    /// follows as a delta from m0), m0 and m1.
+    pub fn encode_frames(frames: &[Vec<IdleCall>], shapes: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut last: Vec<Option<[i16; 6]>> = alloc::vec![None; shapes];
+        let mut seen_now: Vec<Option<[i16; 6]>> = alloc::vec![None; shapes];
+        for f in frames {
+            out.extend_from_slice(&(f.len() as u16).to_le_bytes());
+            seen_now.iter_mut().for_each(|x| *x = None);
+            for c in f {
+                out.extend_from_slice(&c.shape.to_le_bytes());
+                out.extend_from_slice(&c.color.to_le_bytes());
+                let base = last.get(c.shape as usize).copied().flatten();
+                let flags = base.is_some() as u8 | (c.m1.is_some() as u8) << 1;
+                out.push(flags);
+                for k in 0..6 {
+                    out.extend_from_slice(&c.m0[k].wrapping_sub(base.map_or(0, |b| b[k])).to_le_bytes());
+                }
+                if let Some(m1) = c.m1 {
+                    for k in 0..6 {
+                        out.extend_from_slice(&m1[k].wrapping_sub(c.m0[k]).to_le_bytes());
+                    }
+                }
+                if let Some(x) = seen_now.get_mut(c.shape as usize) {
+                    *x = Some(c.m0);
+                }
+            }
+            core::mem::swap(&mut last, &mut seen_now);
+        }
+        out
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.push(2u8);
+        v.extend_from_slice(&self.animation.to_le_bytes());
+        for f in [self.rate, self.period, self.start] {
+            v.extend_from_slice(&f.to_le_bytes());
+        }
+        v.extend_from_slice(&(self.shapes.len() as u16).to_le_bytes());
+        for s in &self.shapes {
+            v.extend_from_slice(&s.slot.to_le_bytes());
+            v.extend_from_slice(&s.attachment.to_le_bytes());
+            for f in [s.anchor[0], s.anchor[1], s.span[0], s.span[1]] {
+                v.extend_from_slice(&f.to_le_bytes());
+            }
+            v.extend_from_slice(&(s.tris.len() as u16).to_le_bytes());
+            for t in &s.tris {
+                v.extend_from_slice(&t.to_le_bytes());
+            }
+        }
+        v.extend_from_slice(&(self.colors.len() as u16).to_le_bytes());
+        for c in &self.colors {
+            v.extend_from_slice(&c.to_le_bytes());
+        }
+        v.extend_from_slice(&self.frames.to_le_bytes());
+        v.extend_from_slice(&(self.stream.len() as u32).to_le_bytes());
+        v.extend_from_slice(&self.stream);
+        v
+    }
+
+    pub fn decode(d: &[u8]) -> Option<IdleBake> {
+        let mut r = Bytes { d, at: 0 };
+        if r.u8()? != 2 {
+            return None;
+        }
+        let animation = r.u16()?;
+        let (rate, period, start) = (r.f32()?, r.f32()?, r.f32()?);
+        if !(rate > 0.0 && period > 0.0 && start.is_finite()) {
+            return None;
+        }
+        let n = r.u16()? as usize;
+        let mut shapes = Vec::with_capacity(n);
+        for _ in 0..n {
+            let slot = r.u16()?;
+            let attachment = r.u32()?;
+            let anchor = [r.f32()?, r.f32()?];
+            let span = [r.f32()?, r.f32()?];
+            if !(span[0] > 0.0 && span[1] > 0.0) {
+                return None;
+            }
+            let k = r.u16()? as usize;
+            let mut tris = Vec::with_capacity(k);
+            for _ in 0..k {
+                tris.push(r.u16()?);
+            }
+            shapes.push(IdleShape { slot, attachment, anchor, span, tris });
+        }
+        let nc = r.u16()? as usize;
+        let mut colors = Vec::with_capacity(nc);
+        for _ in 0..nc {
+            colors.push(r.u32()?);
+        }
+        let frames = r.u16()?;
+        let len = r.u32()? as usize;
+        let stream = d.get(r.at..r.at + len)?.to_vec();
+        if r.at + len != d.len() || frames == 0 {
+            return None;
+        }
+        Some(IdleBake { animation, rate, period, start, shapes, colors, frames, stream })
+    }
+}
+
+struct Bytes<'a> {
+    d: &'a [u8],
+    at: usize,
+}
+
+impl Bytes<'_> {
+    fn u8(&mut self) -> Option<u8> {
+        let v = *self.d.get(self.at)?;
+        self.at += 1;
+        Some(v)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        let b = self.d.get(self.at..self.at + 2)?;
+        self.at += 2;
+        Some(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        let b = self.d.get(self.at..self.at + 4)?;
+        self.at += 4;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn f32(&mut self) -> Option<f32> {
+        self.u32().map(f32::from_bits)
+    }
+    fn i16(&mut self) -> Option<i16> {
+        self.u16().map(|v| v as i16)
+    }
+}
+
+/// Decodes an [`IdleBake`] stream frame after frame (the matrices are deltas from the frame
+/// before, so frames come in order; after the last it starts over).
+#[derive(Clone, Debug, Default)]
+pub struct IdleCursor {
+    at: usize,
+    /// The frame `next` decodes.
+    pub frame: u16,
+    last: Vec<Option<[i16; 6]>>,
+    now: Vec<Option<[i16; 6]>>,
+}
+
+impl IdleCursor {
+    pub fn new(shapes: usize) -> IdleCursor {
+        IdleCursor { at: 0, frame: 0, last: alloc::vec![None; shapes], now: alloc::vec![None; shapes] }
+    }
+
+    pub fn rewind(&mut self) {
+        self.at = 0;
+        self.frame = 0;
+        self.last.iter_mut().for_each(|x| *x = None);
+    }
+
+    /// Decodes frame `self.frame` into `out` (replacing it) and moves on; `None` if the stream
+    /// is malformed (the cursor is then rewound).
+    pub fn next(&mut self, bake: &IdleBake, out: &mut Vec<IdleCall>) -> Option<u16> {
+        if self.frame >= bake.frames {
+            self.rewind();
+        }
+        out.clear();
+        let mut r = Bytes { d: &bake.stream, at: self.at };
+        let ok = (|| -> Option<()> {
+            let n = r.u16()? as usize;
+            self.now.iter_mut().for_each(|x| *x = None);
+            for _ in 0..n {
+                let shape = r.u16()?;
+                let color = r.u16()?;
+                let flags = r.u8()?;
+                let base = if flags & 1 != 0 { (*self.last.get(shape as usize)?)? } else { [0; 6] };
+                let mut m0 = [0i16; 6];
+                for k in 0..6 {
+                    m0[k] = base[k].wrapping_add(r.i16()?);
+                }
+                let m1 = if flags & 2 != 0 {
+                    let mut m = [0i16; 6];
+                    for k in 0..6 {
+                        m[k] = m0[k].wrapping_add(r.i16()?);
+                    }
+                    Some(m)
+                } else {
+                    None
+                };
+                *self.now.get_mut(shape as usize)? = Some(m0);
+                out.push(IdleCall { shape, color, m0, m1 });
+            }
+            Some(())
+        })();
+        if ok.is_none() {
+            self.rewind();
+            out.clear();
+            return None;
+        }
+        core::mem::swap(&mut self.last, &mut self.now);
+        let f = self.frame;
+        self.at = r.at;
+        self.frame += 1;
+        Some(f)
+    }
+}
+
 // ---- interactions ----
 
 /// A drag interaction (head pat, eye follow, cheek pinch...): pressing inside the box and
@@ -737,5 +1012,44 @@ impl Interactions {
             mixes.push(ClipMix { name: r.s()?, intro: r.f()?, outro: r.f()? });
         }
         Some(Interactions { layer, default_mix, intro, idle, talks, drags, mixes })
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn a_baked_idle_round_trips_and_decodes_frame_after_frame() {
+        let shape = |n: u16| IdleShape { slot: n, attachment: 7 + n as u32, anchor: [10.5, 20.0], span: [4.0, 9.0], tris: vec![0, 2, n] };
+        let call = |shape: u16, x: i16, m1: Option<[i16; 6]>| IdleCall { shape, color: 1, m0: [x, 2, 3, -4, 5, 6], m1 };
+        let frames = vec![
+            vec![call(0, 100, None), call(1, -7, Some([9; 6]))],
+            vec![call(1, 30, None)],
+            vec![call(0, 101, Some([1, 2, 3, 4, 5, 6])), call(1, 31, None)],
+        ];
+        let stream = IdleBake::encode_frames(&frames, 2);
+        let bake = IdleBake { animation: 3, rate: 30.0, period: 0.1, start: 0.25, shapes: vec![shape(0), shape(1)], colors: vec![0xFFFF_FFFF, 0x8000_00FF], frames: 3, stream };
+        let back = IdleBake::decode(&bake.encode()).unwrap();
+        assert_eq!(back, bake);
+        let mut c = IdleCursor::new(2);
+        let mut out = Vec::new();
+        for round in 0..2 {
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(c.next(&back, &mut out), Some(i as u16), "round {round}");
+                assert_eq!(&out, f);
+            }
+        }
+        // Parameters and matrices invert each other (to the fixed point).
+        let s = shape(0);
+        let m = [0.9f32, -0.3, 120.0, 0.25, 1.1, -40.0];
+        let p = IdleBake::params(&s, &m).map(|v| v as f32);
+        let m2 = IdleBake::matrix(&s, &p);
+        for (tx, ty) in [(10.5, 20.0), (0.0, 0.0), (30.0, 40.0)] {
+            let a = [m[0] * tx + m[1] * ty + m[2], m[3] * tx + m[4] * ty + m[5]];
+            let b = [m2[0] * tx + m2[1] * ty + m2[2], m2[3] * tx + m2[4] * ty + m2[5]];
+            assert!((a[0] - b[0]).abs() < 0.2 && (a[1] - b[1]).abs() < 0.2, "{a:?} {b:?}");
+        }
     }
 }

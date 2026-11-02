@@ -792,16 +792,23 @@ fn watch_tab(s: &UiState) -> View {
         },
         Some(st) if st.flags & 8 != 0 => "正在加载角色…".into(),
         Some(st) if st.frames > 0 && st.fps_x10 > 0 => format!(
-            "{}.{} fps · 动画 {} ms · 绘制 {} ms · GPU {} ms{} · {} 个三角形 · {} 次绘制{} · 手表剩余内存 {:.1} MB{}",
+            "{}.{} fps · 动画 {} ms · 绘制 {} ms（其中驱动 {} ms）· GPU {} ms{} · {} 个三角形 · {} 次绘制{} · 手表剩余内存 {:.1} MB{}",
             st.fps_x10 / 10,
             st.fps_x10 % 10,
             st.update_ms,
             st.draw_ms,
+            st.driver_ms,
             st.gpu_ms,
             if st.ui_ms > 0 { format!(" · 屏幕刷新 {} ms", st.ui_ms) } else { String::new() },
             st.triangles,
             st.calls,
-            if st.flags & 1 != 0 { " · 背景已烘焙" } else { "" },
+            if st.flags & 16 != 0 {
+                " · 待机已预烘焙"
+            } else if st.flags & 1 != 0 {
+                " · 背景已烘焙"
+            } else {
+                ""
+            },
             st.heap_free_kib as f64 / 1024.0,
             selftest_note(st.flags, st.selftest)
         ),

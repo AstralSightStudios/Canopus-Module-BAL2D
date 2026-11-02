@@ -317,6 +317,114 @@ pub struct Renderer {
     pattern_mode: u32,
 }
 
+fn page_sizes(pages: &[Page]) -> [(f32, f32); 16] {
+    core::array::from_fn(|i| pages.get(i).map(|p| (p.buffer.width as f32, p.buffer.height as f32)).unwrap_or((0.0, 0.0)))
+}
+
+/// Submits calls to the driver (the renderer's state, borrowed for one draw).
+struct Sink<'a> {
+    path: &'a mut Box<[u8; 72]>,
+    path_matrix: &'a Box<[f32; 12]>,
+    image_matrix: &'a mut Box<[f32; 12]>,
+    stats: &'a mut Stats,
+    fp32: &'a mut Option<Vec<u32>>,
+    pattern_mode: u32,
+    /// The page whose palette is loaded.
+    clut_page: usize,
+}
+
+impl Sink<'_> {
+    fn submit(&mut self, target: &mut Target, pages: &mut [Page], call: &bal2d_render::Call) {
+        let Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode, clut_page } = self;
+        let pattern_mode = *pattern_mode;
+        let Some(page) = pages.get_mut(call.page as usize) else { return };
+        if let Some(c) = &page.clut {
+            if *clut_page != call.page as usize {
+                fw::vg_set_clut(256, c.as_ptr());
+                *clut_page = call.page as usize;
+            }
+        }
+        let m = &mut ***image_matrix;
+        *m = [call.matrix[0], call.matrix[1], call.matrix[2], call.matrix[3], call.matrix[4], call.matrix[5], 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+        if let Some(rect) = &call.rect {
+            // An atlas rectangle drawn rigidly: an image blit (no path). The rectangle is
+            // the image for the GPU, so the matrix takes rectangle-relative texels.
+            let (rx, ry) = (rect[0] as f32, rect[1] as f32);
+            m[2] += m[0] * rx + m[1] * ry;
+            m[5] += m[3] * rx + m[4] * ry;
+            let timed = stats.calls % 8 == 0;
+            let t0 = if timed { super::lv::now_ms() } else { 0 };
+            let rc = fw::vg_blit_rect(target.buffer.ptr(), page.buffer.ptr(), rect.as_ptr(), m.as_ptr(), blend(call.blend), tint(call.color), FILTER_BILINEAR);
+            if timed {
+                stats.submit_ms += super::lv::now_ms().wrapping_sub(t0) * 8;
+            }
+            stats.calls += 1;
+            if stats.calls % FLUSH_EVERY == 0 {
+                let rc = fw::vg_flush();
+                if rc != 0 {
+                    stats.errors += 1;
+                    stats.last_error = rc;
+                }
+            }
+            if rc != 0 {
+                stats.errors += 1;
+                stats.last_error = rc;
+            }
+            return;
+        }
+        let p = &mut ***path;
+        for (k, v) in call.bounds.iter().enumerate() {
+            p[k * 4..k * 4 + 4].copy_from_slice(&(*v as f32).to_le_bytes());
+        }
+        match fp32.as_mut() {
+            Some(f) => {
+                path_to_fp32(call.path, f);
+                p[40..44].copy_from_slice(&((f.len() * 4) as u32).to_le_bytes());
+                p[44..48].copy_from_slice(&(f.as_ptr() as usize as u32).to_le_bytes());
+            }
+            None => {
+                p[40..44].copy_from_slice(&((call.path.len() * 2) as u32).to_le_bytes());
+                p[44..48].copy_from_slice(&(call.path.as_ptr() as usize as u32).to_le_bytes());
+            }
+        }
+        p[48] = 1; // path changed
+        // Reading the clock costs as much as a small draw (it goes through 64-bit
+        // timer arithmetic): one call in 8 is timed and stands for all 8.
+        let timed = stats.calls % 8 == 0;
+        let t0 = if timed { super::lv::now_ms() } else { 0 };
+        let rc = fw::vg_draw_pattern(
+            target.buffer.ptr(),
+            p.as_mut_ptr(),
+            FILL_NON_ZERO,
+            path_matrix.as_ptr(),
+            page.buffer.ptr(),
+            m.as_ptr(),
+            blend(call.blend),
+            pattern_mode,
+            0,
+            tint(call.color),
+            FILTER_BILINEAR,
+        );
+        if timed {
+            stats.submit_ms += super::lv::now_ms().wrapping_sub(t0) * 8;
+        }
+        stats.calls += 1;
+        // Hand the GPU work as it accumulates, so it rasterizes while the CPU builds the
+        // next paths (it would otherwise start only at `finish`).
+        if stats.calls % FLUSH_EVERY == 0 {
+            let rc = fw::vg_flush();
+            if rc != 0 {
+                stats.errors += 1;
+                stats.last_error = rc;
+            }
+        }
+        if rc != 0 {
+            stats.errors += 1;
+            stats.last_error = rc;
+        }
+    }
+}
+
 fn blend(b: BlendMode) -> u32 {
     match b {
         BlendMode::Normal => BLEND_SRC_OVER,
@@ -422,107 +530,25 @@ impl Renderer {
     /// y' = h/2 - (y - cy) * s.
     pub fn draw(&mut self, target: &mut Target, layer: usize, list: &DrawList, pages: &mut [Page], cam: (f32, f32, f32)) {
         let size = (target.buffer.width as f32, target.buffer.height as f32);
-        let sizes: [(f32, f32); 16] = core::array::from_fn(|i| pages.get(i).map(|p| (p.buffer.width as f32, p.buffer.height as f32)).unwrap_or((0.0, 0.0)));
+        let sizes = page_sizes(pages);
         let page_count = pages.len();
-        let mut clut_page = usize::MAX;
         let Renderer { path, paths, path_matrix, image_matrix, stats, fp32, pattern_mode } = self;
-        let pattern_mode = *pattern_mode;
+        let mut sink = Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode: *pattern_mode, clut_page: usize::MAX };
         let triangles = paths.triangles;
-        paths.draw(
-            layer,
-            list,
-            cam,
-            size,
-            |p| ((p as usize) < page_count.min(16)).then(|| sizes[p as usize]),
-            |call| {
-                let page = &mut pages[call.page as usize];
-                if let Some(c) = &page.clut {
-                    if clut_page != call.page as usize {
-                        fw::vg_set_clut(256, c.as_ptr());
-                        clut_page = call.page as usize;
-                    }
-                }
-                let m = &mut **image_matrix;
-                *m = [call.matrix[0], call.matrix[1], call.matrix[2], call.matrix[3], call.matrix[4], call.matrix[5], 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
-                if let Some(rect) = &call.rect {
-                    // An atlas rectangle drawn rigidly: an image blit (no path). The rectangle is
-                    // the image for the GPU, so the matrix takes rectangle-relative texels.
-                    let (rx, ry) = (rect[0] as f32, rect[1] as f32);
-                    m[2] += m[0] * rx + m[1] * ry;
-                    m[5] += m[3] * rx + m[4] * ry;
-                    let timed = stats.calls % 8 == 0;
-                    let t0 = if timed { super::lv::now_ms() } else { 0 };
-                    let rc = fw::vg_blit_rect(target.buffer.ptr(), page.buffer.ptr(), rect.as_ptr(), m.as_ptr(), blend(call.blend), tint(call.color), FILTER_BILINEAR);
-                    if timed {
-                        stats.submit_ms += super::lv::now_ms().wrapping_sub(t0) * 8;
-                    }
-                    stats.calls += 1;
-                    if stats.calls % FLUSH_EVERY == 0 {
-                        let rc = fw::vg_flush();
-                        if rc != 0 {
-                            stats.errors += 1;
-                            stats.last_error = rc;
-                        }
-                    }
-                    if rc != 0 {
-                        stats.errors += 1;
-                        stats.last_error = rc;
-                    }
-                    return;
-                }
-                let p = &mut **path;
-                for (k, v) in call.bounds.iter().enumerate() {
-                    p[k * 4..k * 4 + 4].copy_from_slice(&(*v as f32).to_le_bytes());
-                }
-                match fp32.as_mut() {
-                    Some(f) => {
-                        path_to_fp32(call.path, f);
-                        p[40..44].copy_from_slice(&((f.len() * 4) as u32).to_le_bytes());
-                        p[44..48].copy_from_slice(&(f.as_ptr() as usize as u32).to_le_bytes());
-                    }
-                    None => {
-                        p[40..44].copy_from_slice(&((call.path.len() * 2) as u32).to_le_bytes());
-                        p[44..48].copy_from_slice(&(call.path.as_ptr() as usize as u32).to_le_bytes());
-                    }
-                }
-                p[48] = 1; // path changed
-                // Reading the clock costs as much as a small draw (it goes through 64-bit
-                // timer arithmetic): one call in 8 is timed and stands for all 8.
-                let timed = stats.calls % 8 == 0;
-                let t0 = if timed { super::lv::now_ms() } else { 0 };
-                let rc = fw::vg_draw_pattern(
-                    target.buffer.ptr(),
-                    p.as_mut_ptr(),
-                    FILL_NON_ZERO,
-                    path_matrix.as_ptr(),
-                    page.buffer.ptr(),
-                    m.as_ptr(),
-                    blend(call.blend),
-                    pattern_mode,
-                    0,
-                    tint(call.color),
-                    FILTER_BILINEAR,
-                );
-                if timed {
-                    stats.submit_ms += super::lv::now_ms().wrapping_sub(t0) * 8;
-                }
-                stats.calls += 1;
-                // Hand the GPU work as it accumulates, so it rasterizes while the CPU builds the
-                // next paths (it would otherwise start only at `finish`).
-                if stats.calls % FLUSH_EVERY == 0 {
-                    let rc = fw::vg_flush();
-                    if rc != 0 {
-                        stats.errors += 1;
-                        stats.last_error = rc;
-                    }
-                }
-                if rc != 0 {
-                    stats.errors += 1;
-                    stats.last_error = rc;
-                }
-            },
-        );
-        stats.triangles += paths.triangles - triangles;
+        paths.draw(layer, list, cam, size, |p| ((p as usize) < page_count.min(16)).then(|| sizes[p as usize]), |call| sink.submit(target, pages, call));
+        sink.stats.triangles += paths.triangles - triangles;
+    }
+
+    /// Draws calls made elsewhere (the baked idle): `produce` gets the page sizes and the
+    /// callback that submits a call, and returns the triangles it drew.
+    pub fn draw_calls(&mut self, target: &mut Target, pages: &mut [Page], produce: impl FnOnce(&dyn Fn(u32) -> Option<(f32, f32)>, &mut dyn FnMut(&bal2d_render::Call)) -> u32) {
+        let sizes = page_sizes(pages);
+        let page_count = pages.len();
+        let Renderer { path, path_matrix, image_matrix, stats, fp32, pattern_mode, .. } = self;
+        let mut sink = Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode: *pattern_mode, clut_page: usize::MAX };
+        let size = |p: u32| ((p as usize) < page_count.min(16)).then(|| sizes[p as usize]);
+        let triangles = produce(&size, &mut |call| sink.submit(target, pages, call));
+        sink.stats.triangles += triangles;
     }
 
     /// Submits what is queued without waiting.

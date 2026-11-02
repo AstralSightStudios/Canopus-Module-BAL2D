@@ -222,6 +222,7 @@ pub fn build(req: &BuildRequest, progress: &mut dyn FnMut(&str, f32)) -> Result<
             bal2d_compiler::Stage::Analysing => "分析动画".to_string(),
             bal2d_compiler::Stage::Textures { page, pages } => format!("提取贴图（第 {page}/{pages} 张）"),
             bal2d_compiler::Stage::Baking => "合成静态背景".to_string(),
+            bal2d_compiler::Stage::Idle => "预烘焙待机动画".to_string(),
             bal2d_compiler::Stage::Writing => "写入角色包".to_string(),
         };
         progress(&label, f * 0.95);

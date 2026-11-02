@@ -119,6 +119,10 @@ pub struct Runtime {
     pub connect: i32,
     /// The last frame drew the baked background.
     pub bake_active: bool,
+    /// The last frame was drawn from the baked idle.
+    pub idle_active: bool,
+    /// Development: `dev-noidle` turns the baked idle off (A/B timing).
+    pub idle_off: bool,
     /// No frame starts before this (duty-cycle limit).
     idle_until: u32,
     /// The last drawn frame: when it started and ended; `settling` until the first timer call
@@ -172,6 +176,8 @@ pub fn rt() -> &'static mut Runtime {
                 fluent: false,
                 connect: 1,
                 bake_active: false,
+                idle_active: false,
+                idle_off: false,
                 idle_until: 0,
                 frame_start: 0,
                 frame_end: 0,
@@ -224,6 +230,7 @@ pub fn stats() -> bal2d_proto::Stats {
         heap_free_kib: heap_free_kb(),
         pack: r.pack.as_str().split('/').next_back().map(connect::file_id).filter(|_| !r.pack.is_empty()).unwrap_or(0),
         flags: r.bake_active as u32
+            | (r.idle_active as u32) << 4
             | (v.attached() as u32) << 1
             | (v.visible() as u32) << 2
             | (r.loader.is_some() as u32) << 3
@@ -314,14 +321,19 @@ pub fn status_text() -> String {
             _ => "流畅优先",
         };
         text += &alloc::format!(
-            "{}.{} fps · 画质{}\n动画 {} ms · 绘制 {} ms\nGPU {} ms{}\n{} 三角形 · {} 次绘制\n",
+            "{}.{} fps · 画质{}\n动画 {} ms · 绘制 {} ms\n驱动 {} ms · GPU {} ms{}\n{} 三角形 · {} 次绘制\n",
             r.perf.fps_x10 / 10,
             r.perf.fps_x10 % 10,
             quality,
             r.perf.update_ms,
             r.perf.draw_ms,
+            r.perf.submit_ms,
             r.perf.gpu_ms,
-            if r.bake_active { " · 背景已烘焙" } else { "" },
+            match (r.bake_active, r.idle_active) {
+                (_, true) => " · 待机已预烘焙",
+                (true, false) => " · 背景已烘焙",
+                _ => "",
+            },
             r.perf.triangles,
             r.perf.calls,
         );
@@ -789,11 +801,8 @@ extern "C" fn frame(timer: *mut c_void) {
     }
     if r.selftest.is_none() {
         let t = selftest::run(&mut r.renderer);
-        // Development: `dev-refits` (a digit) sets the clustering refits, for A/B timing.
-        if let Some(n) = Fs::read("dev-refits", 4).and_then(|b| b.first().copied()).filter(|c| c.is_ascii_digit()) {
-            r.renderer.paths.refits = n - b'0';
-        }
-        trace(&alloc::format!("self-test flags {:#x}, region blits {}, refits {}", t.flags, r.renderer.paths.blits, r.renderer.paths.refits));
+        r.idle_off = Fs::read("dev-noidle", 4).is_some();
+        trace(&alloc::format!("self-test flags {:#x}, region blits {}, baked idle off {}", t.flags, r.renderer.paths.blits, r.idle_off));
         r.selftest = Some(t);
         return;
     }
@@ -827,8 +836,11 @@ extern "C" fn frame(timer: *mut c_void) {
         r.last_ms = now;
         return;
     }
-    // Touches, in layer pixels.
+    // Touches, in layer pixels. A finger ends the baked idle: the skeletons catch up first.
     let q = core::mem::take(&mut v.touches);
+    if q.len > 0 {
+        lobby.resume();
+    }
     for e in &q.items[..q.len] {
         let kind = match e.kind {
             0 => Touch::Down,
@@ -844,7 +856,15 @@ extern "C" fn frame(timer: *mut c_void) {
         lobby.touch(kind, (e.x + v.rect.0) as f32, (e.y + v.rect.1) as f32);
     }
     let t0 = lv::now_ms();
-    lobby.update(dt_ms as f32 / 1000.0);
+    // Only the idle loops playing: drawn from their bakes, nothing to animate.
+    let baked = !r.idle_off && lobby.idle_ready();
+    if baked {
+        lobby.advance_idle(dt_ms as f32 / 1000.0);
+    } else {
+        lobby.resume();
+        lobby.update(dt_ms as f32 / 1000.0);
+    }
+    r.idle_active = baked;
     lobby.notices.clear();
     let t1 = lv::now_ms();
     let (fw_w, fw_h) = (lobby.width, lobby.height);
@@ -868,7 +888,12 @@ extern "C" fn frame(timer: *mut c_void) {
     let (ox, oy) = (v.rect.0 as f32, v.rect.1 as f32);
     let cx = cam.cx + (ox + target.buffer.width as f32 * 0.5 - fw_w * 0.5) / cam.scale;
     let cy = cam.cy - (oy + target.buffer.height as f32 * 0.5 - fw_h * 0.5) / cam.scale;
+    let size = (target.buffer.width as f32, target.buffer.height as f32);
     for li in 0..lobby.layers.len() {
+        if baked {
+            r.renderer.draw_calls(target, &mut r.pages[li], |sizes, emit| lobby.draw_idle(li, (ox, oy), size, sizes, emit));
+            continue;
+        }
         lobby.draw_list(li, &mut r.list);
         r.renderer.draw(target, li, &r.list, &mut r.pages[li], (cx, cy, cam.scale));
     }
