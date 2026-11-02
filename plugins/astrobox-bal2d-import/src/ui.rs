@@ -20,6 +20,7 @@ const EV_CLEAR: &str = "action:assets.clear";
 const EV_NAME: &str = "input:name";
 const EV_ZOOM: &str = "input:zoom";
 const EV_QUALITY: &str = "input:quality";
+const EV_IDLE: &str = "input:idle";
 const EV_BUILD: &str = "action:build";
 const EV_INSTALL: &str = "action:install";
 const EV_CANCEL: &str = "action:cancel";
@@ -187,6 +188,12 @@ pub async fn on_event(event: &str, payload: &str) {
                 s.built = None;
             });
         }
+        EV_IDLE => {
+            state::with_state(|s| {
+                s.idle_mode = value.to_string();
+                s.built = None;
+            });
+        }
         EV_DEVICE => {
             state::with_state(|s| {
                 if s.selected_addr != value {
@@ -350,6 +357,7 @@ async fn build() {
         screen: size,
         zoom: s.zoom,
         high_quality: s.high_quality,
+        idle_mode: s.idle_mode.clone(),
         framing: s.framing,
     };
     // Each step is shown as it starts (the compile runs in this call; the UI is redrawn from here).
@@ -625,6 +633,21 @@ fn import_tab(s: &UiState) -> View {
                         &[("standard", "标准（推荐）"), ("high", "高清（占用更多手表内存）")],
                     ),
                 )),
+        )
+        .child(
+            row().child(field(
+                "待机动画",
+                select(
+                    EV_IDLE,
+                    if s.idle_mode.is_empty() { "balanced" } else { &s.idle_mode },
+                    &[
+                        ("balanced", "预烘焙 · 均衡（推荐）"),
+                        ("fine", "预烘焙 · 精细（手表绘制次数更多）"),
+                        ("fast", "预烘焙 · 最流畅（细节略软）"),
+                        ("off", "不预烘焙（角色包更小，手表逐帧计算）"),
+                    ],
+                ),
+            )),
         )
         .child(row().child(button(if s.busy { "正在编译…" } else { "编译并预览" }, EV_BUILD, "solid").disabled_if(!can_build)))
         .maybe(s.progress.as_ref().map(|(label, percent)| {

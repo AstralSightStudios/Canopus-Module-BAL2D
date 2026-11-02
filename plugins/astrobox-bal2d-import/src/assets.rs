@@ -190,6 +190,8 @@ pub struct BuildRequest {
     pub screen: (u32, u32),
     pub zoom: u32,
     pub high_quality: bool,
+    /// Baked idle: "off", "fine", "fast", else balanced.
+    pub idle_mode: String,
     /// From the framing editor: a camera per phase (else the default framing at `zoom`).
     pub framing: Option<crate::framing::Framing>,
 }
@@ -207,6 +209,12 @@ pub fn build(req: &BuildRequest, progress: &mut dyn FnMut(&str, f32)) -> Result<
         format,
         budget: budget(req.high_quality),
         name: name.clone(),
+        idle: req.idle_mode != "off",
+        idle_tolerance: match req.idle_mode.as_str() {
+            "fine" => 0.75,
+            "fast" => 1.25,
+            _ => 1.0,
+        },
         camera: req.framing.and_then(|f| f[bal2d_pack::phase::IDLE as usize]),
         phase_cameras: req
             .framing
@@ -242,7 +250,7 @@ pub fn build(req: &BuildRequest, progress: &mut dyn FnMut(&str, f32)) -> Result<
         bytes.len() as f64 / 1024.0,
         original as f64 / 1048576.0,
         if report.budget_scale < 0.999 { format!(" · 为适配手表内存缩小到 {:.0}%", report.budget_scale * 100.0) } else { String::new() }
-    );
+    ) + &idle_note(&report.idle, opts.idle);
     // The same lobby always lands on the same id, so sending it again replaces it on the watch.
     let id = bal2d_proto::crc32(layers.last().map(|l| l.name.as_bytes()).unwrap_or(b"")) | 1;
     Ok(Built {
@@ -253,6 +261,19 @@ pub fn build(req: &BuildRequest, progress: &mut dyn FnMut(&str, f32)) -> Result<
         preview: format!("data:image/png;base64,{}", BASE64.encode(png)),
         summary,
     })
+}
+
+/// What the summary says about the baked idle.
+fn idle_note(r: &bal2d_compiler::idle::IdleReport, wanted: bool) -> String {
+    if !wanted {
+        return String::new();
+    }
+    if r.layers.is_empty() {
+        return if r.skipped.contains("clipping") { " · 待机动画含裁剪，未预烘焙".into() } else { " · 待机动画未预烘焙".into() };
+    }
+    let calls: f32 = r.layers.iter().map(|l| l.1).sum();
+    let fps = r.rate.round() as u32;
+    format!(" · 待机已预烘焙（约 {calls:.0} 次绘制/帧，最高 {fps} 帧/秒采样）")
 }
 
 #[cfg(test)]
@@ -310,7 +331,7 @@ mod tests {
             recognise(&name, data, &mut assets);
         }
         let t0 = std::time::Instant::now();
-        let built = build(&BuildRequest { assets, name: String::new(), screen: (336, 480), zoom: 100, high_quality: false, framing: None }, &mut |_, _| {}).unwrap();
+        let built = build(&BuildRequest { assets, name: String::new(), screen: (336, 480), zoom: 100, high_quality: false, idle_mode: String::new(), framing: None }, &mut |_, _| {}).unwrap();
         eprintln!("built in {:?}: {}", t0.elapsed(), built.summary);
         assert!(built.bytes.starts_with(b"BL2D"));
         assert!(built.preview.starts_with("data:image/png;base64,"));

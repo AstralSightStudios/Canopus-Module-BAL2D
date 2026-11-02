@@ -111,8 +111,9 @@ pub struct Options {
     /// Mesh simplification tolerance in target pixels (0: off): interior vertices go while no
     /// point of the mesh moves further than this in any simulated frame (see `simplify`).
     pub simplify: f32,
-    /// Bake the idle loops into GPU calls (see `idle`).
+    /// Bake the idle loops into GPU calls (see `idle`), grouped within this many target pixels.
     pub idle: bool,
+    pub idle_tolerance: f32,
     /// Pack size the idle bake may grow the pack to (it is baked less often a second if the
     /// pack would be larger; packs go to the watch at some 40-60 KB/s).
     pub max_pack_bytes: usize,
@@ -138,6 +139,7 @@ impl Default for Options {
             keep_layers: false,
             simplify: 0.5,
             idle: true,
+            idle_tolerance: idle::TOLERANCE,
             max_pack_bytes: 2_000_000,
         }
     }
@@ -898,7 +900,7 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
     let probe = bal2d_pack::write(&header, &sections, 1);
     let mut rate = idle::RATE;
     let bytes = loop {
-        let (bakes, mut rep) = idle::bake(&probe, rate);
+        let (bakes, mut rep) = idle::bake(&probe, rate, opts.idle_tolerance);
         rep.rate = rate;
         let mut with = sections.clone();
         for (li, b) in bakes {

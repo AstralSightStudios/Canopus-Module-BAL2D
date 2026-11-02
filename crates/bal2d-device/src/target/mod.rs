@@ -154,6 +154,9 @@ pub struct Runtime {
     breather_at: u32,
     /// How late the frame timer fires past the planned start (ms, running average).
     late_avg: u32,
+    /// Development (`dev-pacetrace`): frames whose pacing is still to be traced.
+    pace_trace: u32,
+    pace_traced: bool,
     /// A frame's whole cost, its own plus the UI work it causes (ms, smoothed), and when the
     /// clustering tolerance last changed (see `adapt_quality`).
     busy_ms: u32,
@@ -203,6 +206,8 @@ pub fn rt() -> &'static mut Runtime {
                 bt_up_at: 0,
                 breather_at: 0,
                 late_avg: 0,
+                pace_trace: 0,
+                pace_traced: false,
                 quality_changed: 0,
                 pressed: false,
             });
@@ -813,6 +818,10 @@ extern "C" fn frame(timer: *mut c_void) {
         }
         r.idle_until = until;
         r.window.idle_ms += until.wrapping_sub(now);
+        if r.pace_trace > 0 {
+            r.pace_trace -= 1;
+            trace(&alloc::format!("pace start {} end {} settle {} until {} rest {} late {}", r.frame_start, r.frame_end, now, until, rest, r.late_avg));
+        }
     }
     if (now.wrapping_sub(r.idle_until) as i32) < 0 {
         let left = r.idle_until.wrapping_sub(now);
@@ -834,6 +843,7 @@ extern "C" fn frame(timer: *mut c_void) {
     if r.selftest.is_none() {
         let t = selftest::run(&mut r.renderer);
         r.idle_off = Fs::read("dev-noidle", 4).is_some();
+        r.pace_traced = Fs::read("dev-pacetrace", 4).is_none();
         trace(&alloc::format!("self-test flags {:#x}, region blits {}, baked idle off {}", t.flags, r.renderer.paths.blits, r.idle_off));
         r.selftest = Some(t);
         return;
@@ -931,6 +941,11 @@ extern "C" fn frame(timer: *mut c_void) {
     let t3 = lv::now_ms();
     r.frame_start = now;
     r.frame_end = t3;
+    // Development: trace the pacing of 90 frames once the lobby has played a while.
+    if !r.pace_traced && r.perf.frames > 900 {
+        r.pace_traced = true;
+        r.pace_trace = 90;
+    }
     r.settling = true;
     r.idle_until = t3;
     set_timer_period(timer, 1);

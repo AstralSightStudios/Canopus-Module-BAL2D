@@ -96,6 +96,8 @@ pub struct UiState {
     /// Framing zoom in percent.
     pub zoom: u32,
     pub high_quality: bool,
+    /// Baked idle: "off", "fine", "balanced" (default) or "fast" (grouping tolerance).
+    pub idle_mode: String,
     pub built: Option<Built>,
     pub busy: bool,
     /// While compiling: what it is doing and the percent done.

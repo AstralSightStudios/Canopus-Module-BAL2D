@@ -18,10 +18,16 @@ fn main() {
         let mut fb = bal2d_preview::Framebuffer::new(w, h, [0.0; 4]);
         let mut slots = Vec::new();
         let mut blends = Vec::new();
+        let mut opaque = 0usize;
         pv.idle_calls(li, |call, tex| {
             slots.push(bal2d_preview::raster::draw_call(&mut fb, call, tex));
             blends.push((call.blend, call.color[3]));
+            let (n, lo) = bal2d_preview::raster::call_coverage((w, h), call, tex);
+            if lo >= 0.999 && call.blend == bal2d_spine::BlendMode::Normal {
+                opaque += n;
+            }
         });
+        println!("layer {li}: {:.2} screens drawn by fully opaque calls", opaque as f32 / (w * h) as f32);
         // Per slot, through the bake's shapes in call order.
         let cur: Vec<u16> = {
             let l = pv.lobby.idle[li].as_ref().unwrap();

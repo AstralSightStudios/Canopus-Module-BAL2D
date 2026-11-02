@@ -292,6 +292,9 @@ fn compile(args: &[String]) {
         opts.simplify = t.parse().unwrap();
     }
     opts.idle = !args.iter().any(|a| a == "--no-idle");
+    if let Some(t) = arg(args, "--idle-tolerance") {
+        opts.idle_tolerance = t.parse().unwrap();
+    }
     opts.format = match arg(args, "--format").as_deref() {
         Some("argb4444") => bal2d_pack::PageFormat::Argb4444,
         Some("index8") => bal2d_pack::PageFormat::Index8,

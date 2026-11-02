@@ -192,6 +192,49 @@ pub fn draw_call(fb: &mut Framebuffer, call: &bal2d_render::Call, tex: &Texture)
     n
 }
 
+/// Pixels a call covers on a target of `size` and the least alpha its texture gives them (tint
+/// included): 1.0 means the call could be drawn without blending.
+pub fn call_coverage(size: (usize, usize), call: &bal2d_render::Call, tex: &Texture) -> (usize, f32) {
+    let m = call.matrix;
+    let det = m[0] * m[4] - m[1] * m[3];
+    if det.abs() < 1e-12 {
+        return (0, 1.0);
+    }
+    let (pw, ph) = (tex.width as f32, tex.height as f32);
+    let inv = [m[4] / det / pw, -m[1] / det / pw, -m[3] / det / ph, m[0] / det / ph];
+    let k = 1.0 / bal2d_render::PATH_SCALE;
+    let (mut n, mut lo) = (0usize, 1.0f32);
+    for t in call.path.chunks_exact(10) {
+        if t[0] != bal2d_render::PATH_MOVE as i16 {
+            break;
+        }
+        let p = [[t[1] as f32 * k, t[2] as f32 * k], [t[4] as f32 * k, t[5] as f32 * k], [t[7] as f32 * k, t[8] as f32 * k]];
+        let area = edge(p[0], p[1], p[2]);
+        if area.abs() < 1e-9 {
+            continue;
+        }
+        let ccw = area > 0.0;
+        let x0 = p.iter().map(|q| q[0]).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
+        let x1 = (p.iter().map(|q| q[0]).fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(size.0);
+        let y0 = p.iter().map(|q| q[1]).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
+        let y1 = (p.iter().map(|q| q[1]).fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(size.1);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let c = [x as f32 + 0.5, y as f32 + 0.5];
+                let w = [edge(p[1], p[2], c), edge(p[2], p[0], c), edge(p[0], p[1], c)];
+                if !(if ccw { w.iter().all(|v| *v >= 0.0) } else { w.iter().all(|v| *v <= 0.0) }) {
+                    continue;
+                }
+                let (dx, dy) = (c[0] - m[2], c[1] - m[5]);
+                let a = tex.sample(inv[0] * dx + inv[1] * dy, inv[2] * dx + inv[3] * dy)[3] * call.color[3];
+                lo = lo.min(a);
+                n += 1;
+            }
+        }
+    }
+    (n, lo)
+}
+
 fn draw_exact(fb: &mut Framebuffer, list: &DrawList, pages: &[Texture], cam: Camera) -> Stats {
     let mut stats = Stats::default();
     let (w2, h2) = (fb.width as f32 * 0.5, fb.height as f32 * 0.5);

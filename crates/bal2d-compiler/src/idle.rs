@@ -202,9 +202,10 @@ impl Span<'_> {
     }
 }
 
-/// Bakes every layer's idle loop of the pack `pack` at up to `max_rate` frames a second; empty
+/// Bakes every layer's idle loop of the pack `pack` at up to `max_rate` frames a second, groups
+/// within `tolerance` target pixels; empty
 /// (with the reason) when the lobby does not settle into idle loops that can be baked.
-pub fn bake(pack: &[u8], max_rate: f32) -> (Vec<(u16, IdleBake)>, IdleReport) {
+pub fn bake(pack: &[u8], max_rate: f32, tolerance: f32) -> (Vec<(u16, IdleBake)>, IdleReport) {
     let mut report = IdleReport::default();
     let Ok((mut lobby, pages)) = Lobby::load(pack) else {
         report.skipped = "pack does not load".into();
@@ -255,7 +256,7 @@ pub fn bake(pack: &[u8], max_rate: f32) -> (Vec<(u16, IdleBake)>, IdleReport) {
     drop(idle);
     let (w, h) = (lobby.width, lobby.height);
     let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    let tol = env("BAL2D_IDLE_TOL", TOLERANCE) - QUANT_MARGIN;
+    let tol = env("BAL2D_IDLE_TOL", tolerance) - QUANT_MARGIN;
     let rate_max = env("BAL2D_IDLE_RATE", max_rate);
     let mut list = DrawList::default();
     let mut out = Vec::new();
