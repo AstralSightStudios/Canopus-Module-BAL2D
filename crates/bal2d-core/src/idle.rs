@@ -113,6 +113,11 @@ impl IdleLayer {
         true
     }
 
+    /// The shapes of the frame drawn last, in call order (for tools).
+    pub fn current_shapes(&self) -> Vec<u16> {
+        self.cur.iter().map(|c| c.shape).collect()
+    }
+
     /// Decodes on into `cur` until it holds frame `f`.
     fn decode_to(&mut self, f: u16) -> bool {
         loop {

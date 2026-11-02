@@ -16,7 +16,7 @@ use bal2d_pack::{IdleBake, IdleCall, IdleShape};
 use bal2d_render::{DrawList, Tri};
 
 /// Tolerance of the baked grouping (target pixels), less a margin for the fixed-point matrices.
-pub const TOLERANCE: f32 = 0.75;
+pub const TOLERANCE: f32 = 1.0;
 const QUANT_MARGIN: f32 = 0.06;
 /// Samples per second, and the most frames one layer's loop gets (longer loops are sampled
 /// less often). At `HOLD_RATE` and above, groups need only fit their own frame: the watch

@@ -133,10 +133,14 @@ pub struct Stats {
     /// The GPU self-test's probes that passed (bit per probe, see the module's selftest.rs; 0
     /// from older modules or before it ran).
     pub selftest: u32,
+    /// Average milliseconds per frame left idle on purpose (pacing), and how late the frame
+    /// timer fired past that (0 from older modules).
+    pub idle_ms: u32,
+    pub late_ms: u32,
 }
 
 impl Stats {
-    const WORDS: usize = 14;
+    const WORDS: usize = 16;
     /// Words every reply has (`ui_ms` came later).
     const REQUIRED: usize = 12;
 
@@ -156,6 +160,8 @@ impl Stats {
             self.flags,
             self.ui_ms,
             self.selftest,
+            self.idle_ms,
+            self.late_ms,
         ]
     }
 
@@ -175,6 +181,8 @@ impl Stats {
             flags: w[11],
             ui_ms: w[12],
             selftest: w[13],
+            idle_ms: w[14],
+            late_ms: w[15],
         }
     }
 }

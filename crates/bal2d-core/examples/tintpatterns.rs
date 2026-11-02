@@ -36,5 +36,12 @@ fn main() {
         *patterns.entry(v.2.clone()).or_default() += 1;
     }
     let animated = patterns.keys().filter(|p| p.iter().any(|c| *c != p[0])).count();
+    let mut all: HashMap<Vec<[u8; 4]>, usize> = HashMap::new();
+    for v in slots.values() {
+        *all.entry(v.2.clone()).or_default() += 1;
+    }
+    let mut counts: Vec<usize> = all.values().copied().collect();
+    counts.sort_unstable_by(|a, b| b.cmp(a));
+    println!("all {} slots: {} distinct tint sequences; largest groups {:?}", slots.len(), all.len(), &counts[..counts.len().min(10)]);
     println!("{} slots drawn, {} never move; their tint sequences: {} distinct ({} change over the loop); {} frames", slots.len(), still.len(), patterns.len(), animated, frames);
 }

@@ -122,12 +122,11 @@ impl PackPreview {
         }
         let c = self.lobby.camera;
         let cam = Camera { cx: c.cx, cy: c.cy, scale: c.scale };
-        let baked = self.use_idle && self.lobby.idle_ready();
         for li in 0..self.lobby.layers.len() {
             if mask & (1 << li) == 0 {
                 continue;
             }
-            if baked {
+            if self.use_idle && self.lobby.layer_idle_ready(li) {
                 let pages = &self.pages[li];
                 let size = |p: u32| pages.get(p as usize).map(|t| (t.width as f32, t.height as f32));
                 self.lobby.draw_idle(li, (0.0, 0.0), (w as f32, h as f32), &size, &mut |call| {

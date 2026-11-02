@@ -48,6 +48,21 @@ fn main() {
         pv.advance(period / n as f32);
     }
     println!("PSNR baked vs live: mean {:.2} dB, worst {:.2} dB at +{:.2} s", sum / n as f64, worst.0, worst.3);
+    // During a talk: the layers not talking stay on their bakes.
+    pv.lobby.tap();
+    let mut talk = (0.0, 0, 0);
+    for _ in 0..12 {
+        pv.advance(0.25);
+        let ready = (0..pv.lobby.layers.len()).filter(|&i| pv.lobby.layer_idle_ready(i)).count();
+        pv.use_idle = false;
+        let live = pv.render();
+        pv.use_idle = true;
+        let mixed = pv.render();
+        talk.0 += psnr(&live, &mixed);
+        talk.1 += 1;
+        talk.2 += ready;
+    }
+    println!("talk: PSNR {:.2} dB with {:.1} of {} layers on bakes", talk.0 / talk.1 as f64, talk.2 as f32 / talk.1 as f32, pv.lobby.layers.len());
     for li in 0..pv.lobby.layers.len() {
         pv.use_idle = false;
         let live = pv.render_layers(1 << li);

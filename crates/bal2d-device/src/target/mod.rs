@@ -43,9 +43,15 @@ static BT_LINK: AtomicU8 = AtomicU8::new(0xFF);
 /// turns; long gaps now and then leave it room beyond the gaps between frames. A link counts as
 /// settled 10 s after it came up. (Mirage's failures to connect under a heavy lobby turned out to
 /// be the emulator's own lock starving its Bluetooth socket, fixed there.)
+/// Light frames (a frame + redraw under `BREATHER_BUSY_MS`, a baked idle) leave the UI task
+/// enough room between them: no breathers then (they showed as a hitch every two seconds).
 const BREATHER_MS: u32 = 250;
 const BREATHER_EVERY_MS: u32 = 2000;
+const BREATHER_BUSY_MS: u32 = 45;
 const LINK_SETTLE_MS: u32 = 10_000;
+/// The frame timer fires a few milliseconds late (the UI loop's own granularity): it is asked for
+/// this much less, and the frame rate cap allows for the lateness measured.
+const TIMER_EARLY_MS: u32 = 3;
 /// Frame + redraw (ms) above which half of it, not a third, stays idle.
 const HEAVY_BUSY_MS: u32 = 80;
 /// "Smoothness first" (`options::FLUENT`): the idle share between frames, and its floor (ms).
@@ -86,6 +92,9 @@ pub struct Perf {
     pub errors: u32,
     pub last_error: i32,
     pub fps_x10: u32,
+    /// Left idle on purpose after a frame, and how late the timer then fired.
+    pub idle_ms: u32,
+    pub late_ms: u32,
 }
 
 pub struct Runtime {
@@ -141,6 +150,8 @@ pub struct Runtime {
     gate_was: u8,
     bt_up_at: u32,
     breather_at: u32,
+    /// How late the frame timer fires past the planned start (ms, running average).
+    late_avg: u32,
     /// A frame's whole cost, its own plus the UI work it causes (ms, smoothed), and when the
     /// clustering tolerance last changed (see `adapt_quality`).
     busy_ms: u32,
@@ -189,6 +200,7 @@ pub fn rt() -> &'static mut Runtime {
                 gate_was: 0,
                 bt_up_at: 0,
                 breather_at: 0,
+                late_avg: 0,
                 quality_changed: 0,
                 pressed: false,
             });
@@ -238,6 +250,8 @@ pub fn stats() -> bal2d_proto::Stats {
             | r.selftest.map(|t| t.flags).unwrap_or(0),
         ui_ms: r.refresh_ms,
         selftest: r.selftest.map_or(0, |t| t.passed),
+        idle_ms: p.idle_ms,
+        late_ms: p.late_ms,
     }
 }
 
@@ -321,7 +335,7 @@ pub fn status_text() -> String {
             _ => "流畅优先",
         };
         text += &alloc::format!(
-            "{}.{} fps · 画质{}\n动画 {} ms · 绘制 {} ms\n驱动 {} ms · GPU {} ms{}\n{} 三角形 · {} 次绘制\n",
+            "{}.{} fps · 画质{}\n动画 {} ms · 绘制 {} ms\n驱动 {} ms · GPU {} ms\n屏幕刷新 {} ms{}\n{} 三角形 · {} 次绘制\n",
             r.perf.fps_x10 / 10,
             r.perf.fps_x10 % 10,
             quality,
@@ -329,6 +343,7 @@ pub fn status_text() -> String {
             r.perf.draw_ms,
             r.perf.submit_ms,
             r.perf.gpu_ms,
+            r.refresh_ms,
             match (r.bake_active, r.idle_active) {
                 (_, true) => " · 待机已预烘焙",
                 (true, false) => " · 背景已烘焙",
@@ -773,23 +788,27 @@ extern "C" fn frame(timer: *mut c_void) {
         }
         r.bt_was = link;
         let settled = link == 1 && now.wrapping_sub(r.bt_up_at) >= LINK_SETTLE_MS;
-        if !settled && now.wrapping_sub(r.breather_at) >= BREATHER_EVERY_MS {
+        if !settled && r.busy_ms >= BREATHER_BUSY_MS && now.wrapping_sub(r.breather_at) >= BREATHER_EVERY_MS {
             r.breather_at = now;
             rest = rest.max(BREATHER_MS);
         }
         let mut until = now.wrapping_add(rest);
-        // And no faster than the frame rate.
-        let earliest = r.frame_start.wrapping_add(FRAME_MS);
+        // And no faster than the frame rate (as the timer will really fire).
+        let earliest = r.frame_start.wrapping_add(FRAME_MS.saturating_sub(r.late_avg.min(FRAME_MS / 4)));
         if (earliest.wrapping_sub(until) as i32) > 0 {
             until = earliest;
         }
         r.idle_until = until;
+        r.window.idle_ms += until.wrapping_sub(now);
     }
     if (now.wrapping_sub(r.idle_until) as i32) < 0 {
-        set_timer_period(timer, r.idle_until.wrapping_sub(now));
+        let left = r.idle_until.wrapping_sub(now);
+        set_timer_period(timer, if left > TIMER_EARLY_MS + 1 { left - TIMER_EARLY_MS } else { 1 });
         return;
     }
     set_timer_period(timer, FRAME_MS);
+    let late = now.wrapping_sub(r.idle_until).min(1000);
+    r.late_avg = (r.late_avg * 7 + late) / 8;
     // While a pack arrives, two frames a second: the transfer gets the CPU.
     if connect::receiving() && now.wrapping_sub(r.last_ms) < 500 {
         return;
@@ -856,15 +875,9 @@ extern "C" fn frame(timer: *mut c_void) {
         lobby.touch(kind, (e.x + v.rect.0) as f32, (e.y + v.rect.1) as f32);
     }
     let t0 = lv::now_ms();
-    // Only the idle loops playing: drawn from their bakes, nothing to animate.
-    let baked = !r.idle_off && lobby.idle_ready();
-    if baked {
-        lobby.advance_idle(dt_ms as f32 / 1000.0);
-    } else {
-        lobby.resume();
-        lobby.update(dt_ms as f32 / 1000.0);
-    }
-    r.idle_active = baked;
+    // Layers that only play their idle loop are drawn from their bakes, not animated.
+    let baked = lobby.update_with(dt_ms as f32 / 1000.0, !r.idle_off);
+    r.idle_active = baked != 0;
     lobby.notices.clear();
     let t1 = lv::now_ms();
     let (fw_w, fw_h) = (lobby.width, lobby.height);
@@ -890,7 +903,7 @@ extern "C" fn frame(timer: *mut c_void) {
     let cy = cam.cy - (oy + target.buffer.height as f32 * 0.5 - fw_h * 0.5) / cam.scale;
     let size = (target.buffer.width as f32, target.buffer.height as f32);
     for li in 0..lobby.layers.len() {
-        if baked {
+        if baked & (1 << li.min(31)) != 0 {
             r.renderer.draw_calls(target, &mut r.pages[li], |sizes, emit| lobby.draw_idle(li, (ox, oy), size, sizes, emit));
             continue;
         }
@@ -919,6 +932,7 @@ extern "C" fn frame(timer: *mut c_void) {
     w.triangles = r.renderer.stats.triangles;
     w.calls = r.renderer.stats.calls;
     w.submit_ms += r.renderer.stats.submit_ms;
+    w.late_ms += late;
     w.errors += r.renderer.stats.errors;
     if r.renderer.stats.errors != 0 {
         w.last_error = r.renderer.stats.last_error;
@@ -937,6 +951,8 @@ extern "C" fn frame(timer: *mut c_void) {
             errors: r.perf.errors + w.errors,
             last_error: if w.errors != 0 { w.last_error } else { r.perf.last_error },
             fps_x10: w.frames * 10_000 / span,
+            idle_ms: w.idle_ms / n,
+            late_ms: w.late_ms / n,
         };
         if r.perf.frames < 400 || r.perf.frames % 300 < 31 {
             trace(&alloc::format!(
