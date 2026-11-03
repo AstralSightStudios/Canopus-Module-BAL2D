@@ -43,11 +43,15 @@ fn descriptor_init(index: usize) {
         (*d).on_signal = on_signal as *const () as *mut core::ffi::c_void;
         (*d).on_create = on_create as *const () as *mut core::ffi::c_void;
         (*d).on_resume = on_resume as *const () as *mut core::ffi::c_void;
-        // Band 10 Pro: +0x58 START, +0x5c PAUSE, +0x60 STOP, +0x64 UI_DESTROY.
-        (*d).on_destroy = on_pause as *const () as *mut core::ffi::c_void;
-        (*d).extension_callback_100 = on_destroy as *const () as *mut core::ffi::c_void;
+        // Band 10 Pro: +0x58 START (right after create), +0x5c PAUSE, +0x60 STOP, +0x64 UI_DESTROY.
+        (*d).on_pause = on_pause as *const () as *mut core::ffi::c_void;
+        (*d).on_ui_destroy = on_destroy as *const () as *mut core::ffi::c_void;
     }
 }
+
+// The firmware dispatches by offset: the SDK's names must stay on these slots.
+const _: () = assert!(core::mem::offset_of!(firmware_page_descriptor, on_pause) == 0x5c);
+const _: () = assert!(core::mem::offset_of!(firmware_page_descriptor, on_ui_destroy) == 0x64);
 
 /// # Safety
 /// Called by the Supervisor on the serialized UI owner with the live context.
