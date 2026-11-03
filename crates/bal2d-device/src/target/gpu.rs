@@ -63,6 +63,17 @@ pub static BAD_FORMATS: AtomicU32 = AtomicU32::new(0);
 pub fn uncached(addr: usize) -> Option<usize> {
     (0x3C00_0000..0x3E00_0000).contains(&addr).then_some(addr - 0x0400_0000)
 }
+
+/// The address the GPU is given for CPU memory at `addr`: PSRAM through its non-cached alias.
+/// On the watch the GPU's accesses to the cached alias go through the CPU's cache: what it
+/// writes there stays in dirty lines (the third real-watch log: nothing of a finished draw in
+/// memory, all of it after a cache flush) and what it reads competes with the CPU for a small
+/// cache. The vendor driver keeps its own GPU memory (command and tessellation buffers) in the
+/// non-cached alias too. CPU writes still go through the cache and are cleaned before the GPU
+/// reads them (`GpuMem::clean`).
+pub fn gpu_addr(addr: usize) -> u32 {
+    uncached(addr).unwrap_or(addr) as u32
+}
 /// Draw calls between submits (`vg_lite_flush`) within a frame.
 const FLUSH_EVERY: u32 = 48;
 /// Pixels of drawing (the draws' screen rectangles, an upper bound of what they fill) between
@@ -157,9 +168,10 @@ impl VgBuffer {
         raw[4..8].copy_from_slice(&(height as i32).to_le_bytes());
         raw[8..12].copy_from_slice(&(stride as i32).to_le_bytes());
         raw[14..16].copy_from_slice(&format.to_le_bytes());
-        let p = mem.ptr() as usize as u32;
-        raw[20..24].copy_from_slice(&p.to_le_bytes());
-        raw[24..28].copy_from_slice(&p.to_le_bytes());
+        // `memory` (the CPU's pointer) and `address` (the GPU's).
+        let p = mem.ptr() as usize;
+        raw[20..24].copy_from_slice(&(p as u32).to_le_bytes());
+        raw[24..28].copy_from_slice(&gpu_addr(p).to_le_bytes());
         // Normal image mode until set; opaque transparency mode 0.
         raw[80..82].copy_from_slice(&0x1F00u16.to_le_bytes());
         VgBuffer { raw, width, height, stride }
@@ -180,9 +192,9 @@ impl VgBuffer {
         raw[4..8].copy_from_slice(&(height as i32).to_le_bytes());
         raw[8..12].copy_from_slice(&(stride as i32).to_le_bytes());
         raw[14..16].copy_from_slice(&format.to_le_bytes());
-        let p = data as usize as u32;
-        raw[20..24].copy_from_slice(&p.to_le_bytes());
-        raw[24..28].copy_from_slice(&p.to_le_bytes());
+        let p = data as usize;
+        raw[20..24].copy_from_slice(&(p as u32).to_le_bytes());
+        raw[24..28].copy_from_slice(&gpu_addr(p).to_le_bytes());
         raw[80..82].copy_from_slice(&0x1F00u16.to_le_bytes());
         (self.width, self.height, self.stride) = (width, height, stride);
     }
@@ -463,7 +475,8 @@ impl Stream {
         // uploaded: handle, memory, address, bytes, property (bit 0: uploaded, CALL it).
         c[20..24].copy_from_slice(&0u32.to_le_bytes());
         c[24..28].copy_from_slice(&(addr as u32).to_le_bytes());
-        c[28..32].copy_from_slice(&(addr as u32).to_le_bytes());
+        // What the driver CALLs: the GPU fetches the stream from memory, past the cache.
+        c[28..32].copy_from_slice(&gpu_addr(addr).to_le_bytes());
         c[32..36].copy_from_slice(&(len as u32).to_le_bytes());
         c[36..40].copy_from_slice(&1u32.to_le_bytes());
         c[40..44].copy_from_slice(&(len as u32).to_le_bytes());

@@ -214,6 +214,14 @@ pub struct Runtime {
     /// Waits for the GPU since start that ran into the driver's 100 ms timeout (it resets the
     /// GPU and drops what was queued: parts of a frame go missing).
     gpu_resets: u32,
+    /// After a frame with timeouts no new frame starts until then (the system gets its CPU
+    /// and the GPU a rest); timeouts in the current escalation window and when it began; how
+    /// far the module has stepped back (`GPU_STEPS`); paused for good at the last step.
+    gpu_cool_until: u32,
+    gpu_window_resets: u32,
+    gpu_window_at: u32,
+    gpu_step: u8,
+    gpu_paused: bool,
     /// LVGL's layer, wrapped for the GPU.
     layer_buffer: Option<gpu::VgBuffer>,
     /// When the module started and when the phone link last changed (breathers).
@@ -285,6 +293,11 @@ pub fn rt() -> &'static mut Runtime {
                 direct_checked: 0,
                 direct_broken: false,
                 gpu_resets: 0,
+                gpu_cool_until: 0,
+                gpu_window_resets: 0,
+                gpu_window_at: 0,
+                gpu_step: 0,
+                gpu_paused: false,
                 layer_buffer: None,
                 started_at: 0,
                 link_changed_at: 0,
@@ -481,6 +494,12 @@ pub fn status_text() -> String {
     }
     if r.gpu_resets != 0 {
         text += &alloc::format!("GPU 超时复位 {} 次（开机以来）\n", r.gpu_resets);
+        text += match r.gpu_step {
+            0 => "",
+            1 => "已因 GPU 超时关闭批量绘制\n",
+            2 => "已因 GPU 超时关闭批量绘制、贴图改用 32 位\n",
+            _ => "GPU 反复超时，已暂停动画（重新选择角色可重试）\n",
+        };
     }
     if r.direct_broken {
         text += "直接绘制自检未通过（GPU 没写进系统缓冲区），已改用缓冲绘制\n";
@@ -1062,6 +1081,18 @@ extern "C" fn frame(timer: *mut c_void) {
         }
         return;
     }
+    // GPU timeouts: a rest, or no more frames (the last one drawn stays up).
+    if r.gpu_paused || (r.gpu_cool_until.wrapping_sub(now) as i32) > 0 {
+        r.last_ms = now;
+        if r.direct {
+            r.direct = false;
+            if !r.gpu_paused {
+                draw_own(r, v.rect);
+            }
+            v.set_direct(false);
+        }
+        return;
+    }
     // A gap (the layer away, the screen off) is no frame rate: the stats window starts over.
     if now.wrapping_sub(r.last_frame_at) > 500 {
         r.window = Perf::default();
@@ -1251,18 +1282,59 @@ impl Marks {
     }
 }
 
-/// Counts the frame's GPU timeouts (`gpu::Stats::resets`); the first few go to the log.
+/// Timeouts within `GPU_WINDOW_MS` that make the module step back once more: batched draws
+/// off, then every page widened to BGRA8888 (the pack reloads), then no more frames.
+const GPU_STEP_RESETS: u32 = 3;
+const GPU_WINDOW_MS: u32 = 10_000;
+const GPU_COOL_MS: u32 = 1000;
+
+/// Counts the frame's GPU timeouts (`gpu::Stats::resets`); the first few go to the log. Each
+/// costs 100 ms with the LVGL thread blocked and loses part of the frame; several in a row
+/// starve the system (the watch froze on the third real test), so the module rests and then
+/// steps back to plainer drawing.
 fn note_resets(r: &mut Runtime) {
     let s = r.renderer.stats;
     if s.resets == 0 {
         return;
     }
+    let now = lv::now_ms();
     r.gpu_resets += s.resets;
     if r.gpu_resets <= 8 {
         trace(&alloc::format!(
             "gpu timeout: {} in this frame ({} since start); calls {} batches {}, waited for the GPU {} ms",
             s.resets, r.gpu_resets, s.calls, s.batches, s.flush_ms
         ));
+    }
+    if s.resets >= 2 {
+        r.gpu_cool_until = now.wrapping_add(GPU_COOL_MS);
+    }
+    if now.wrapping_sub(r.gpu_window_at) > GPU_WINDOW_MS {
+        r.gpu_window_at = now;
+        r.gpu_window_resets = 0;
+    }
+    r.gpu_window_resets += s.resets;
+    if r.gpu_window_resets < GPU_STEP_RESETS {
+        return;
+    }
+    r.gpu_window_resets = 0;
+    r.gpu_window_at = now;
+    r.gpu_step += 1;
+    match r.gpu_step {
+        1 => {
+            gpu::STREAM_OFF.store(true, Ordering::Relaxed);
+            trace("gpu timeouts: batched draws off");
+        }
+        2 => {
+            use bal2d_pack::PageFormat;
+            let wide = 1 << PageFormat::Argb4444 as u32 | 1 << PageFormat::Argb8565 as u32 | 1 << PageFormat::Index8 as u32;
+            gpu::BAD_FORMATS.fetch_or(wide, Ordering::Relaxed);
+            RELOAD.store(true, Ordering::Release);
+            trace("gpu timeouts: pages widened to BGRA8888, reloading");
+        }
+        _ => {
+            r.gpu_paused = true;
+            trace("gpu timeouts: drawing paused");
+        }
     }
 }
 
