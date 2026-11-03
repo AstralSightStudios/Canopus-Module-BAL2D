@@ -347,17 +347,32 @@ impl IdleLayer {
                         path.extend_from_slice(&[PATH_MOVE as i16, p[0], p[1], PATH_LINE as i16, q[0], q[1], PATH_LINE as i16, r[0], r[1], PATH_CLOSE as i16]);
                     }
                 } else {
-                    let mut first = true;
+                    // At most three elements per loop entry, room reserved above: written
+                    // without a capacity check each.
+                    let fixed = &self.fixed[..verts];
+                    let room = &mut path.spare_capacity_mut()[..loops.len() * 3];
+                    let mut n = 0;
+                    let mut op = PATH_MOVE as i16;
                     for &v in loops {
                         if v == u16::MAX {
-                            path.push(PATH_CLOSE as i16);
-                            first = true;
+                            room[n].write(PATH_CLOSE as i16);
+                            n += 1;
+                            op = PATH_MOVE as i16;
                             continue;
                         }
-                        let q = self.fixed[v as usize];
-                        path.extend_from_slice(&[if first { PATH_MOVE } else { PATH_LINE } as i16, q[0], q[1]]);
-                        first = false;
+                        // SAFETY: outline vertices are the attachment's (checked at load) and
+                        // `n + 3 <= 3 * entries seen <= room.len()`.
+                        unsafe {
+                            let q = *fixed.get_unchecked(v as usize);
+                            room.get_unchecked_mut(n).write(op);
+                            room.get_unchecked_mut(n + 1).write(q[0]);
+                            room.get_unchecked_mut(n + 2).write(q[1]);
+                        }
+                        n += 3;
+                        op = PATH_LINE as i16;
                     }
+                    // SAFETY: the first `n` elements were written.
+                    unsafe { path.set_len(n) };
                 }
                 if path.is_empty() {
                     continue;
