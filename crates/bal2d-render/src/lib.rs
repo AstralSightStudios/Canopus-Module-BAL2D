@@ -488,6 +488,8 @@ struct Grouper {
     /// Members grouped: group `g` is `order[starts[g]..starts[g + 1]]` (indices into `vis`).
     starts: Vec<u32>,
     order: Vec<u32>,
+    /// Per vertex of the batch: the group the last triangle using it joined (`u16::MAX`: none).
+    vgroup: Vec<u16>,
 }
 
 impl Grouper {
@@ -495,7 +497,7 @@ impl Grouper {
         fn grow<T>(v: &mut Vec<T>, n: usize) -> bool {
             v.try_reserve_exact(n.saturating_sub(v.capacity())).is_ok()
         }
-        grow(&mut self.vis, n) && grow(&mut self.of, n) && grow(&mut self.ms, n) && grow(&mut self.starts, n + 1) && grow(&mut self.order, n)
+        grow(&mut self.vis, n) && grow(&mut self.of, n) && grow(&mut self.ms, n) && grow(&mut self.starts, n + 1) && grow(&mut self.order, n) && grow(&mut self.vgroup, n * 3)
     }
 
     fn members(&self, g: usize) -> &[u32] {
@@ -506,10 +508,17 @@ impl Grouper {
     /// range), keeping only those that reach `cull` (the target's size in pixels) when given. One pass: each triangle is read once and tried against the group it joined last,
     /// then the others in order (the groups come out as scanning what is left once per group
     /// makes them: a triangle that fits no earlier group starts one in both).
+    ///
+    /// Before scanning every group a triangle tries the ones its vertices' last triangles
+    /// joined (neighbours mostly share an affine): with deforming meshes the full scan per
+    /// triangle was most of a live layer's grouping time. Any group a triangle joins places it
+    /// within `tol`, so the drawing is as exact either way.
     fn group(&mut self, screen: &[[f32; 2]], texel: &[[f32; 2]], idx: &[u16], tol: f32, cull: Option<(f32, f32)>) {
         self.vis.clear();
         self.of.clear();
         self.ms.clear();
+        self.vgroup.clear();
+        self.vgroup.resize(screen.len(), u16::MAX);
         let mut last = 0usize;
         for (n, t) in idx.chunks_exact(3).enumerate() {
             let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
@@ -531,9 +540,14 @@ impl Grouper {
                 }
                 true
             };
+            // SAFETY: as above (every index in range of the vertex lists, `vgroup` sized to them).
+            let near = unsafe { [*self.vgroup.get_unchecked(a), *self.vgroup.get_unchecked(b), *self.vgroup.get_unchecked(c)] };
+            let tried = |g: usize| g == last || near.contains(&(g as u16));
             let g = if self.ms.get(last).is_some_and(|m| fits(m)) {
                 last
-            } else if let Some(g) = self.ms.iter().enumerate().position(|(g, m)| g != last && fits(m)) {
+            } else if let Some(&g) = near.iter().find(|&&g| g != u16::MAX && g as usize != last && fits(&self.ms[g as usize])) {
+                g as usize
+            } else if let Some(g) = self.ms.iter().enumerate().position(|(g, m)| !tried(g) && fits(m)) {
                 g
             } else if let Some(m) = (Tri { s: p, t: tx, v: [0; 3] }).affine() {
                 if self.ms.len() >= u16::MAX as usize {
@@ -547,6 +561,12 @@ impl Grouper {
             last = g;
             self.vis.push(n as u16);
             self.of.push(g as u16);
+            // SAFETY: as above.
+            unsafe {
+                *self.vgroup.get_unchecked_mut(a) = g as u16;
+                *self.vgroup.get_unchecked_mut(b) = g as u16;
+                *self.vgroup.get_unchecked_mut(c) = g as u16;
+            }
         }
         // Members by group (counting sort; in triangle order within a group).
         self.starts.clear();
