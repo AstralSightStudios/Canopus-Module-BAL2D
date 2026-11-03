@@ -79,9 +79,11 @@ pub fn gpu_addr(addr: usize) -> u32 {
 /// `trust`: the old stable drawing gave the GPU the cached alias). Buffers made while it is off
 /// keep the cached alias until re-addressed (`VgBuffer::readdress`) or made again.
 pub static UNCACHED: AtomicBool = AtomicBool::new(true);
-/// Submits also once the draws add up to `FLUSH_PIXELS` (a feature the watch tries; without it
-/// every `FLUSH_EVERY` draws, as the old stable drawing did).
-pub static SPLIT: AtomicBool = AtomicBool::new(false);
+/// Submits also once the draws add up to `SPLIT_PX` pixels (`FLUSH_PIXELS` until the start-up
+/// measurement sets it from the GPU's speed, see `bench`). The fifth real-watch log: with
+/// every submit of 48 draws the heavy phases of an animation ran into the driver's timeout.
+pub static SPLIT: AtomicBool = AtomicBool::new(true);
+pub static SPLIT_PX: AtomicU32 = AtomicU32::new(FLUSH_PIXELS);
 /// Draw calls between submits (`vg_lite_flush`) within a frame.
 const FLUSH_EVERY: u32 = 48;
 /// Pixels of drawing (the draws' screen rectangles, an upper bound of what they fill) between
@@ -89,7 +91,7 @@ const FLUSH_EVERY: u32 = 48;
 /// reports success, so the rest of that submit is lost (on the watch: parts of the character
 /// missing for a frame, some cut into bands). A screen of the heaviest layers takes the
 /// watch's GPU about 10 ms; capping each submit there keeps every wait far below the limit.
-const FLUSH_PIXELS: u32 = 336 * 480;
+const FLUSH_PIXELS: u32 = 336 * 480 / 2;
 /// A wait this long was the driver's 100 ms timeout (and its GPU reset).
 pub const TIMEOUT_MS: u32 = 90;
 /// `VG_LITE_LOW`: no anti-aliasing, so the triangles of a mesh meet without seams.
@@ -555,7 +557,7 @@ impl Stats {
     }
 
     fn split_due(&self) -> bool {
-        SPLIT.load(Ordering::Relaxed) && self.queued_px >= FLUSH_PIXELS
+        SPLIT.load(Ordering::Relaxed) && self.queued_px >= SPLIT_PX.load(Ordering::Relaxed)
     }
 
     /// A wait of `ms` for the GPU at `at` (see `long_waits`): the driver's timeout when that long.

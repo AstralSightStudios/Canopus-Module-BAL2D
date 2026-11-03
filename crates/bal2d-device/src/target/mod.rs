@@ -11,6 +11,7 @@ use bal2d_render::DrawList;
 use canopus_target_private::*;
 
 pub mod app;
+pub mod bench;
 pub mod connect;
 pub mod fw;
 pub mod gpu;
@@ -237,6 +238,10 @@ pub struct Runtime {
     /// Development (`dev-gpu-timeout`, a hex feature mask): frames with any of these features on
     /// count a timeout, to try the trials where the GPU never times out (Mirage).
     force_timeout: u8,
+    /// The start-up GPU measurement (`bench`).
+    bench: Option<bench::Bench>,
+    /// Stats windows traced (the first few, then one in ten).
+    perf_traced: u32,
     /// LVGL's layer, wrapped for the GPU.
     layer_buffer: Option<gpu::VgBuffer>,
     /// When the module started and when the phone link last changed (breathers).
@@ -322,6 +327,8 @@ pub fn rt() -> &'static mut Runtime {
                 trial_frames: 0,
                 trial_resets: 0,
                 force_timeout: 0,
+                bench: None,
+                perf_traced: 0,
                 layer_buffer: None,
                 started_at: 0,
                 link_changed_at: 0,
@@ -332,7 +339,7 @@ pub fn rt() -> &'static mut Runtime {
     }
 }
 
-static mut TRACE_LEFT: u32 = 200;
+static mut TRACE_LEFT: u32 = 400;
 /// The diagnostic log (the phone can fetch it: `LOG`); past `LOG_KEEP` bytes at start it moves
 /// to `LOG_PREVIOUS`, so it holds the last few boots.
 pub const LOG_FILE: &str = "log.txt";
@@ -518,6 +525,18 @@ pub fn status_text() -> String {
     }
     if r.gpu_resets != 0 {
         text += &alloc::format!("GPU 超时复位 {} 次（开机以来）\n", r.gpu_resets);
+    }
+    if let Some(b) = r.bench {
+        let ms = |v: u32| alloc::format!("{}.{}", v / 10, v % 10);
+        text += &alloc::format!(
+            "GPU 每屏耗时 ms：清屏 {} · 32位贴图 {}/{} · 8565 {}/{} · 背景 {}\n",
+            ms(b.clear),
+            ms(b.tex32),
+            ms(b.tex32_nc),
+            ms(b.tex24),
+            ms(b.tex24_nc),
+            ms(b.blit)
+        );
     }
     if r.selftest.is_some() {
         text += &alloc::format!("GPU 功能：已开 {}", trust::names(r.features));
@@ -1076,6 +1095,16 @@ extern "C" fn frame(timer: *mut c_void) {
         r.force_timeout = Fs::read("dev-gpu-timeout", 8)
             .and_then(|b| u8::from_str_radix(core::str::from_utf8(&b).ok()?.trim().trim_start_matches("0x"), 16).ok())
             .unwrap_or(0);
+        // How fast this GPU fills: what a submit may carry so it stays well within the driver's
+        // 100 ms (the pack is not loaded yet: the heap has room for the measurement).
+        r.bench = bench::run();
+        if let Some(b) = r.bench {
+            gpu::SPLIT_PX.store(b.split_px(), Ordering::Relaxed);
+            trace(&alloc::format!(
+                "gpu bench (ms/screen x10): clear {} tex32 {} (non-cached {}) tex8565 {} (non-cached {}) blit565 {}; timeouts {}; submit {} px",
+                b.clear, b.tex32, b.tex32_nc, b.tex24, b.tex24_nc, b.blit, b.timeouts, b.split_px()
+            ));
+        }
         r.trust = trust::Trust::load();
         r.features = r.trust.good;
         apply_features(r);
@@ -1233,7 +1262,8 @@ extern "C" fn frame(timer: *mut c_void) {
             redraw_ms: w.redraw_ms / w.redraws.max(1),
             direct: w.direct,
         };
-        if r.perf.frames < 400 || r.perf.frames % 300 < 31 {
+        r.perf_traced += 1;
+        if r.perf_traced <= 4 || r.perf_traced % 10 == 0 {
             trace(&alloc::format!(
                 "perf fps {}.{} update {} draw {} (driver {} flush {}) gpu {} ui {} idle {} late {} tris {} calls {} direct {} redraws {} errors {} last {}",
                 r.perf.fps_x10 / 10,
@@ -1334,7 +1364,6 @@ const GPU_COOL_MS: u32 = 1000;
 fn apply_features(r: &mut Runtime) {
     use bal2d_pack::PageFormat;
     let f = r.features;
-    gpu::SPLIT.store(f & trust::SPLIT != 0, Ordering::Relaxed);
     let uncached = f & trust::UNCACHED != 0;
     let readdress = gpu::UNCACHED.swap(uncached, Ordering::Relaxed) != uncached;
     if readdress {

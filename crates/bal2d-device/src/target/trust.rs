@@ -23,14 +23,14 @@ pub const BAKE: u8 = 4;
 pub const PAD: u8 = 8;
 /// GPU addresses through PSRAM's non-cached alias (`gpu::UNCACHED`).
 pub const UNCACHED: u8 = 16;
-/// Submits split by drawn area too (`gpu::SPLIT`).
-pub const SPLIT: u8 = 32;
-pub const ALL: u8 = NATIVE | STREAM | BAKE | PAD | UNCACHED | SPLIT;
+pub const ALL: u8 = NATIVE | STREAM | BAKE | PAD | UNCACHED;
 /// The order of the trials: what saves the most first.
-const ORDER: [u8; 6] = [NATIVE, STREAM, BAKE, PAD, UNCACHED, SPLIT];
+const ORDER: [u8; 5] = [NATIVE, STREAM, BAKE, PAD, UNCACHED];
 const FILE: &str = "gpu-trust.bin";
-/// Bumped when the drawing changes enough that old verdicts mean nothing.
-const VERSION: u8 = 2;
+/// Bumped when the drawing changes enough that old verdicts mean nothing (3: submits sized by
+/// the GPU's measured speed; the verdicts before blamed features for timeouts that came from
+/// submits too large for it).
+const VERSION: u8 = 3;
 /// Timeouts during a trial that make the feature bad.
 pub const BAD_RESETS: u32 = 2;
 /// Frames drawn without a timeout before a trial starts, and for one to pass.
@@ -76,7 +76,7 @@ impl Trust {
 /// Feature names for the log and the status page.
 pub fn names(mask: u8) -> alloc::string::String {
     let mut t = alloc::string::String::new();
-    for (bit, name) in [(NATIVE, "原格式贴图"), (STREAM, "批量绘制"), (BAKE, "背景烘焙"), (PAD, "边缘延伸"), (UNCACHED, "非缓存地址"), (SPLIT, "按面积提交")] {
+    for (bit, name) in [(NATIVE, "原格式贴图"), (STREAM, "批量绘制"), (BAKE, "背景烘焙"), (PAD, "边缘延伸"), (UNCACHED, "非缓存地址")] {
         if mask & bit != 0 {
             if !t.is_empty() {
                 t += "、";
