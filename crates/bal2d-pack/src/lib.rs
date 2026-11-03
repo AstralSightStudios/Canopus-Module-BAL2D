@@ -770,6 +770,10 @@ impl IdleBake {
             return None;
         }
         d.drain(..at);
+        // The header (shapes, colours, runs) now lives in its own vectors: give its room back
+        // (shrinking leaves the block where it is). Kept, it made a baked idle take about 1.6 to
+        // 2 times its size on the watch.
+        d.shrink_to_fit();
         Some(IdleBake { animation, rate, period, start, shapes, colors, live, frames, stream: d })
     }
 }

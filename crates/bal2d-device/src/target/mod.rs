@@ -738,6 +738,7 @@ fn load_step() -> Option<i32> {
                     lobby.bake = None;
                 }
                 trace(&alloc::format!("parsed in {} ms; {} pages; heap: free {} KB, largest {} KB", lv::now_ms().wrapping_sub(l.t0), pages.len(), heap_free_kb(), largest_block_kb()));
+                early_idle(&mut lobby, &pages, &mut l.src);
                 l.per_layer = (0..lobby.layers.len()).map(|_| Vec::new()).collect();
                 l.lobby = Some(lobby);
                 l.pages = pages;
@@ -750,6 +751,20 @@ fn load_step() -> Option<i32> {
         }
     };
     if let Some(p) = l.pages.get(l.next) {
+        // No room after all (the firmware resets on a failed malloc, so this is checked first):
+        // the baked idles loaded early go, the pages come first.
+        if !heap_allows(page_bytes(p) + 64 * 1024) {
+            if let Some(lobby) = l.lobby.as_mut() {
+                if lobby.idle.iter().any(|i| i.is_some()) {
+                    lobby.idle.iter_mut().for_each(|i| *i = None);
+                    trace(&alloc::format!("page {}: no room next to the baked idles, dropped them; heap: free {} KB", l.next, heap_free_kb()));
+                }
+            }
+        }
+        if !heap_allows(page_bytes(p) + 64 * 1024) {
+            trace(&alloc::format!("page {}: {} KB do not fit; heap: free {} KB, largest {} KB", l.next, page_bytes(p) / 1024, heap_free_kb(), largest_block_kb()));
+            return Some(-12);
+        }
         let up = gpu::Page::from_pack(&mut l.src, p);
         trace(&alloc::format!("page {}/{} {}x{} {:?}: {}; heap: free {} KB", p.layer, p.index, p.header.width, p.header.height, p.header.format, up.as_ref().err().copied().unwrap_or(0), heap_free_kb()));
         match up {
@@ -813,6 +828,9 @@ fn load_step() -> Option<i32> {
     if let Some(lobby) = l.lobby.as_mut() {
         for li in 0..lobby.layers.len() {
             let Some(Some(e)) = lobby.idle_entries.get(li).copied() else { continue };
+            if lobby.idle.get(li).is_some_and(|i| i.is_some()) || skip_idle() & (1 << li.min(31)) != 0 {
+                continue;
+            }
             let need = e.raw_len as usize + e.stored_len as usize + e.raw_len as usize / 4;
             let loaded = heap_allows(need + IDLE_HEADROOM) && lobby.load_idle(&mut l.src, li);
             trace(&alloc::format!("baked idle {li}: {} KB, {}; heap: free {} KB", e.raw_len / 1024, if loaded { "loaded" } else { "skipped" }, heap_free_kb()));
@@ -829,6 +847,53 @@ fn load_step() -> Option<i32> {
     r.pages = l.per_layer;
     r.bake = bake;
     Some(0)
+}
+
+/// Bytes a page takes uploaded (widened to BGRA8888 when its format is one the GPU gets wrong
+/// or the drawing does not trust yet).
+fn page_bytes(p: &bal2d_core::Page) -> usize {
+    let bad = gpu::BAD_FORMATS.load(Ordering::Relaxed);
+    let f = p.header.format;
+    let bpp = if f != bal2d_pack::PageFormat::Bgra8888 && bad & (1 << f as u32) != 0 { 4 } else { f.bytes_per_pixel() };
+    p.header.width as usize * p.header.height as usize * bpp + 64
+}
+
+/// Loads baked idles before the pages when what the rest of the pack needs (pages as they will
+/// be uploaded, the background image, working buffers) still fits after them: loaded last, the
+/// transient copy of a compressed section did not fit next to the pages on the watch (Hoshino's
+/// 1.4 MB background idle was skipped and animated live, the frame's largest CPU cost).
+/// Development (`dev-skip-idle`, a hex layer mask): layers whose baked idle is not loaded (to
+/// time a layer animated live).
+fn skip_idle() -> u32 {
+    Fs::read("dev-skip-idle", 8)
+        .and_then(|b| u32::from_str_radix(core::str::from_utf8(&b).ok()?.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0)
+}
+
+fn early_idle(lobby: &mut Lobby, pages: &[bal2d_core::Page], src: &mut FileSource) {
+    let skip = skip_idle();
+    let page_bytes: usize = pages.iter().map(page_bytes).sum();
+    let bake_bytes = lobby.bake.as_ref().map_or(0, |b| b.header.width as usize * b.header.height as usize * 2 + 64);
+    // Vertex, path and outline buffers, the GPU stream (a few hundred KB).
+    let rest = page_bytes + bake_bytes + 640 * 1024;
+    for li in 0..lobby.layers.len() {
+        let Some(Some(e)) = lobby.idle_entries.get(li).copied() else { continue };
+        if skip & (1 << li.min(31)) != 0 {
+            continue;
+        }
+        // Held for good: the bake and what is derived from it; for a moment also the stored
+        // (compressed) section. Each needs a block of its own, the sum the free total.
+        let (raw, stored) = (e.raw_len as usize, e.stored_len as usize);
+        let kept = raw + raw / 4;
+        let (free, largest) = fw::heap_info();
+        let after = (free as usize).saturating_sub(kept + rest);
+        if after < HEAP_RESERVE as usize + 256 * 1024 || (largest as usize) < raw.max(stored) + 64 * 1024 {
+            trace(&alloc::format!("baked idle {li}: {} KB, not before the pages (free {} KB, largest {} KB)", raw / 1024, free / 1024, largest / 1024));
+            continue;
+        }
+        let loaded = lobby.load_idle(src, li);
+        trace(&alloc::format!("baked idle {li}: {} KB, {} before the pages; heap: free {} KB", raw / 1024, if loaded { "loaded" } else { "not loaded" }, heap_free_kb()));
+    }
 }
 
 /// Writes the placeholder image an LVGL image object shows until the module takes it over
