@@ -560,10 +560,6 @@ pub struct Stats {
     /// Draws left out as degenerate (`degenerate`), and the first of them: (det, bounds).
     pub skipped: u32,
     pub first_skip: Option<(f32, [i16; 4])>,
-    /// The farthest path coordinate from the target's middle this frame (pixels), and that
-    /// draw's bounds (path units).
-    pub extent: u32,
-    pub extent_bounds: [i16; 4],
 }
 
 /// Why a draw is left out, if it is: a texel -> pixel affine that is not finite or (nearly)
@@ -754,13 +750,6 @@ impl Sink<'_> {
             let c = self.clip;
             if (b[2] as f32 * k + ox) < c[0] as f32 || (b[0] as f32 * k + ox) > c[2] as f32 || (b[3] as f32 * k + oy) < c[1] as f32 || (b[1] as f32 * k + oy) > c[3] as f32 {
                 return;
-            }
-            let far = [(b[0] as f32 * k + ox - 168.0), (b[2] as f32 * k + ox - 168.0), (b[1] as f32 * k + oy - 240.0), (b[3] as f32 * k + oy - 240.0)]
-                .iter()
-                .fold(0f32, |m, v| m.max(v.abs())) as u32;
-            if far > self.stats.extent {
-                self.stats.extent = far;
-                self.stats.extent_bounds = b;
             }
         }
         // Kept for the log: what went into a submit that times out.

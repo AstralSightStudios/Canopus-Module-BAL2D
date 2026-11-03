@@ -814,19 +814,24 @@ pub struct IdleCursor {
     at: usize,
     /// The frame `next` decodes.
     pub frame: u16,
-    last: Vec<Option<[i16; 6]>>,
-    now: Vec<Option<[i16; 6]>>,
+    /// Per shape: its matrix in the frame it last appeared in, and that frame's number in
+    /// decoding order (`tick`): a delta applies when it appeared in the frame before. Updated in
+    /// place (each shape appears once per frame): no per-frame reset of every shape.
+    last: Vec<[i16; 6]>,
+    seen: Vec<u32>,
+    tick: u32,
 }
 
 impl IdleCursor {
     pub fn new(shapes: usize) -> IdleCursor {
-        IdleCursor { at: 0, frame: 0, last: alloc::vec![None; shapes], now: alloc::vec![None; shapes] }
+        IdleCursor { at: 0, frame: 0, last: alloc::vec![[0; 6]; shapes], seen: alloc::vec![0; shapes], tick: 1 }
     }
 
     pub fn rewind(&mut self) {
         self.at = 0;
         self.frame = 0;
-        self.last.iter_mut().for_each(|x| *x = None);
+        // Nothing appeared in "the frame before" the first one.
+        self.tick += 1;
     }
 
     /// Decodes frame `self.frame` into `out` (replacing it) and moves on; `None` if the stream
@@ -836,33 +841,55 @@ impl IdleCursor {
             self.rewind();
         }
         out.clear();
-        let mut r = Bytes { d: &bake.stream, at: self.at };
+        let d = &bake.stream[..];
+        let mut at = self.at;
+        let prev = self.tick;
+        let tick = prev + 1;
         let ok = (|| -> Option<()> {
-            let n = r.u16()? as usize;
-            self.now.iter_mut().for_each(|x| *x = None);
+            let n = u16::from_le_bytes([*d.get(at)?, *d.get(at + 1)?]) as usize;
+            at += 2;
+            out.reserve(n);
             for _ in 0..n {
-                let shape = r.u16()?;
-                let color = r.u16()?;
-                let flags = r.u8()?;
-                let base = if flags & 1 != 0 { (*self.last.get(shape as usize)?)? } else { [0; 6] };
+                // The longest record: shape, colour, flags, two matrices.
+                let rec = d.get(at..at + 29).or_else(|| d.get(at..))?;
+                if rec.len() < 5 {
+                    return None;
+                }
+                let shape = u16::from_le_bytes([rec[0], rec[1]]);
+                let color = u16::from_le_bytes([rec[2], rec[3]]);
+                let flags = rec[4];
+                let len = 5 + 12 + if flags & 2 != 0 { 12 } else { 0 };
+                if rec.len() < len {
+                    return None;
+                }
+                let at_m = |k: usize| i16::from_le_bytes([rec[5 + 2 * k], rec[6 + 2 * k]]);
+                let s = shape as usize;
+                let base = if flags & 1 != 0 {
+                    if self.seen.get(s).copied() != Some(prev) {
+                        return None;
+                    }
+                    self.last[s]
+                } else {
+                    [0; 6]
+                };
                 let mut m0 = [0i16; 6];
                 for k in 0..6 {
-                    m0[k] = base[k].wrapping_add(r.i16()?);
+                    m0[k] = base[k].wrapping_add(at_m(k));
                 }
-                let m1 = if flags & 2 != 0 {
+                let m1 = (flags & 2 != 0).then(|| {
                     let mut m = [0i16; 6];
                     for k in 0..6 {
-                        m[k] = m0[k].wrapping_add(r.i16()?);
+                        m[k] = m0[k].wrapping_add(at_m(6 + k));
                     }
-                    Some(m)
-                } else {
-                    None
-                };
+                    m
+                });
                 // Live-run markers name no shape.
-                if let Some(x) = self.now.get_mut(shape as usize) {
-                    *x = Some(m0);
+                if s < self.last.len() {
+                    self.last[s] = m0;
+                    self.seen[s] = tick;
                 }
                 out.push(IdleCall { shape, color, m0, m1 });
+                at += len;
             }
             Some(())
         })();
@@ -871,9 +898,9 @@ impl IdleCursor {
             out.clear();
             return None;
         }
-        core::mem::swap(&mut self.last, &mut self.now);
+        self.tick = tick;
         let f = self.frame;
-        self.at = r.at;
+        self.at = at;
         self.frame += 1;
         Some(f)
     }

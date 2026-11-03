@@ -244,9 +244,6 @@ pub struct Runtime {
     perf_traced: u32,
     /// Degenerate draws left out since start (`gpu::degenerate`), the first few logged.
     skipped: u32,
-    /// The farthest path coordinate seen so far (pixels from the target's middle; new records
-    /// are logged in steps).
-    extent_max: u32,
     /// Hung submits whose draws went to the log; development (`dev-gpu-hang` "auto"): fake a
     /// hang on a draw picked after a while.
     hang_dumps: u32,
@@ -339,7 +336,6 @@ pub fn rt() -> &'static mut Runtime {
                 bench: None,
                 perf_traced: 0,
                 skipped: 0,
-                extent_max: 0,
                 hang_dumps: 0,
                 fake_auto: false,
                 layer_buffer: None,
@@ -1510,10 +1506,6 @@ fn note_resets(r: &mut Runtime) {
         r.renderer.stats.resets += 1;
     }
     let s = r.renderer.stats;
-    if s.extent >= r.extent_max + 128 || (s.resets != 0 && r.gpu_resets < 24) {
-        r.extent_max = r.extent_max.max(s.extent);
-        trace(&alloc::format!("farthest path point {} px off centre, bounds {:?}{}", s.extent, s.extent_bounds, if s.resets != 0 { " in a frame that timed out" } else { "" }));
-    }
     if s.skipped != 0 {
         if r.skipped < 16 {
             if let Some((det, b)) = s.first_skip {
