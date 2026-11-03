@@ -862,10 +862,19 @@ pub const PATH_CLOSE: u32 = 1;
 #[cfg(feature = "outline")]
 #[derive(Default)]
 pub struct Outline {
-    edges: Vec<(u64, u32, u32, [f32; 2])>,
-    live: Vec<(u32, u32, [f32; 2])>,
-    used: Vec<bool>,
+    /// Directed edges: from, to, start point, the next edge out of the same vertex, and whether
+    /// it is still there (not cancelled by its reverse, not yet chained).
+    edges: Vec<(u32, u32, [f32; 2])>,
+    next: Vec<u32>,
+    alive: Vec<bool>,
+    /// Per vertex id: its first outgoing edge, valid when stamped with this call's `stamp`.
+    head: Vec<u32>,
+    head_stamp: Vec<u32>,
+    stamp: u32,
 }
+
+#[cfg(feature = "outline")]
+const NO_EDGE: u32 = u32::MAX;
 
 #[cfg(feature = "outline")]
 impl Outline {
@@ -873,8 +882,17 @@ impl Outline {
     pub fn reserve(&mut self, triangles: usize) -> bool {
         let n = triangles * 3;
         self.edges.try_reserve_exact(n.saturating_sub(self.edges.capacity())).is_ok()
-            && self.live.try_reserve_exact(n.saturating_sub(self.live.capacity())).is_ok()
-            && self.used.try_reserve_exact(n.saturating_sub(self.used.capacity())).is_ok()
+            && self.next.try_reserve_exact(n.saturating_sub(self.next.capacity())).is_ok()
+            && self.alive.try_reserve_exact(n.saturating_sub(self.alive.capacity())).is_ok()
+            && self.head.try_reserve_exact(n.saturating_sub(self.head.capacity())).is_ok()
+            && self.head_stamp.try_reserve_exact(n.saturating_sub(self.head_stamp.capacity())).is_ok()
+    }
+
+    fn head_of(&self, v: u32) -> u32 {
+        match self.head_stamp.get(v as usize) {
+            Some(&s) if s == self.stamp => self.head[v as usize],
+            _ => NO_EDGE,
+        }
     }
 }
 
@@ -885,9 +903,20 @@ impl Outline {
 /// leaves every winding number as it was), and the remaining edges are chained into loops. The
 /// result covers exactly the pixels the triangles cover, with far fewer edges for a mesh: only
 /// its border is left. `emit(op, x, y)` receives MOVE, LINE and CLOSE in order.
+///
+/// No sorting: each vertex keeps a list of its outgoing edges; an edge a -> b cancels one live
+/// b -> a in b's list, or joins a's (what is left per vertex pair is the net count in the
+/// winning direction, as with counting), and the loops are walked along the same lists.
+/// Sorting the edges was a third of all time on the watch while a layer played live.
 pub fn outline(tris: &[Tri], members: &[u32], scratch: &mut Outline, mut emit: impl FnMut(u32, f32, f32)) {
-    let e = &mut scratch.edges;
-    e.clear();
+    scratch.edges.clear();
+    scratch.next.clear();
+    scratch.alive.clear();
+    scratch.stamp = scratch.stamp.wrapping_add(1);
+    if scratch.stamp == 0 {
+        scratch.head_stamp.iter_mut().for_each(|s| *s = 0);
+        scratch.stamp = 1;
+    }
     for &ti in members {
         let t = &tris[ti as usize];
         let area = (t.s[1][0] - t.s[0][0]) * (t.s[2][1] - t.s[0][1]) - (t.s[2][0] - t.s[0][0]) * (t.s[1][1] - t.s[0][1]);
@@ -895,64 +924,60 @@ pub fn outline(tris: &[Tri], members: &[u32], scratch: &mut Outline, mut emit: i
         for k in 0..3 {
             let (i, j) = (o[k], o[(k + 1) % 3]);
             let (a, b) = (t.v[i], t.v[j]);
-            let key = ((a.min(b) as u64) << 32) | a.max(b) as u64;
-            e.push((key, a, b, t.s[i]));
+            if a == b {
+                continue;
+            }
+            // A live b -> a cancels this edge (and goes).
+            let mut e = scratch.head_of(b);
+            let mut cancelled = false;
+            while e != NO_EDGE {
+                let x = e as usize;
+                if scratch.alive[x] && scratch.edges[x].1 == a {
+                    scratch.alive[x] = false;
+                    cancelled = true;
+                    break;
+                }
+                e = scratch.next[x];
+            }
+            if cancelled {
+                continue;
+            }
+            let n = scratch.edges.len() as u32;
+            if scratch.head.len() <= a as usize {
+                scratch.head.resize(a as usize + 1, NO_EDGE);
+                scratch.head_stamp.resize(a as usize + 1, 0);
+            }
+            let first = scratch.head_of(a);
+            scratch.edges.push((a, b, t.s[i]));
+            scratch.next.push(first);
+            scratch.alive.push(true);
+            scratch.head[a as usize] = n;
+            scratch.head_stamp[a as usize] = scratch.stamp;
         }
     }
-    e.sort_unstable_by_key(|x| x.0);
-    let live = &mut scratch.live;
-    live.clear();
-    let mut i = 0;
-    while i < e.len() {
-        let mut j = i;
-        let mut net: i32 = 0;
-        while j < e.len() && e[j].0 == e[i].0 {
-            net += if e[j].1 < e[j].2 { 1 } else { -1 };
-            j += 1;
-        }
-        // Keep |net| edges of the direction that wins (a == b: degenerate, dropped).
-        let mut left = net.unsigned_abs();
-        for x in &e[i..j] {
-            if left == 0 {
-                break;
-            }
-            if (net > 0) == (x.1 < x.2) && x.1 != x.2 {
-                live.push((x.1, x.2, x.3));
-                left -= 1;
-            }
-        }
-        i = j;
-    }
-    live.sort_unstable_by_key(|x| x.0);
-    let used = &mut scratch.used;
-    used.clear();
-    used.resize(live.len(), false);
-    for first in 0..live.len() {
-        if used[first] {
+    for first in 0..scratch.edges.len() {
+        if !scratch.alive[first] {
             continue;
         }
-        used[first] = true;
-        let start = live[first].0;
-        emit(PATH_MOVE, live[first].2[0], live[first].2[1]);
-        let mut cur = live[first].1;
-        let mut guard = live.len();
+        scratch.alive[first] = false;
+        let (start, to, p) = scratch.edges[first];
+        emit(PATH_MOVE, p[0], p[1]);
+        let mut cur = to;
+        let mut guard = scratch.edges.len();
         while cur != start && guard > 0 {
             guard -= 1;
-            let from = live.partition_point(|x| x.0 < cur);
-            let mut next = None;
-            for k in from..live.len() {
-                if live[k].0 != cur {
-                    break;
-                }
-                if !used[k] {
-                    next = Some(k);
-                    break;
-                }
+            let mut e = scratch.head_of(cur);
+            while e != NO_EDGE && !scratch.alive[e as usize] {
+                e = scratch.next[e as usize];
             }
-            let Some(k) = next else { break };
-            used[k] = true;
-            emit(PATH_LINE, live[k].2[0], live[k].2[1]);
-            cur = live[k].1;
+            if e == NO_EDGE {
+                break;
+            }
+            let x = e as usize;
+            scratch.alive[x] = false;
+            let (_, to, p) = scratch.edges[x];
+            emit(PATH_LINE, p[0], p[1]);
+            cur = to;
         }
         emit(PATH_CLOSE, 0.0, 0.0);
     }
