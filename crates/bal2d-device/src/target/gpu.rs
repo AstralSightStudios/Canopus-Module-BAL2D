@@ -546,7 +546,32 @@ pub struct Stats {
     /// stream full.
     pub resets: u32,
     pub long_waits: [(u8, u16); 4],
+    /// Draws left out as degenerate (`degenerate`), and the first of them: (det, bounds).
+    pub skipped: u32,
+    pub first_skip: Option<(f32, [i16; 4])>,
+    /// The farthest path coordinate from the target's middle this frame (pixels), and that
+    /// draw's bounds (path units).
+    pub extent: u32,
+    pub extent_bounds: [i16; 4],
 }
+
+/// Why a draw is left out, if it is: a texel -> pixel affine that is not finite or (nearly)
+/// singular, which the driver inverts for the image coordinate generator (an attachment scaled
+/// to nothing gives one; Mirage's model then draws nothing, the watch's GPU may hang until the
+/// driver's 100 ms timeout), or empty bounds. What it would draw is less than a pixel.
+fn degenerate(call: &bal2d_render::Call) -> Option<f32> {
+    let m = call.matrix;
+    let det = m[0] * m[4] - m[1] * m[3];
+    let finite = m.iter().all(|v| v.is_finite());
+    let b = call.bounds;
+    let empty = call.rect.is_none() && (b[2] <= b[0] || b[3] <= b[1]);
+    (!finite || !(det.abs() >= MIN_DET) || det.abs() > MAX_DET || empty).then_some(det)
+}
+
+/// |det| of a texel -> pixel affine kept: a texel no smaller than 1/32 pixel each way on
+/// average, and no larger than 256 pixels.
+const MIN_DET: f32 = 1.0 / 1024.0;
+const MAX_DET: f32 = 65536.0;
 
 impl Stats {
     /// Counts a draw of `px` pixels; true when it is time to submit.
@@ -624,6 +649,30 @@ struct Sink<'a> {
 
 impl Sink<'_> {
     fn submit(&mut self, target: &mut VgBuffer, pages: &mut [Page], call: &bal2d_render::Call) {
+        if let Some(det) = degenerate(call) {
+            self.stats.skipped += 1;
+            if self.stats.first_skip.is_none() {
+                self.stats.first_skip = Some((det, call.bounds));
+            }
+            return;
+        }
+        if call.rect.is_none() {
+            let k = 1.0 / bal2d_render::PATH_SCALE;
+            let b = call.bounds;
+            let (ox, oy) = self.offset;
+            // Wholly outside the clip: nothing to draw, nothing to tessellate.
+            let c = self.clip;
+            if (b[2] as f32 * k + ox) < c[0] as f32 || (b[0] as f32 * k + ox) > c[2] as f32 || (b[3] as f32 * k + oy) < c[1] as f32 || (b[1] as f32 * k + oy) > c[3] as f32 {
+                return;
+            }
+            let far = [(b[0] as f32 * k + ox - 168.0), (b[2] as f32 * k + ox - 168.0), (b[1] as f32 * k + oy - 240.0), (b[3] as f32 * k + oy - 240.0)]
+                .iter()
+                .fold(0f32, |m, v| m.max(v.abs())) as u32;
+            if far > self.stats.extent {
+                self.stats.extent = far;
+                self.stats.extent_bounds = b;
+            }
+        }
         if call.rect.is_none() && self.fp32.is_none() && self.stream.is_some() {
             self.batch(target, pages, call);
             return;

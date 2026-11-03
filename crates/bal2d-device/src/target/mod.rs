@@ -242,6 +242,11 @@ pub struct Runtime {
     bench: Option<bench::Bench>,
     /// Stats windows traced (the first few, then one in ten).
     perf_traced: u32,
+    /// Degenerate draws left out since start (`gpu::degenerate`), the first few logged.
+    skipped: u32,
+    /// The farthest path coordinate seen so far (pixels from the target's middle; new records
+    /// are logged in steps).
+    extent_max: u32,
     /// LVGL's layer, wrapped for the GPU.
     layer_buffer: Option<gpu::VgBuffer>,
     /// When the module started and when the phone link last changed (breathers).
@@ -329,6 +334,8 @@ pub fn rt() -> &'static mut Runtime {
                 force_timeout: 0,
                 bench: None,
                 perf_traced: 0,
+                skipped: 0,
+                extent_max: 0,
                 layer_buffer: None,
                 started_at: 0,
                 link_changed_at: 0,
@@ -522,6 +529,9 @@ pub fn status_text() -> String {
         if r.perf.redraws > 1 {
             text += &alloc::format!("重绘 {} 次/秒（{} ms）\n", r.perf.redraws, r.perf.redraw_ms);
         }
+    }
+    if r.skipped != 0 {
+        text += &alloc::format!("跳过退化绘制 {} 次（开机以来）\n", r.skipped);
     }
     if r.gpu_resets != 0 {
         text += &alloc::format!("GPU 超时复位 {} 次（开机以来）\n", r.gpu_resets);
@@ -1423,6 +1433,18 @@ fn note_resets(r: &mut Runtime) {
         r.renderer.stats.resets += 1;
     }
     let s = r.renderer.stats;
+    if s.extent >= r.extent_max + 128 || (s.resets != 0 && r.gpu_resets < 24) {
+        r.extent_max = r.extent_max.max(s.extent);
+        trace(&alloc::format!("farthest path point {} px off centre, bounds {:?}{}", s.extent, s.extent_bounds, if s.resets != 0 { " in a frame that timed out" } else { "" }));
+    }
+    if s.skipped != 0 {
+        if r.skipped < 16 {
+            if let Some((det, b)) = s.first_skip {
+                trace(&alloc::format!("degenerate draws left out: {} in this frame; first det {det:e} bounds {b:?}", s.skipped));
+            }
+        }
+        r.skipped += s.skipped;
+    }
     if s.resets == 0 {
         return;
     }
