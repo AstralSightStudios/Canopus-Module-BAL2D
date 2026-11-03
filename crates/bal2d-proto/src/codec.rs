@@ -146,10 +146,13 @@ pub struct Stats {
     /// draws the scene again). 0 from older modules.
     pub flush_ms: u32,
     pub redraws: u32,
+    /// Waits for the GPU since the module started that ran into the driver's 100 ms timeout
+    /// (it resets the GPU and drops what was queued). 0 from older modules.
+    pub gpu_resets: u32,
 }
 
 impl Stats {
-    const WORDS: usize = 18;
+    const WORDS: usize = 19;
     /// Words every reply has (`ui_ms` came later).
     const REQUIRED: usize = 12;
 
@@ -173,6 +176,7 @@ impl Stats {
             self.late_ms,
             self.flush_ms,
             self.redraws,
+            self.gpu_resets,
         ]
     }
 
@@ -196,6 +200,7 @@ impl Stats {
             late_ms: w[15],
             flush_ms: w[16],
             redraws: w[17],
+            gpu_resets: w[18],
         }
     }
 }

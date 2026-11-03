@@ -827,7 +827,7 @@ fn watch_tab(s: &UiState) -> View {
         },
         Some(st) if st.flags & 8 != 0 => "正在加载角色…".into(),
         Some(st) if st.frames > 0 && st.fps_x10 > 0 => format!(
-            "{}.{} fps（{}）· 动画 {} ms · 绘制 {} ms（其中驱动 {} ms、等 GPU {} ms）· GPU 收尾 {} ms{}{} · {} 个三角形 · {} 次绘制{} · 手表剩余内存 {:.1} MB{}",
+            "{}.{} fps（{}）· 动画 {} ms · 绘制 {} ms（其中驱动 {} ms、等 GPU {} ms）· GPU 收尾 {} ms{}{} · {} 个三角形 · {} 次绘制{} · 手表剩余内存 {:.1} MB{}{}",
             st.fps_x10 / 10,
             st.fps_x10 % 10,
             match (st.flags & 32 != 0, st.flags & 64 != 0, st.flags & 128 != 0) {
@@ -853,7 +853,12 @@ fn watch_tab(s: &UiState) -> View {
                 ""
             },
             st.heap_free_kib as f64 / 1024.0,
-            selftest_note(st.flags, st.selftest)
+            selftest_note(st.flags, st.selftest),
+            if st.gpu_resets > 0 {
+                format!(" · GPU 超时复位 {} 次（驱动等 GPU 超过 100 ms 会复位 GPU，这一批绘制丢失，画面会缺一块）", st.gpu_resets)
+            } else {
+                String::new()
+            }
         ),
         Some(st) if st.flags & 2 == 0 => "当前没有显示：表盘没有角色图层且未开启全屏显示。".into(),
         Some(_) => "角色暂停中（熄屏或不在表盘上）。".into(),

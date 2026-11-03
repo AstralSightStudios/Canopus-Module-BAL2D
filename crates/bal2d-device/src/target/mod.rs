@@ -211,6 +211,9 @@ pub struct Runtime {
     /// GPU's output missing from LVGL's layer (then the module's buffer for good).
     direct_checked: u32,
     direct_broken: bool,
+    /// Waits for the GPU since start that ran into the driver's 100 ms timeout (it resets the
+    /// GPU and drops what was queued: parts of a frame go missing).
+    gpu_resets: u32,
     /// LVGL's layer, wrapped for the GPU.
     layer_buffer: Option<gpu::VgBuffer>,
     /// When the module started and when the phone link last changed (breathers).
@@ -281,6 +284,7 @@ pub fn rt() -> &'static mut Runtime {
                 direct_traced: 0,
                 direct_checked: 0,
                 direct_broken: false,
+                gpu_resets: 0,
                 layer_buffer: None,
                 started_at: 0,
                 link_changed_at: 0,
@@ -351,6 +355,7 @@ pub fn stats() -> bal2d_proto::Stats {
         late_ms: p.late_ms,
         flush_ms: p.flush_ms,
         redraws: p.redraws,
+        gpu_resets: r.gpu_resets,
     }
 }
 
@@ -473,6 +478,9 @@ pub fn status_text() -> String {
         if r.perf.redraws > 1 {
             text += &alloc::format!("重绘 {} 次/秒（{} ms）\n", r.perf.redraws, r.perf.redraw_ms);
         }
+    }
+    if r.gpu_resets != 0 {
+        text += &alloc::format!("GPU 超时复位 {} 次（开机以来）\n", r.gpu_resets);
     }
     if r.direct_broken {
         text += "直接绘制自检未通过（GPU 没写进系统缓冲区），已改用缓冲绘制\n";
@@ -1243,6 +1251,21 @@ impl Marks {
     }
 }
 
+/// Counts the frame's GPU timeouts (`gpu::Stats::resets`); the first few go to the log.
+fn note_resets(r: &mut Runtime) {
+    let s = r.renderer.stats;
+    if s.resets == 0 {
+        return;
+    }
+    r.gpu_resets += s.resets;
+    if r.gpu_resets <= 8 {
+        trace(&alloc::format!(
+            "gpu timeout: {} in this frame ({} since start); calls {} batches {}, waited for the GPU {} ms",
+            s.resets, r.gpu_resets, s.calls, s.batches, s.flush_ms
+        ));
+    }
+}
+
 /// Adds a drawn frame's cost to the stats window (`draw`: building and submitting, `gpu`:
 /// waiting for the GPU to finish).
 fn count_draw(r: &mut Runtime, draw: u32, gpu: u32) {
@@ -1271,6 +1294,7 @@ fn draw_own(r: &mut Runtime, rect: (i32, i32, i32, i32)) -> (u32, u32) {
     render(r, &mut target.buffer, (0, 0), [0, 0, w, h], rect);
     let t2 = lv::now_ms();
     r.renderer.finish();
+    note_resets(r);
     // Whatever reads the frame with the CPU (LVGL's software path) must not see cached lines of
     // an earlier one: the GPU writes memory behind the cache.
     fw::cache_flush_invalidate(target.pixels, target.buffer.stride as usize * target.buffer.height as usize);
@@ -1421,6 +1445,7 @@ pub fn on_draw_main(e: *mut c_void) {
     // Done before LVGL goes on: what it draws above comes after in the GPU's queue anyway, but
     // it must not flush the screen with the frame half drawn.
     r.renderer.finish();
+    note_resets(r);
     if cached {
         fw::cache_flush_invalidate(rows.0 as *const u8, rows.1);
     }

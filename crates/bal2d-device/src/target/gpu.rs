@@ -65,6 +65,14 @@ pub fn uncached(addr: usize) -> Option<usize> {
 }
 /// Draw calls between submits (`vg_lite_flush`) within a frame.
 const FLUSH_EVERY: u32 = 48;
+/// Pixels of drawing (the draws' screen rectangles, an upper bound of what they fill) between
+/// submits: one screen. The firmware waits 100 ms for a submit and then resets the GPU and
+/// reports success, so the rest of that submit is lost (on the watch: parts of the character
+/// missing for a frame, some cut into bands). A screen of the heaviest layers takes the
+/// watch's GPU about 10 ms; capping each submit there keeps every wait far below the limit.
+const FLUSH_PIXELS: u32 = 336 * 480;
+/// A wait this long was the driver's 100 ms timeout (and its GPU reset).
+pub const TIMEOUT_MS: u32 = 90;
 /// `VG_LITE_LOW`: no anti-aliasing, so the triangles of a mesh meet without seams.
 const QUALITY_LOW: u8 = 3;
 
@@ -501,6 +509,37 @@ pub struct Stats {
     pub batches: u32,
     pub errors: u32,
     pub last_error: i32,
+    /// Draws and their pixels since the last submit (`FLUSH_EVERY`, `FLUSH_PIXELS`).
+    queued: u32,
+    queued_px: u32,
+    /// Waits for the GPU that ran into the driver's timeout (it reset the GPU).
+    pub resets: u32,
+}
+
+impl Stats {
+    /// Counts a draw of `px` pixels; true when it is time to submit.
+    fn queue(&mut self, px: u32) -> bool {
+        self.queued += 1;
+        self.queued_px = self.queued_px.saturating_add(px);
+        self.queued >= FLUSH_EVERY || self.queued_px >= FLUSH_PIXELS
+    }
+
+    /// A wait of `ms` for the GPU: the driver's timeout when that long.
+    fn waited(&mut self, ms: u32) {
+        if ms >= TIMEOUT_MS {
+            self.resets += 1;
+        }
+    }
+}
+
+/// Pixels of the rectangle `b` (path units) moved by `offset` and cut to `clip` (target pixels).
+fn bounds_px(b: [i16; 4], offset: (f32, f32), clip: [i32; 4]) -> u32 {
+    let k = 1.0 / bal2d_render::PATH_SCALE;
+    let x0 = ((b[0] as f32 * k + offset.0) as i32).max(clip[0]);
+    let y0 = ((b[1] as f32 * k + offset.1) as i32).max(clip[1]);
+    let x1 = ((b[2] as f32 * k + offset.0) as i32 + 1).min(clip[2]);
+    let y1 = ((b[3] as f32 * k + offset.1) as i32 + 1).min(clip[3]);
+    if x1 <= x0 || y1 <= y0 { 0 } else { ((x1 - x0) * (y1 - y0)) as u32 }
 }
 
 /// Per-frame drawing state reused across calls.
@@ -551,7 +590,7 @@ impl Sink<'_> {
             return;
         }
         self.carry(target, pages);
-        let Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode, clut_page, offset, .. } = self;
+        let Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode, clut_page, offset, clip, .. } = self;
         let pattern_mode = *pattern_mode;
         let Some(page) = pages.get_mut(call.page as usize) else { return };
         if let Some(c) = &page.clut {
@@ -572,10 +611,13 @@ impl Sink<'_> {
             let t0 = if timed { super::lv::now_ms() } else { 0 };
             let rc = fw::vg_blit_rect(target.ptr(), page.buffer.ptr(), rect.as_ptr(), m.as_ptr(), blend(call.blend), tint(call.color), FILTER_BILINEAR);
             if timed {
-                stats.submit_ms += super::lv::now_ms().wrapping_sub(t0) * 8;
+                let dt = super::lv::now_ms().wrapping_sub(t0);
+                stats.waited(dt);
+                stats.submit_ms += dt * 8;
             }
             stats.calls += 1;
-            if stats.calls % FLUSH_EVERY == 0 {
+            let px = ((m[0] * m[4] - m[1] * m[3]).abs() * rect[2] as f32 * rect[3] as f32) as u32;
+            if stats.queue(px) {
                 timed_flush(stats);
             }
             if rc != 0 {
@@ -618,12 +660,15 @@ impl Sink<'_> {
             FILTER_BILINEAR,
         );
         if timed {
-            stats.submit_ms += super::lv::now_ms().wrapping_sub(t0) * 8;
+            let dt = super::lv::now_ms().wrapping_sub(t0);
+            stats.waited(dt);
+            stats.submit_ms += dt * 8;
         }
         stats.calls += 1;
         // Hand the GPU work as it accumulates, so it rasterizes while the CPU builds the
-        // next paths (it would otherwise start only at `finish`).
-        if stats.calls % FLUSH_EVERY == 0 {
+        // next paths (it would otherwise start only at `finish`), and in pieces it gets through
+        // well within the driver's timeout.
+        if stats.queue(bounds_px(call.bounds, *offset, *clip)) {
             timed_flush(stats);
         }
         if rc != 0 {
@@ -658,12 +703,14 @@ impl Sink<'_> {
             Some(st) => (st.pending(), st.page == call.page && st.blend == call.blend, st.fits(call.path.len())),
             None => return,
         };
-        if pending > 0 && (!same || pending >= FLUSH_EVERY || !fits) {
+        if pending > 0 && (!same || self.stats.queued >= FLUSH_EVERY || self.stats.queued_px >= FLUSH_PIXELS || !fits) {
             self.carry(target, pages);
         }
         if !fits {
             // Full: the GPU runs what is there before it is written over.
+            let t0 = super::lv::now_ms();
             let rc = fw::vg_finish();
+            self.stats.waited(super::lv::now_ms().wrapping_sub(t0));
             if rc != 0 {
                 self.stats.errors += 1;
                 self.stats.last_error = rc;
@@ -685,6 +732,8 @@ impl Sink<'_> {
             st.draw(call.page, call.blend, &m, &g, tint(call.color), [x0, y0, x1 - x0, y1 - y0], call.bounds, call.path);
         }
         self.stats.calls += 1;
+        self.stats.queued += 1;
+        self.stats.queued_px = self.stats.queued_px.saturating_add(((x1 - x0) * (y1 - y0)) as u32);
     }
 
     /// Hands the open batch to the driver: one draw with the batch's page, blend and first
@@ -709,7 +758,9 @@ impl Sink<'_> {
             color,
             FILTER_BILINEAR,
         );
-        self.stats.submit_ms += super::lv::now_ms().wrapping_sub(t0);
+        let dt = super::lv::now_ms().wrapping_sub(t0);
+        self.stats.waited(dt);
+        self.stats.submit_ms += dt;
         self.stats.batches += 1;
         if rc != 0 {
             self.stats.errors += 1;
@@ -724,7 +775,11 @@ impl Sink<'_> {
 fn timed_flush(stats: &mut Stats) {
     let t0 = super::lv::now_ms();
     let rc = fw::vg_flush();
-    stats.flush_ms += super::lv::now_ms().wrapping_sub(t0);
+    let dt = super::lv::now_ms().wrapping_sub(t0);
+    stats.waited(dt);
+    stats.flush_ms += dt;
+    stats.queued = 0;
+    stats.queued_px = 0;
     if rc != 0 {
         stats.errors += 1;
         stats.last_error = rc;
@@ -838,6 +893,7 @@ impl Renderer {
         fw::vg_set_scissor(clip[0], clip[1], clip[2], clip[3]);
         fw::vg_enable_scissor();
         if let Some((rect, color)) = clear {
+            self.stats.queued_px = (rect[2].max(0) * rect[3].max(0)) as u32;
             let rc = fw::vg_clear(target.ptr(), rect.as_ptr(), color);
             if rc != 0 {
                 self.stats.errors += 1;
@@ -906,7 +962,11 @@ impl Renderer {
     }
 
     pub fn finish(&mut self) {
+        let t0 = super::lv::now_ms();
         let rc = fw::vg_finish();
+        self.stats.waited(super::lv::now_ms().wrapping_sub(t0));
+        self.stats.queued = 0;
+        self.stats.queued_px = 0;
         if rc != 0 {
             self.stats.errors += 1;
             self.stats.last_error = rc;

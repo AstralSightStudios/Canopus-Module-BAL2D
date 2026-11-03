@@ -259,7 +259,12 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
     let mut log: Vec<(u32, i32, i32, u16, u16)> = Vec::new(); // (probe, draw rc, finish rc, pixels)
     let mut now = 0u32;
     let mut step = |wants: &mut Vec<(u32, u32, [i32; 3], i32)>, bit: u32, cell: u32, want: [i32; 3], tol: i32, draw_rc: i32| {
-        let finish_rc = fw::vg_finish();
+        let t0 = super::lv::now_ms();
+        let mut finish_rc = fw::vg_finish();
+        // The driver's timeout: it reset the GPU and says nothing (VG_LITE_TIMEOUT stands in).
+        if finish_rc == 0 && super::lv::now_ms().wrapping_sub(t0) >= gpu::TIMEOUT_MS {
+            finish_rc = 4;
+        }
         if near(pixel(nc, cell * 8 + 4, 4), want, tol) && near(pixel(nc, cell * 8 + 3, 3), want, tol) {
             now |= bit;
         }
