@@ -123,7 +123,8 @@ pub struct Stats {
     pub pack: u32,
     /// Bit 0: the baked background is in use; bit 1: the view is attached; bit 2: visible;
     /// bit 3: a pack is loading; bit 4: the baked idle is playing; bit 5: frames are drawn
-    /// straight into LVGL's layer (direct mode); bits 8..15: why the last load failed (errno-like, 0: it did
+    /// straight into LVGL's layer (direct mode); bit 6: direct frames were read back and found
+    /// in the layer; bit 7: one was not (the module's buffer from then on); bits 8..15: why the last load failed (errno-like, 0: it did
     /// not: 2 no pack, 5 / 22 unreadable, 12 out of memory); bits 16..23: the GPU self-test
     /// (16 ran, 17 could not check, 18 FP32 paths, 19 non-cached writes, 20 32-bit pages,
     /// 21 no PAD edges, 22 blend results off, 23 other results off).

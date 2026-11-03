@@ -828,7 +828,12 @@ fn watch_tab(s: &UiState) -> View {
             "{}.{} fps（{}）· 动画 {} ms · 绘制 {} ms（其中驱动 {} ms、等 GPU {} ms）· GPU 收尾 {} ms{}{} · {} 个三角形 · {} 次绘制{} · 手表剩余内存 {:.1} MB{}",
             st.fps_x10 / 10,
             st.fps_x10 % 10,
-            if st.flags & 32 != 0 { "直接绘制" } else { "缓冲绘制" },
+            match (st.flags & 32 != 0, st.flags & 64 != 0, st.flags & 128 != 0) {
+                (_, _, true) => "缓冲绘制：直接绘制在这块手表上自检未通过",
+                (true, true, _) => "直接绘制，已读回校验",
+                (true, false, _) => "直接绘制",
+                _ => "缓冲绘制",
+            },
             st.update_ms,
             st.draw_ms,
             st.driver_ms,

@@ -207,6 +207,10 @@ pub struct Runtime {
     direct_backoff_until: u32,
     /// Development: DRAW_MAIN calls traced so far.
     direct_traced: u32,
+    /// Direct frames whose pixels were read back (`DIRECT_CHECKS`), and whether one showed the
+    /// GPU's output missing from LVGL's layer (then the module's buffer for good).
+    direct_checked: u32,
+    direct_broken: bool,
     /// LVGL's layer, wrapped for the GPU.
     layer_buffer: Option<gpu::VgBuffer>,
     /// When the module started and when the phone link last changed (breathers).
@@ -275,6 +279,8 @@ pub fn rt() -> &'static mut Runtime {
                 direct_failures: 0,
                 direct_backoff_until: 0,
                 direct_traced: 0,
+                direct_checked: 0,
+                direct_broken: false,
                 layer_buffer: None,
                 started_at: 0,
                 link_changed_at: 0,
@@ -320,6 +326,8 @@ pub fn stats() -> bal2d_proto::Stats {
         flags: r.bake_active as u32
             | (r.idle_active as u32) << 4
             | (p.direct as u32) << 5
+            | ((r.direct_checked >= DIRECT_CHECKS) as u32) << 6
+            | (r.direct_broken as u32) << 7
             | (v.attached() as u32) << 1
             | (v.visible() as u32) << 2
             | (r.loader.is_some() as u32) << 3
@@ -453,6 +461,11 @@ pub fn status_text() -> String {
         if r.perf.redraws > 1 {
             text += &alloc::format!("重绘 {} 次/秒（{} ms）\n", r.perf.redraws, r.perf.redraw_ms);
         }
+    }
+    if r.direct_broken {
+        text += "直接绘制自检未通过（GPU 没写进系统缓冲区），已改用缓冲绘制\n";
+    } else if r.direct_checked >= DIRECT_CHECKS && r.perf.direct {
+        text += "直接绘制：本机读回校验通过\n";
     }
     if r.loader.is_some() {
         text += "正在加载角色…\n";
@@ -1058,6 +1071,7 @@ extern "C" fn frame(timer: *mut c_void) {
     // Straight into LVGL's layer while it stays where it is framed (it is drawn there in the
     // redraw this frame asks for); through the module's buffer while it scrolls.
     let direct = !r.direct_off
+        && !r.direct_broken
         && r.direct_failures < DIRECT_FAILURES
         && now.wrapping_sub(r.direct_moved_at) >= DIRECT_SETTLE_MS
         && (r.direct_backoff_until.wrapping_sub(now) as i32) <= 0;
@@ -1158,6 +1172,57 @@ const DIRECT_FAILURES: u32 = 8;
 /// whose redraws are cheap copies.
 const DIRECT_REDRAWS_PER_FRAME: u32 = 1;
 const DIRECT_BACKOFF_MS: u32 = 10_000;
+/// Direct frames checked by reading pixels back: before drawing, the CPU marks a few pixels of
+/// the area in LVGL's layer; the frame clears or covers every one of them, so a mark still
+/// there after the GPU finished means its writes did not reach the layer (another address the
+/// GPU sees, a cache in the way) and the frames go through the module's buffer from then on.
+const DIRECT_CHECKS: u32 = 8;
+
+/// Pixels marked for the read-back check, inside `clip` (buffer coordinates): byte offsets into
+/// the layer, their marks, and the bytes per pixel.
+struct Marks {
+    at: [usize; 4],
+    mark: [[u8; 4]; 4],
+    bpp: usize,
+}
+
+impl Marks {
+    fn new(layer: &lv::DrawLayer, clip: [i32; 4]) -> Option<Marks> {
+        let bpp = match layer.cf {
+            lv::cf::ARGB8888 | lv::cf::XRGB8888 => 4,
+            lv::cf::RGB565 => 2,
+            lv::cf::RGB888 => 3,
+            _ => return None,
+        };
+        let (w, h) = (clip[2] - clip[0], clip[3] - clip[1]);
+        if w < 4 || h < 4 || layer.data.is_null() {
+            return None;
+        }
+        let mut m = Marks { at: [0; 4], mark: [[0; 4]; 4], bpp };
+        for (i, (fx, fy)) in [(1, 1), (3, 1), (1, 3), (3, 3)].into_iter().enumerate() {
+            let (x, y) = (clip[0] + w * fx / 4, clip[1] + h * fy / 4);
+            m.at[i] = y as usize * layer.stride as usize + x as usize * bpp;
+            let k = i as u8;
+            m.mark[i] = [0x5A ^ k, 0xC3 ^ (k << 4), 0x1E ^ k, 0xA5];
+        }
+        Some(m)
+    }
+
+    fn write(&self, data: *mut u8) {
+        for (at, mark) in self.at.iter().zip(&self.mark) {
+            for (k, b) in mark[..self.bpp].iter().enumerate() {
+                unsafe { core::ptr::write_volatile(data.add(at + k), *b) };
+            }
+        }
+        unsafe { core::arch::asm!("dsb sy") };
+    }
+
+    /// How many marks are still there.
+    fn left(&self, data: *const u8) -> usize {
+        let same = |at: usize, mark: &[u8; 4]| mark[..self.bpp].iter().enumerate().all(|(k, b)| unsafe { core::ptr::read_volatile(data.add(at + k)) } == *b);
+        self.at.iter().zip(&self.mark).filter(|(at, mark)| same(**at, mark)).count()
+    }
+}
 
 /// Adds a drawn frame's cost to the stats window (`draw`: building and submitting, `gpu`:
 /// waiting for the GPU to finish).
@@ -1316,6 +1381,20 @@ pub fn on_draw_main(e: *mut c_void) {
         }
         None => gpu::VgBuffer::wrap(layer.data, layer.width, layer.height, layer.stride, format),
     };
+    let marks = if r.direct_checked < DIRECT_CHECKS { Marks::new(&layer, clip) } else { None };
+    if let Some(m) = &marks {
+        m.write(layer.data);
+    }
+    // The screen's layer is in SRAM, which no cache sits in front of. A layer of its own (an
+    // ancestor fading or zooming) is allocated on the heap in cached PSRAM: what the CPU wrote
+    // there (LVGL's software drawing, the marks) is pushed out first, so later evictions
+    // cannot land on the GPU's output, and the lines are dropped again after it, so the CPU
+    // reads what the GPU wrote. Mirage has no cache: only the real watch needs this.
+    let rows = (layer.data as usize + clip[1] as usize * layer.stride as usize, (clip[3] - clip[1]) as usize * layer.stride as usize);
+    let cached = gpu::uncached(layer.data as usize).is_some();
+    if cached {
+        fw::cache_flush_invalidate(rows.0 as *const u8, rows.1);
+    }
     let t1 = lv::now_ms();
     render(r, &mut buffer, offset, clip, rect);
     r.renderer.end_scissor(&buffer);
@@ -1323,7 +1402,21 @@ pub fn on_draw_main(e: *mut c_void) {
     // Done before LVGL goes on: what it draws above comes after in the GPU's queue anyway, but
     // it must not flush the screen with the frame half drawn.
     r.renderer.finish();
+    if cached {
+        fw::cache_flush_invalidate(rows.0 as *const u8, rows.1);
+    }
     let t3 = lv::now_ms();
+    if let Some(m) = &marks {
+        if m.left(layer.data) == m.at.len() {
+            r.direct_broken = true;
+            trace(&alloc::format!("direct check: the GPU's frame is not in LVGL's layer at {:#x} (cf {:#x}): own buffer from now on", layer.data as usize, layer.cf));
+        } else {
+            r.direct_checked += 1;
+            if r.direct_checked == DIRECT_CHECKS {
+                trace(&alloc::format!("direct check: {DIRECT_CHECKS} frames read back fine (layer {:#x})", layer.data as usize));
+            }
+        }
+    }
     r.layer_buffer = Some(buffer);
     r.direct_failures = 0;
     if r.direct_pending {
