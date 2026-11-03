@@ -2,11 +2,13 @@
 //!
 //! The real watch's GPU hung (the driver's 100 ms timeout, a GPU reset, parts of frames lost,
 //! the system frozen after a few) once features beyond the oldest drawing were on, while every
-//! self-test probe passed and Mirage showed nothing. So frames start with the plainest drawing
-//! (32-bit pages, transparent pattern edges, a driver call per draw, the background drawn as its
-//! slots) and the features are tried one at a time once frames have run clean for a while: a
-//! timeout during a trial marks that feature bad and turns it off at once, a clean trial marks it
-//! good. The verdicts are kept in a file, and the feature under trial is written there before it
+//! self-test probe passed and Mirage showed nothing; even the plainest features timed out once
+//! the later changes to submitting and addressing were in. So frames start exactly as the build
+//! that ran on the watch did (32-bit pages, transparent pattern edges, a driver call per draw,
+//! the background drawn as its slots, the cached PSRAM alias, a submit every 48 draws), and the
+//! features are tried one at a time once frames have run clean for a while: two timeouts during
+//! a trial (one may come anyway) mark that feature bad and turn it off at once, a clean trial
+//! marks it good. The verdicts are kept in a file, and the feature under trial is written there before it
 //! is turned on, so a watch that freezes and restarts during a trial counts it as bad.
 
 use super::host::Fs;
@@ -19,12 +21,18 @@ pub const STREAM: u8 = 2;
 pub const BAKE: u8 = 4;
 /// PAD pattern edges.
 pub const PAD: u8 = 8;
-pub const ALL: u8 = NATIVE | STREAM | BAKE | PAD;
+/// GPU addresses through PSRAM's non-cached alias (`gpu::UNCACHED`).
+pub const UNCACHED: u8 = 16;
+/// Submits split by drawn area too (`gpu::SPLIT`).
+pub const SPLIT: u8 = 32;
+pub const ALL: u8 = NATIVE | STREAM | BAKE | PAD | UNCACHED | SPLIT;
 /// The order of the trials: what saves the most first.
-const ORDER: [u8; 4] = [NATIVE, STREAM, BAKE, PAD];
+const ORDER: [u8; 6] = [NATIVE, STREAM, BAKE, PAD, UNCACHED, SPLIT];
 const FILE: &str = "gpu-trust.bin";
 /// Bumped when the drawing changes enough that old verdicts mean nothing.
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+/// Timeouts during a trial that make the feature bad.
+pub const BAD_RESETS: u32 = 2;
 /// Frames drawn without a timeout before a trial starts, and for one to pass.
 pub const CLEAN_FRAMES: u32 = 120;
 
@@ -68,7 +76,7 @@ impl Trust {
 /// Feature names for the log and the status page.
 pub fn names(mask: u8) -> alloc::string::String {
     let mut t = alloc::string::String::new();
-    for (bit, name) in [(NATIVE, "原格式贴图"), (STREAM, "批量绘制"), (BAKE, "背景烘焙"), (PAD, "边缘延伸")] {
+    for (bit, name) in [(NATIVE, "原格式贴图"), (STREAM, "批量绘制"), (BAKE, "背景烘焙"), (PAD, "边缘延伸"), (UNCACHED, "非缓存地址"), (SPLIT, "按面积提交")] {
         if mask & bit != 0 {
             if !t.is_empty() {
                 t += "、";

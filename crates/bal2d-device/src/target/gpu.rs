@@ -72,8 +72,16 @@ pub fn uncached(addr: usize) -> Option<usize> {
 /// non-cached alias too. CPU writes still go through the cache and are cleaned before the GPU
 /// reads them (`GpuMem::clean`).
 pub fn gpu_addr(addr: usize) -> u32 {
-    uncached(addr).unwrap_or(addr) as u32
+    if UNCACHED.load(Ordering::Relaxed) { uncached(addr).unwrap_or(addr) as u32 } else { addr as u32 }
 }
+
+/// GPU addresses through the non-cached alias (`gpu_addr`; a feature the watch tries, see
+/// `trust`: the old stable drawing gave the GPU the cached alias). Buffers made while it is off
+/// keep the cached alias until re-addressed (`VgBuffer::readdress`) or made again.
+pub static UNCACHED: AtomicBool = AtomicBool::new(true);
+/// Submits also once the draws add up to `FLUSH_PIXELS` (a feature the watch tries; without it
+/// every `FLUSH_EVERY` draws, as the old stable drawing did).
+pub static SPLIT: AtomicBool = AtomicBool::new(false);
 /// Draw calls between submits (`vg_lite_flush`) within a frame.
 const FLUSH_EVERY: u32 = 48;
 /// Pixels of drawing (the draws' screen rectangles, an upper bound of what they fill) between
@@ -197,6 +205,12 @@ impl VgBuffer {
         raw[24..28].copy_from_slice(&gpu_addr(p).to_le_bytes());
         raw[80..82].copy_from_slice(&0x1F00u16.to_le_bytes());
         (self.width, self.height, self.stride) = (width, height, stride);
+    }
+
+    /// Gives the GPU the memory's address as `gpu_addr` now says (cached or non-cached alias).
+    pub fn readdress(&mut self) {
+        let p = u32::from_le_bytes([self.raw[20], self.raw[21], self.raw[22], self.raw[23]]) as usize;
+        self.raw[24..28].copy_from_slice(&gpu_addr(p).to_le_bytes());
     }
 
     pub fn set_image_mode(&mut self, mode: u16) {
@@ -525,8 +539,11 @@ pub struct Stats {
     /// Draws and their pixels since the last submit (`FLUSH_EVERY`, `FLUSH_PIXELS`).
     queued: u32,
     queued_px: u32,
-    /// Waits for the GPU that ran into the driver's timeout (it reset the GPU).
+    /// Waits for the GPU that ran into the driver's timeout (it reset the GPU), and the first
+    /// few of them: (where, ms) with where 1 flush, 2 finish, 3 batch carry, 4 draw, 5 blit, 6
+    /// stream full.
     pub resets: u32,
+    pub long_waits: [(u8, u16); 4],
 }
 
 impl Stats {
@@ -534,12 +551,19 @@ impl Stats {
     fn queue(&mut self, px: u32) -> bool {
         self.queued += 1;
         self.queued_px = self.queued_px.saturating_add(px);
-        self.queued >= FLUSH_EVERY || self.queued_px >= FLUSH_PIXELS
+        self.queued >= FLUSH_EVERY || self.split_due()
     }
 
-    /// A wait of `ms` for the GPU: the driver's timeout when that long.
-    fn waited(&mut self, ms: u32) {
+    fn split_due(&self) -> bool {
+        SPLIT.load(Ordering::Relaxed) && self.queued_px >= FLUSH_PIXELS
+    }
+
+    /// A wait of `ms` for the GPU at `at` (see `long_waits`): the driver's timeout when that long.
+    fn waited(&mut self, ms: u32, at: u8) {
         if ms >= TIMEOUT_MS {
+            if let Some(slot) = self.long_waits.get_mut(self.resets as usize) {
+                *slot = (at, ms.min(65535) as u16);
+            }
             self.resets += 1;
         }
     }
@@ -625,7 +649,7 @@ impl Sink<'_> {
             let rc = fw::vg_blit_rect(target.ptr(), page.buffer.ptr(), rect.as_ptr(), m.as_ptr(), blend(call.blend), tint(call.color), FILTER_BILINEAR);
             if timed {
                 let dt = super::lv::now_ms().wrapping_sub(t0);
-                stats.waited(dt);
+                stats.waited(dt, 5);
                 stats.submit_ms += dt * 8;
             }
             stats.calls += 1;
@@ -674,7 +698,7 @@ impl Sink<'_> {
         );
         if timed {
             let dt = super::lv::now_ms().wrapping_sub(t0);
-            stats.waited(dt);
+            stats.waited(dt, 4);
             stats.submit_ms += dt * 8;
         }
         stats.calls += 1;
@@ -716,14 +740,14 @@ impl Sink<'_> {
             Some(st) => (st.pending(), st.page == call.page && st.blend == call.blend, st.fits(call.path.len())),
             None => return,
         };
-        if pending > 0 && (!same || self.stats.queued >= FLUSH_EVERY || self.stats.queued_px >= FLUSH_PIXELS || !fits) {
+        if pending > 0 && (!same || self.stats.queued >= FLUSH_EVERY || self.stats.split_due() || !fits) {
             self.carry(target, pages);
         }
         if !fits {
             // Full: the GPU runs what is there before it is written over.
             let t0 = super::lv::now_ms();
             let rc = fw::vg_finish();
-            self.stats.waited(super::lv::now_ms().wrapping_sub(t0));
+            self.stats.waited(super::lv::now_ms().wrapping_sub(t0), 6);
             if rc != 0 {
                 self.stats.errors += 1;
                 self.stats.last_error = rc;
@@ -772,7 +796,7 @@ impl Sink<'_> {
             FILTER_BILINEAR,
         );
         let dt = super::lv::now_ms().wrapping_sub(t0);
-        self.stats.waited(dt);
+        self.stats.waited(dt, 3);
         self.stats.submit_ms += dt;
         self.stats.batches += 1;
         if rc != 0 {
@@ -789,7 +813,7 @@ fn timed_flush(stats: &mut Stats) {
     let t0 = super::lv::now_ms();
     let rc = fw::vg_flush();
     let dt = super::lv::now_ms().wrapping_sub(t0);
-    stats.waited(dt);
+    stats.waited(dt, 1);
     stats.flush_ms += dt;
     stats.queued = 0;
     stats.queued_px = 0;
@@ -982,7 +1006,7 @@ impl Renderer {
     pub fn finish(&mut self) {
         let t0 = super::lv::now_ms();
         let rc = fw::vg_finish();
-        self.stats.waited(super::lv::now_ms().wrapping_sub(t0));
+        self.stats.waited(super::lv::now_ms().wrapping_sub(t0), 2);
         self.stats.queued = 0;
         self.stats.queued_px = 0;
         if rc != 0 {
