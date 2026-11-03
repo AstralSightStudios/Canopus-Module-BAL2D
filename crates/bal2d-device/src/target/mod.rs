@@ -203,6 +203,8 @@ pub struct Runtime {
     direct_frame_ms: u32,
     /// DRAW_MAIN calls that could not draw (no usable layer buffer), in a row.
     direct_failures: u32,
+    /// Frames go through the module's buffer until then (LVGL redraws the layer too often).
+    direct_backoff_until: u32,
     /// Development: DRAW_MAIN calls traced so far.
     direct_traced: u32,
     /// LVGL's layer, wrapped for the GPU.
@@ -271,6 +273,7 @@ pub fn rt() -> &'static mut Runtime {
                 direct_moved_at: 0,
                 direct_frame_ms: 0,
                 direct_failures: 0,
+                direct_backoff_until: 0,
                 direct_traced: 0,
                 layer_buffer: None,
                 started_at: 0,
@@ -1054,7 +1057,10 @@ extern "C" fn frame(timer: *mut c_void) {
     let t1 = lv::now_ms();
     // Straight into LVGL's layer while it stays where it is framed (it is drawn there in the
     // redraw this frame asks for); through the module's buffer while it scrolls.
-    let direct = !r.direct_off && r.direct_failures < DIRECT_FAILURES && now.wrapping_sub(r.direct_moved_at) >= DIRECT_SETTLE_MS;
+    let direct = !r.direct_off
+        && r.direct_failures < DIRECT_FAILURES
+        && now.wrapping_sub(r.direct_moved_at) >= DIRECT_SETTLE_MS
+        && (r.direct_backoff_until.wrapping_sub(now) as i32) <= 0;
     let t3 = if direct {
         if !r.direct {
             trace("direct drawing");
@@ -1135,6 +1141,10 @@ extern "C" fn frame(timer: *mut c_void) {
                 r.perf.last_error
             ));
         }
+        if r.perf.direct && r.perf.redraws > r.perf.drawn.max(1) * DIRECT_REDRAWS_PER_FRAME {
+            r.direct_backoff_until = now.wrapping_add(DIRECT_BACKOFF_MS);
+            trace(&alloc::format!("{} redraws for {} frames: own buffer for a while", r.perf.redraws, r.perf.drawn));
+        }
         r.window = Perf::default();
         r.window_start = now;
     }
@@ -1142,6 +1152,12 @@ extern "C" fn frame(timer: *mut c_void) {
 
 /// Direct DRAW_MAIN calls that may fail in a row before frames go through the module's buffer.
 const DIRECT_FAILURES: u32 = 8;
+/// LVGL redrawing the layer more often than this per drawn frame (an animated watchface under
+/// it invalidates its own areas all the time; each redraw draws the scene again in direct
+/// mode, unseen by the pacing): frames go through the module's buffer for `DIRECT_BACKOFF_MS`,
+/// whose redraws are cheap copies.
+const DIRECT_REDRAWS_PER_FRAME: u32 = 1;
+const DIRECT_BACKOFF_MS: u32 = 10_000;
 
 /// Adds a drawn frame's cost to the stats window (`draw`: building and submitting, `gpu`:
 /// waiting for the GPU to finish).
@@ -1206,6 +1222,9 @@ fn render(r: &mut Runtime, target: &mut gpu::VgBuffer, offset: (i32, i32), clip:
     let cx = cam.cx + (ox + w as f32 * 0.5 - fw_w * 0.5) / cam.scale;
     let cy = cam.cy - (oy + h as f32 * 0.5 - fw_h * 0.5) / cam.scale;
     let size = (w as f32, h as f32);
+    // A partial redraw: baked calls outside it build no path (a pixel of margin).
+    let view = [(clip[0] - offset.0 - 1) as f32, (clip[1] - offset.1 - 1) as f32, (clip[2] - offset.0 + 1) as f32, (clip[3] - offset.1 + 1) as f32];
+    lobby.idle_view = (view[0] > 0.0 || view[1] > 0.0 || view[2] < size.0 || view[3] < size.1).then_some(view);
     for li in 0..lobby.layers.len() {
         let Some(pages) = pages.get_mut(li) else { break };
         if *baked_mask & (1 << li.min(31)) != 0 {
@@ -1226,8 +1245,15 @@ pub fn on_draw_main(e: *mut c_void) {
         return;
     }
     let v = view::view();
-    let Some(layer) = (unsafe { lv::draw_layer(e) }) else {
+    // A layer without a buffer yet (an ancestor fading is drawn into a layer of its own, whose
+    // buffer comes with its first task) or of another format: nothing drawn this time, through
+    // the module's buffer for a while (LVGL draws that as an image), for good after a few.
+    let fail = |r: &mut Runtime| {
         r.direct_failures += 1;
+        r.direct_moved_at = lv::now_ms();
+    };
+    let Some(layer) = (unsafe { lv::draw_layer(e) }) else {
+        fail(r);
         return;
     };
     let format = match layer.cf {
@@ -1236,7 +1262,7 @@ pub fn on_draw_main(e: *mut c_void) {
         lv::cf::RGB565 => gpu::VG_FMT_BGR565,
         lv::cf::RGB888 => gpu::VG_FMT_BGR888,
         _ => {
-            r.direct_failures += 1;
+            fail(r);
             return;
         }
     };

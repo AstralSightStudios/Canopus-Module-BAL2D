@@ -146,6 +146,9 @@ pub struct Lobby {
     pub bake: Option<Bake>,
     /// Per layer: its idle loop baked into GPU calls (`idle`), once loaded (`load_idle`).
     pub idle: Vec<Option<idle::IdleLayer>>,
+    /// The part of the layer `draw_idle` is drawn for (layer pixels: x0, y0, x1, y1), when only
+    /// part of it is (a partial redraw): calls wholly outside build no path. None: all of it.
+    pub idle_view: Option<[f32; 4]>,
     /// Per layer: the pack section of its baked idle, if it has one.
     pub idle_entries: Vec<Option<bal2d_pack::Entry>>,
     /// Per layer: time its baked idle has played that its skeleton has not (`update_with`).
@@ -281,6 +284,7 @@ impl Lobby {
             time: 0.0,
             bake,
             idle_pending: alloc::vec![0.0; layers_len],
+            idle_view: None,
             idle,
             idle_entries,
         };
@@ -741,7 +745,8 @@ impl Lobby {
         let (Some(l), Some(Some(b))) = (self.layers.get(layer), self.idle.get_mut(layer)) else { return 0 };
         let Some(e) = l.state.current(0) else { return 0 };
         let tau = idle::wrap(l.state.entry(e).track_time + pending - b.bake.start, b.bake.period);
-        b.draw(&l.data, &l.skeleton, cam, tau, origin, size, page_size, emit)
+        let view = self.idle_view.unwrap_or([0.0, 0.0, size.0, size.1]);
+        b.draw(&l.data, &l.skeleton, cam, tau, origin, size, view, page_size, emit)
     }
 
     /// Whether the baked image stands in for its slots now: always, or once the intro is over

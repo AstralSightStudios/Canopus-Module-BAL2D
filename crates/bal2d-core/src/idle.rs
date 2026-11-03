@@ -204,6 +204,7 @@ impl IdleLayer {
         tau: f32,
         origin: (f32, f32),
         size: (f32, f32),
+        view: [f32; 4],
         page_size: &dyn Fn(u32) -> Option<(f32, f32)>,
         emit: &mut dyn FnMut(&Call),
     ) -> u32 {
@@ -214,7 +215,8 @@ impl IdleLayer {
         if !self.seek(f) {
             return 0;
         }
-        let (lx, ly) = (path_coord(size.0), path_coord(size.1));
+        // Calls wholly outside the part drawn (path units) build no path.
+        let (vx0, vy0, lx, ly) = (path_coord(view[0]), path_coord(view[1]), path_coord(view[2]), path_coord(view[3]));
         let k = bal2d_render::PATH_SCALE;
         let mut triangles = 0;
         let mut i = 0;
@@ -292,7 +294,7 @@ impl IdleLayer {
                     lo = [lo[0].min(q[0]), lo[1].min(q[1])];
                     hi = [hi[0].max(q[0]), hi[1].max(q[1])];
                 }
-                if hi[0] < 0 || hi[1] < 0 || lo[0] > lx || lo[1] > ly {
+                if hi[0] < vx0 || hi[1] < vy0 || lo[0] > lx || lo[1] > ly {
                     continue;
                 }
                 if loops.is_empty() {
@@ -314,7 +316,7 @@ impl IdleLayer {
                         first = false;
                     }
                 }
-                if hi[0] < 0 || hi[1] < 0 || lo[0] > lx || lo[1] > ly || path.is_empty() {
+                if path.is_empty() {
                     continue;
                 }
                 path.push(0);
