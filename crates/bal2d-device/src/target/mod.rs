@@ -751,10 +751,7 @@ fn load_step() -> Option<i32> {
         // the baked idles loaded early go, the pages come first.
         if !heap_allows(page_bytes(p) + 64 * 1024) {
             if let Some(lobby) = l.lobby.as_mut() {
-                if lobby.idle.iter().any(|i| i.is_some()) {
-                    lobby.idle.iter_mut().for_each(|i| *i = None);
-                    trace(&alloc::format!("page {}: no room next to the baked idles, dropped them; heap: free {} KB", l.next, heap_free_kb()));
-                }
+                drop_idles(lobby, "a page");
             }
         }
         if !heap_allows(page_bytes(p) + 64 * 1024) {
@@ -770,6 +767,18 @@ fn load_step() -> Option<i32> {
         l.next += 1;
         return None;
     }
+    // The background image, like the pages: room first (early idles go, else the image does).
+    let bake_need = l.lobby.as_ref().and_then(|lb| lb.bake.as_ref()).map_or(0, |b| b.header.width as usize * b.header.height as usize * 2 + 64);
+    if bake_need > 0 && !heap_allows(bake_need + 64 * 1024) {
+        if let Some(lb) = l.lobby.as_mut() {
+            drop_idles(lb, "background image");
+            if !heap_allows(bake_need + 64 * 1024) {
+                trace(&alloc::format!("background image: {} KB do not fit, drawn as its slots", bake_need / 1024));
+                lb.bake = None;
+            }
+        }
+    }
+    let Some(lobby) = l.lobby.as_ref() else { return Some(-22) };
     let bake = match &lobby.bake {
         Some(b) => match gpu::BakeImage::from_pack(&mut l.src, b) {
             Ok(img) => {
@@ -809,6 +818,18 @@ fn load_step() -> Option<i32> {
         verts = verts.max(v);
         idx = idx.max(i);
     }
+    // Their room first too (vertex and index lists, batches, the renderer's grouping, outline
+    // and stream buffers: an estimate on the generous side).
+    let buffers = verts * 16 + idx * 2 + 32 * 1024 + max_tris * 480 + 128 * 1024;
+    if !heap_allows(buffers + 64 * 1024) {
+        if let Some(lb) = l.lobby.as_mut() {
+            drop_idles(lb, "working buffers");
+        }
+        if !heap_allows(buffers + 64 * 1024) {
+            trace(&alloc::format!("buffers: about {} KB do not fit; heap: free {} KB", buffers / 1024, heap_free_kb()));
+            return Some(-12);
+        }
+    }
     let ok = r.list.positions.try_reserve_exact(verts * 2).is_ok()
         && r.list.uvs.try_reserve_exact(verts * 2).is_ok()
         && r.list.indices.try_reserve_exact(idx).is_ok()
@@ -843,6 +864,15 @@ fn load_step() -> Option<i32> {
     r.pages = l.per_layer;
     r.bake = bake;
     Some(0)
+}
+
+/// Frees the baked idles loaded early (they come last, into what is left: what else a pack
+/// needs comes first).
+fn drop_idles(lobby: &mut Lobby, for_what: &str) {
+    if lobby.idle.iter().any(|i| i.is_some()) {
+        lobby.idle.iter_mut().for_each(|i| *i = None);
+        trace(&alloc::format!("not enough room for {for_what} next to the baked idles: dropped them; heap: free {} KB", heap_free_kb()));
+    }
 }
 
 /// Bytes a page takes uploaded (widened to BGRA8888 when its format is one the GPU gets wrong
