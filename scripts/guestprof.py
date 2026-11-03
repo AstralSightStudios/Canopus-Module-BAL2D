@@ -56,6 +56,7 @@ def main():
     ap.add_argument("after")
     ap.add_argument("--top", type=int, default=40)
     ap.add_argument("--device", default="bal2d-dev-043")
+    ap.add_argument("--func", help="module function (substring): its hottest instructions, disassembled")
     a = ap.parse_args()
     A, B = load(a.before), load(a.after)
     diff = {k: B[k] - A.get(k, 0) for k in B if B[k] - A.get(k, 0) > 0}
@@ -105,6 +106,36 @@ def main():
     print(f"{total} samples; module {100 * mod / total:.1f}%")
     for k, n in by.most_common(a.top):
         print(f"{100 * n / total:5.1f}%  {k}")
+    if a.func and base:
+        import capstone
+        md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB | capstone.CS_MODE_MCLASS)
+        md.skipdata = True
+        for i, (addr, name) in enumerate(syms):
+            if a.func not in name:
+                continue
+            addr &= ~1
+            end = (syms[i + 1][0] & ~1) if i + 1 < len(syms) else len(text)
+            hot = collections.Counter()
+            for pc, n in pcs.items():
+                if base + addr <= pc < base + end:
+                    hot[pc - base - addr] += n
+            fn = sum(hot.values())
+            if not fn:
+                continue
+            print(f"\n{name[:100]} ({end - addr} bytes, {100 * fn / total:.1f}%)")
+            ins = {x.address: x for x in md.disasm(text[addr:end], addr)}
+            # Windows of instructions around the hottest offsets.
+            shown = set()
+            for off, n in hot.most_common(12):
+                off &= ~1
+                for o in range(off - 12, off + 4, 2):
+                    x = ins.get(addr + o)
+                    if x is None or o in shown:
+                        continue
+                    shown.add(o)
+                    c = hot.get(o, 0)
+                    print(f"  +{o:5x} {100 * c / total:5.2f}%  {x.mnemonic} {x.op_str}")
+                print("  ...")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,10 @@ pub struct IdleLayer {
     acc: Vec<[f32; 3]>,
     fixed: Vec<[i16; 2]>,
     mats: Vec<[f32; 6]>,
+    /// Per call of the run: its bounds (path units, a margin wider than its vertices); the
+    /// vertices the run touched.
+    boxes: Vec<[i16; 4]>,
+    touched: Vec<u16>,
     /// Per live run: the slots left out of its draw list; and the list and grouping it uses.
     live_skip: Vec<Vec<bool>>,
     live_list: DrawList,
@@ -115,6 +119,8 @@ impl IdleLayer {
             acc: Vec::new(),
             fixed: Vec::new(),
             mats: Vec::new(),
+            boxes: Vec::new(),
+            touched: Vec::new(),
             live_skip,
             live_list: DrawList::default(),
             live_paths: {
@@ -244,11 +250,20 @@ impl IdleLayer {
             let Some((page, tris, verts)) = geometry(data, att) else { continue };
             let Some((pw, ph)) = page_size(page) else { continue };
             let uvs = uvs(data, att);
-            // Each call's texel -> target affine, and the vertices' summed positions.
+            if uvs.len() < verts * 2 {
+                continue;
+            }
+            // Each call's texel -> target affine, the vertices' summed positions (and which
+            // were touched), and the call's bounds from its own placement, a margin wider: the
+            // averaging below moves a shared vertex by far less (the bounds cull and size the
+            // GPU's tessellation window, which may be larger than the path).
             self.mats.clear();
+            self.boxes.clear();
+            self.touched.clear();
             if self.acc.len() < verts {
                 self.acc.resize(verts, [0.0; 3]);
             }
+            let margin = 2.0 * k;
             for c in &self.cur[run.clone()] {
                 let shape = &self.bake.shapes[c.shape as usize];
                 let m1 = c.m1.or_else(|| self.next.get(*self.next_of.get(c.shape as usize)? as usize).map(|n| n.m0)).unwrap_or(c.m0);
@@ -262,38 +277,49 @@ impl IdleLayer {
                 // uv -> path units.
                 let u = [m[0] * pw * k, m[1] * ph * k, m[2] * k, m[3] * pw * k, m[4] * ph * k, m[5] * k];
                 let vs = &self.verts[self.vert_at[c.shape as usize] as usize..self.vert_at[c.shape as usize + 1] as usize];
+                let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                let acc = &mut self.acc[..verts];
                 for &v in vs {
-                    let (x, y) = (uvs[v as usize * 2], uvs[v as usize * 2 + 1]);
-                    let a = &mut self.acc[v as usize];
-                    a[0] += u[0] * x + u[1] * y + u[2];
-                    a[1] += u[3] * x + u[4] * y + u[5];
+                    let v = v as usize;
+                    // SAFETY: `IdleLayer::new` checked every vertex of every shape against the
+                    // attachment's vertex count `verts`; `uvs` holds `verts` pairs (above).
+                    let (x, y, a) = unsafe { (*uvs.get_unchecked(v * 2), *uvs.get_unchecked(v * 2 + 1), acc.get_unchecked_mut(v)) };
+                    let (px, py) = (u[0] * x + u[1] * y + u[2], u[3] * x + u[4] * y + u[5]);
+                    x0 = x0.min(px);
+                    x1 = x1.max(px);
+                    y0 = y0.min(py);
+                    y1 = y1.max(py);
+                    if a[2] == 0.0 {
+                        self.touched.push(v as u16);
+                    }
+                    a[0] += px;
+                    a[1] += py;
                     a[2] += 1.0;
                 }
+                self.boxes.push([(x0 - margin) as i16, (y0 - margin) as i16, (x1 + margin) as i16, (y1 + margin) as i16]);
                 self.mats.push(m);
             }
-            // Averaged once per vertex (most are used by one call: no division then).
+            // Averaged once per vertex used (most by one call: no division then).
             if self.fixed.len() < verts {
                 self.fixed.resize(verts, [0; 2]);
             }
-            for (a, f) in self.acc[..verts].iter_mut().zip(&mut self.fixed) {
-                if a[2] > 0.0 {
-                    let w = if a[2] == 1.0 { 1.0 } else { 1.0 / a[2] };
-                    *f = [clamp16(a[0] * w), clamp16(a[1] * w)];
-                    *a = [0.0; 3];
-                }
+            for &v in &self.touched {
+                let (a, f) = (&mut self.acc[v as usize], &mut self.fixed[v as usize]);
+                *f = if a[2] > 1.5 {
+                    let w = 1.0 / a[2];
+                    [(a[0] * w) as i16, (a[1] * w) as i16]
+                } else {
+                    [a[0] as i16, a[1] as i16]
+                };
+                *a = [0.0; 3];
             }
-            for (c, m) in self.cur[run].iter().zip(&self.mats) {
+            for ((c, m), bx) in self.cur[run].iter().zip(&self.mats).zip(&self.boxes) {
                 let shape = &self.bake.shapes[c.shape as usize];
                 let path = &mut self.path;
                 path.clear();
                 let loops = &self.outline[self.outline_at[c.shape as usize] as usize..self.outline_at[c.shape as usize + 1] as usize];
                 path.reserve(if loops.is_empty() { shape.tris.len() * 10 + 2 } else { loops.len() * 3 + 2 });
-                let (mut lo, mut hi) = ([i16::MAX; 2], [i16::MIN; 2]);
-                for &v in &self.verts[self.vert_at[c.shape as usize] as usize..self.vert_at[c.shape as usize + 1] as usize] {
-                    let q = self.fixed[v as usize];
-                    lo = [lo[0].min(q[0]), lo[1].min(q[1])];
-                    hi = [hi[0].max(q[0]), hi[1].max(q[1])];
-                }
+                let (lo, hi) = ([bx[0], bx[1]], [bx[2], bx[3]]);
                 if hi[0] < vx0 || hi[1] < vy0 || lo[0] > lx || lo[1] > ly {
                     continue;
                 }
@@ -406,10 +432,6 @@ fn outline_of(tris: &[u16], sel: &[u16], s: &mut OutlineScratch, out: &mut Vec<u
         out.push(u16::MAX);
     }
     !s.boundary.is_empty()
-}
-
-fn clamp16(v: f32) -> i16 {
-    v.clamp(-32768.0, 32767.0) as i16
 }
 
 /// The texel -> screen affine of fixed-point parameters `p` (interpolated, so in f32).
