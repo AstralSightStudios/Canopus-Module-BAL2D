@@ -862,15 +862,23 @@ pub const PATH_CLOSE: u32 = 1;
 #[cfg(feature = "outline")]
 #[derive(Default)]
 pub struct Outline {
-    /// Directed edges: from, to, start point, the next edge out of the same vertex, and whether
-    /// it is still there (not cancelled by its reverse, not yet chained).
-    edges: Vec<(u32, u32, [f32; 2])>,
-    next: Vec<u32>,
-    alive: Vec<bool>,
+    edges: Vec<Edge>,
     /// Per vertex id: its first outgoing edge, valid when stamped with this call's `stamp`.
     head: Vec<u32>,
     head_stamp: Vec<u32>,
     stamp: u32,
+}
+
+/// A directed edge of [`outline`]: where it goes, the next edge out of the same vertex, its start
+/// point, and whether it is still there (not cancelled by its reverse, not yet chained).
+#[cfg(feature = "outline")]
+#[derive(Clone, Copy)]
+struct Edge {
+    from: u32,
+    to: u32,
+    next: u32,
+    alive: bool,
+    p: [f32; 2],
 }
 
 #[cfg(feature = "outline")]
@@ -882,17 +890,8 @@ impl Outline {
     pub fn reserve(&mut self, triangles: usize) -> bool {
         let n = triangles * 3;
         self.edges.try_reserve_exact(n.saturating_sub(self.edges.capacity())).is_ok()
-            && self.next.try_reserve_exact(n.saturating_sub(self.next.capacity())).is_ok()
-            && self.alive.try_reserve_exact(n.saturating_sub(self.alive.capacity())).is_ok()
             && self.head.try_reserve_exact(n.saturating_sub(self.head.capacity())).is_ok()
             && self.head_stamp.try_reserve_exact(n.saturating_sub(self.head_stamp.capacity())).is_ok()
-    }
-
-    fn head_of(&self, v: u32) -> u32 {
-        match self.head_stamp.get(v as usize) {
-            Some(&s) if s == self.stamp => self.head[v as usize],
-            _ => NO_EDGE,
-        }
     }
 }
 
@@ -909,14 +908,24 @@ impl Outline {
 /// winning direction, as with counting), and the loops are walked along the same lists.
 /// Sorting the edges was a third of all time on the watch while a layer played live.
 pub fn outline(tris: &[Tri], members: &[u32], scratch: &mut Outline, mut emit: impl FnMut(u32, f32, f32)) {
-    scratch.edges.clear();
-    scratch.next.clear();
-    scratch.alive.clear();
-    scratch.stamp = scratch.stamp.wrapping_add(1);
-    if scratch.stamp == 0 {
-        scratch.head_stamp.iter_mut().for_each(|s| *s = 0);
-        scratch.stamp = 1;
+    let Outline { edges, head, head_stamp, stamp } = scratch;
+    edges.clear();
+    *stamp = stamp.wrapping_add(1);
+    if *stamp == 0 {
+        head_stamp.iter_mut().for_each(|s| *s = 0);
+        *stamp = 1;
     }
+    let stamp = *stamp;
+    // The vertex lists cover every id the group uses (grown once, then kept).
+    let top = members.iter().flat_map(|&ti| tris[ti as usize].v).max().map_or(0, |v| v as usize + 1);
+    if head.len() < top {
+        head.resize(top, NO_EDGE);
+        head_stamp.resize(top, 0);
+    }
+    let first_of = |head: &[u32], head_stamp: &[u32], v: u32| -> u32 {
+        // SAFETY: every vertex id of the group is below `top <= head.len()`.
+        unsafe { if *head_stamp.get_unchecked(v as usize) == stamp { *head.get_unchecked(v as usize) } else { NO_EDGE } }
+    };
     for &ti in members {
         let t = &tris[ti as usize];
         let area = (t.s[1][0] - t.s[0][0]) * (t.s[2][1] - t.s[0][1]) - (t.s[2][0] - t.s[0][0]) * (t.s[1][1] - t.s[0][1]);
@@ -928,56 +937,51 @@ pub fn outline(tris: &[Tri], members: &[u32], scratch: &mut Outline, mut emit: i
                 continue;
             }
             // A live b -> a cancels this edge (and goes).
-            let mut e = scratch.head_of(b);
+            let mut e = first_of(head, head_stamp, b);
             let mut cancelled = false;
             while e != NO_EDGE {
-                let x = e as usize;
-                if scratch.alive[x] && scratch.edges[x].1 == a {
-                    scratch.alive[x] = false;
+                // SAFETY: list links are indices of pushed edges.
+                let x = unsafe { edges.get_unchecked_mut(e as usize) };
+                if x.alive && x.to == a {
+                    x.alive = false;
                     cancelled = true;
                     break;
                 }
-                e = scratch.next[x];
+                e = x.next;
             }
             if cancelled {
                 continue;
             }
-            let n = scratch.edges.len() as u32;
-            if scratch.head.len() <= a as usize {
-                scratch.head.resize(a as usize + 1, NO_EDGE);
-                scratch.head_stamp.resize(a as usize + 1, 0);
-            }
-            let first = scratch.head_of(a);
-            scratch.edges.push((a, b, t.s[i]));
-            scratch.next.push(first);
-            scratch.alive.push(true);
-            scratch.head[a as usize] = n;
-            scratch.head_stamp[a as usize] = scratch.stamp;
+            let n = edges.len() as u32;
+            edges.push(Edge { from: a, to: b, next: first_of(head, head_stamp, a), alive: true, p: t.s[i] });
+            head[a as usize] = n;
+            head_stamp[a as usize] = stamp;
         }
     }
-    for first in 0..scratch.edges.len() {
-        if !scratch.alive[first] {
+    let count = edges.len();
+    for first in 0..count {
+        if !edges[first].alive {
             continue;
         }
-        scratch.alive[first] = false;
-        let (start, to, p) = scratch.edges[first];
+        edges[first].alive = false;
+        let Edge { from: start, to, p, .. } = edges[first];
         emit(PATH_MOVE, p[0], p[1]);
         let mut cur = to;
-        let mut guard = scratch.edges.len();
+        let mut guard = count;
         while cur != start && guard > 0 {
             guard -= 1;
-            let mut e = scratch.head_of(cur);
-            while e != NO_EDGE && !scratch.alive[e as usize] {
-                e = scratch.next[e as usize];
+            let mut e = if (cur as usize) < head.len() { first_of(head, head_stamp, cur) } else { NO_EDGE };
+            // SAFETY: list links are indices of pushed edges.
+            while e != NO_EDGE && unsafe { !edges.get_unchecked(e as usize).alive } {
+                e = unsafe { edges.get_unchecked(e as usize).next };
             }
             if e == NO_EDGE {
                 break;
             }
-            let x = e as usize;
-            scratch.alive[x] = false;
-            let (_, to, p) = scratch.edges[x];
-            emit(PATH_LINE, p[0], p[1]);
-            cur = to;
+            let x = &mut edges[e as usize];
+            x.alive = false;
+            emit(PATH_LINE, x.p[0], x.p[1]);
+            cur = x.to;
         }
         emit(PATH_CLOSE, 0.0, 0.0);
     }
