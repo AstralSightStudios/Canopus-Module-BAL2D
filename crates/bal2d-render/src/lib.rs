@@ -3,7 +3,7 @@
 #![no_std]
 
 extern crate alloc;
-#[cfg(feature = "outline")]
+#[cfg(feature = "host")]
 extern crate std;
 
 use alloc::vec::Vec;
@@ -115,7 +115,7 @@ fn build_slot(data: &SkeletonData, sk: &Skeleton, out: &mut DrawList, skip: Opti
             (m.color, region.page, &m.uvs[..], &m.triangles[..])
         }
         AttachmentKind::Clipping(c) => {
-            #[cfg(feature = "outline")]
+            #[cfg(feature = "host")]
             if std::env::var("BAL2D_NO_CLIP").is_ok() {
                 return;
             }
@@ -603,6 +603,14 @@ pub struct Call<'a> {
     /// With [`Paths::blits`]: the group is this texel rectangle (x, y, width, height) mapped by
     /// `matrix`, to be drawn as an image blit (`path` is then empty).
     pub rect: Option<[i32; 4]>,
+    /// What the draw is of, the same from frame to frame: `slot << 16 | attachment` (16 bits),
+    /// or for a baked idle shape `1 << 31 | shape`.
+    pub tag: u32,
+}
+
+/// [`Call::tag`] of a batch's draws.
+pub fn batch_tag(b: &Batch) -> u32 {
+    (b.slot as u32 & 0x7FFF) << 16 | (b.attachment & 0xFFFF)
 }
 
 /// Turns draw lists into GPU calls: the visible triangles of each batch, grouped by affine
@@ -620,6 +628,8 @@ pub struct Paths {
     tris: Vec<Tri>,
     #[cfg(feature = "outline")]
     outline: Outline,
+    #[cfg(feature = "outline")]
+    seq: Vec<u32>,
     data: Vec<i16>,
     /// Screen-space tolerance of the affine clustering (pixels).
     pub tolerance: f32,
@@ -637,7 +647,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn new() -> Paths {
-        Paths { tolerance: 0.75, ..Default::default() }
+        Paths { tolerance: 0.75, outline_paths: cfg!(feature = "outline"), ..Default::default() }
     }
 
     /// Room for batches of up to `max_triangles` triangles.
@@ -652,6 +662,8 @@ impl Paths {
     #[cfg(feature = "outline")]
     fn reserve_outline(&mut self, n: usize) -> bool {
         self.outline.reserve(n)
+            && self.tris.try_reserve_exact(n.saturating_sub(self.tris.capacity())).is_ok()
+            && self.seq.try_reserve_exact(n.saturating_sub(self.seq.capacity())).is_ok()
     }
 
     #[cfg(not(feature = "outline"))]
@@ -752,7 +764,7 @@ impl Paths {
                     self.triangles += 2;
                     self.calls += 1;
                     self.rects += 1;
-                    emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &[], bounds: [0; 4], matrix: m, rect: Some(rect) });
+                    emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &[], bounds: [0; 4], matrix: m, rect: Some(rect), tag: batch_tag(b) });
                     continue;
                 }
             }
@@ -779,7 +791,7 @@ impl Paths {
                     if let Some(rect) = texel_rect(&pair).filter(|_| pair.iter().all(|t| t.error(&matrix) <= BLIT_ERROR)) {
                         self.calls += 1;
                         self.rects += 1;
-                        emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &[], bounds: [0; 4], matrix, rect: Some(rect) });
+                        emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &[], bounds: [0; 4], matrix, rect: Some(rect), tag: batch_tag(b) });
                         continue;
                     }
                 }
@@ -796,8 +808,9 @@ impl Paths {
                     {
                         self.tris.clear();
                         self.tris.extend(members.iter().map(|&m| tri(m)));
-                        let all: Vec<u32> = (0..self.tris.len() as u32).collect();
-                        outline(&self.tris, &all, &mut self.outline, |op, x, y| {
+                        self.seq.clear();
+                        self.seq.extend(0..self.tris.len() as u32);
+                        outline(&self.tris, &self.seq, &mut self.outline, |op, x, y| {
                             d.push(op as i16);
                             if op != PATH_CLOSE {
                                 let q = [path_coord(x), path_coord(y)];
@@ -834,7 +847,7 @@ impl Paths {
                     d.push(0);
                 }
                 self.calls += 1;
-                emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &self.data, bounds: [lo[0], lo[1], hi[0], hi[1]], matrix, rect: None });
+                emit(&Call { page: b.page, blend: b.blend, color: b.color, path: &self.data, bounds: [lo[0], lo[1], hi[0], hi[1]], matrix, rect: None, tag: batch_tag(b) });
             }
         }
     }

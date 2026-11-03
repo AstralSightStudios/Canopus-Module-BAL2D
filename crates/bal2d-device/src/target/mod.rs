@@ -247,6 +247,10 @@ pub struct Runtime {
     /// The farthest path coordinate seen so far (pixels from the target's middle; new records
     /// are logged in steps).
     extent_max: u32,
+    /// Hung submits whose draws went to the log; development (`dev-gpu-hang` "auto"): fake a
+    /// hang on a draw picked after a while.
+    hang_dumps: u32,
+    fake_auto: bool,
     /// LVGL's layer, wrapped for the GPU.
     layer_buffer: Option<gpu::VgBuffer>,
     /// When the module started and when the phone link last changed (breathers).
@@ -336,6 +340,8 @@ pub fn rt() -> &'static mut Runtime {
                 perf_traced: 0,
                 skipped: 0,
                 extent_max: 0,
+                hang_dumps: 0,
+                fake_auto: false,
                 layer_buffer: None,
                 started_at: 0,
                 link_changed_at: 0,
@@ -818,6 +824,7 @@ fn load_step() -> Option<i32> {
     r.renderer.paths.tolerance = TOLERANCES[0];
     r.quality_changed = lv::now_ms();
     r.pack = l.name;
+    Fs::remove(BANS_FILE);
     r.lobby = l.lobby;
     r.pages = l.per_layer;
     r.bake = bake;
@@ -1114,6 +1121,11 @@ extern "C" fn frame(timer: *mut c_void) {
                 "gpu bench (ms/screen x10): clear {} tex32 {} (non-cached {}) tex8565 {} (non-cached {}) blit565 {}; timeouts {}; submit {} px",
                 b.clear, b.tex32, b.tex32_nc, b.tex24, b.tex24_nc, b.blit, b.timeouts, b.split_px()
             ));
+        }
+        if let Some(b) = Fs::read("dev-gpu-hang", 16) {
+            let t = core::str::from_utf8(&b).unwrap_or("").trim();
+            r.fake_auto = t == "auto";
+            r.renderer.hangs.fake = u32::from_str_radix(t.trim_start_matches("0x"), 16).unwrap_or(0);
         }
         r.trust = trust::Trust::load();
         r.features = r.trust.good;
@@ -1445,6 +1457,7 @@ fn note_resets(r: &mut Runtime) {
         }
         r.skipped += s.skipped;
     }
+    note_hangs(r);
     if s.resets == 0 {
         return;
     }
@@ -1497,6 +1510,34 @@ fn note_resets(r: &mut Runtime) {
         // Nothing left to turn off: a longer rest, and on (the watch is still being tested).
         trace("gpu timeouts with every feature off: resting 5 s");
         r.gpu_cool_until = now.wrapping_add(5 * GPU_COOL_MS);
+    }
+}
+
+/// The draws an earlier build left out for hanging the GPU (removed: they are drawn again).
+const BANS_FILE: &str = "gpu-banned.bin";
+
+/// The draws of submits that timed out this frame, and culprits found, to the log (and bans to
+/// the file).
+fn note_hangs(r: &mut Runtime) {
+    let h = &mut r.renderer.hangs;
+    if r.fake_auto && h.fake == 0 && r.perf.frames > 300 && !h.seen.is_empty() {
+        h.fake = h.seen[h.seen.len() / 2];
+        trace(&alloc::format!("dev: faking hangs on draw {:08x}", h.fake));
+    }
+    if !h.hung.is_empty() {
+        let hung = core::mem::take(&mut h.hung);
+        if r.hang_dumps < 8 {
+            r.hang_dumps += 1;
+            trace(&alloc::format!("hung submit(s): {} draws; sig/page/blend/len/bounds/det:", hung.len()));
+            for chunk in hung.chunks(5) {
+                let mut line = alloc::string::String::from(" ");
+                for d in chunk {
+                    let b = d.bounds;
+                    line += &alloc::format!(" {:08x}/{}/{}/{}/{},{},{},{}/{:.3e}", d.sig, d.page, d.blend, d.len, b[0], b[1], b[2], b[3], d.det);
+                }
+                trace(&line);
+            }
+        }
     }
 }
 
@@ -1572,6 +1613,7 @@ fn render(r: &mut Runtime, target: &mut gpu::VgBuffer, offset: (i32, i32), clip:
     lobby.idle_view = (view[0] > 0.0 || view[1] > 0.0 || view[2] < size.0 || view[3] < size.1).then_some(view);
     for li in 0..lobby.layers.len() {
         let Some(pages) = pages.get_mut(li) else { break };
+        renderer.hangs.layer = li as u32;
         if *baked_mask & (1 << li.min(31)) != 0 {
             renderer.draw_calls(target, pages, |sizes, emit| lobby.draw_idle(li, (ox, oy), size, sizes, emit));
             continue;

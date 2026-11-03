@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 bal2d-spine = { path = "../../crates/bal2d-spine" }
-bal2d-render = { path = "../../crates/bal2d-render", features = ["outline"] }
+bal2d-render = { path = "../../crates/bal2d-render", features = ["host"] }
 bal2d-pack = { path = "../../crates/bal2d-pack" }
 bal2d-core = { path = "../../crates/bal2d-core" }
 bal2d-face = { path = "../../crates/bal2d-face" }

@@ -17,7 +17,7 @@ target-xiaomi-band-10-pro-3-101-043 = ["device", "canopus-target-private/target-
 [dependencies]
 bal2d-core = { path = "../bal2d-core" }
 bal2d-spine = { path = "../bal2d-spine", default-features = false }
-bal2d-render = { path = "../bal2d-render" }
+bal2d-render = { path = "../bal2d-render", features = ["outline"] }
 bal2d-pack = { path = "../bal2d-pack" }
 bal2d-proto = { path = "../bal2d-proto" }
 canopus-abi = { path = "../../../Canopus/sdk/rust/canopus-abi" }

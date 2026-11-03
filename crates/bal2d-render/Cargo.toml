@@ -7,8 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-# Paths as cluster outlines (host experiments; not in the watch build).
+# Paths as cluster outlines (the watch build: the real GC355 hung on long triangle-soup paths).
 outline = []
+# Host-only experiment switches (environment variables).
+host = ["outline"]
 
 [dependencies]
 bal2d-spine = { path = "../bal2d-spine", default-features = false }

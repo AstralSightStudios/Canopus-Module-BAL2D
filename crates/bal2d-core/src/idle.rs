@@ -327,7 +327,7 @@ impl IdleLayer {
                 let color = [(col & 0xFF) as f32 / 255.0, (col >> 8 & 0xFF) as f32 / 255.0, (col >> 16 & 0xFF) as f32 / 255.0, (col >> 24) as f32 / 255.0];
                 triangles += shape.tris.len() as u32;
                 let (_, blend) = self.geo[c.shape as usize];
-                emit(&Call { page, blend, color, path, bounds: [lo[0], lo[1], hi[0], hi[1]], matrix: *m, rect: None });
+                emit(&Call { page, blend, color, path, bounds: [lo[0], lo[1], hi[0], hi[1]], matrix: *m, rect: None, tag: 1 << 31 | c.shape as u32 });
             }
         }
         triangles

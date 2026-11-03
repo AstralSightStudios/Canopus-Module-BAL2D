@@ -24,13 +24,14 @@ pub const PAD: u8 = 8;
 /// GPU addresses through PSRAM's non-cached alias (`gpu::UNCACHED`).
 pub const UNCACHED: u8 = 16;
 pub const ALL: u8 = NATIVE | STREAM | BAKE | PAD | UNCACHED;
-/// The order of the trials: what saves the most first.
-const ORDER: [u8; 5] = [NATIVE, STREAM, BAKE, PAD, UNCACHED];
+/// The order of the trials: what saves the most first. (The non-cached alias is no trial: the
+/// watch's measurement has it at half the speed for textures.)
+const ORDER: [u8; 4] = [NATIVE, STREAM, BAKE, PAD];
 const FILE: &str = "gpu-trust.bin";
 /// Bumped when the drawing changes enough that old verdicts mean nothing (3: submits sized by
-/// the GPU's measured speed; the verdicts before blamed features for timeouts that came from
-/// submits too large for it).
-const VERSION: u8 = 3;
+/// the GPU's measured speed; 4: live draws as outlines — the hangs every verdict before was
+/// polluted by came from long triangle-soup paths of live layers).
+const VERSION: u8 = 4;
 /// Timeouts during a trial that make the feature bad.
 pub const BAD_RESETS: u32 = 2;
 /// Frames drawn without a timeout before a trial starts, and for one to pass.

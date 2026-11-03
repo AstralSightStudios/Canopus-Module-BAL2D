@@ -596,6 +596,83 @@ impl Stats {
     }
 }
 
+/// A draw as the hang diagnostics see it.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DrawRec {
+    /// `Call::tag` with the layer in bits 28..30: the same draw from frame to frame.
+    pub sig: u32,
+    pub page: u8,
+    pub blend: u8,
+    /// Path length (16-bit words), 0 for a blit.
+    pub len: u16,
+    pub bounds: [i16; 4],
+    pub det: f32,
+}
+
+/// What went into the submits that hang the watch's GPU (the driver resets it after 100 ms and
+/// drops the submit), for the log. Each submit's draws are kept until the GPU has been waited
+/// for past them. (Leaving out the draws of hung submits was tried: the culprit changed from
+/// hang to hang, every long triangle-soup path of a live layer was one, and parts of the
+/// character went missing one by one. Outline paths are the fix; this stays as evidence.)
+#[derive(Default)]
+pub struct Hangs {
+    /// Draws since the last submit, and those of the last submit (what the next wait is for).
+    pub cur: Vec<DrawRec>,
+    pub prev: Vec<DrawRec>,
+    /// Draws of the submits that timed out this frame (for the log).
+    pub hung: Vec<DrawRec>,
+    /// The layer being drawn (part of `DrawRec::sig`).
+    pub layer: u32,
+    /// Frames since a timeout.
+    pub quiet_frames: u32,
+    /// Development (`dev-gpu-hang`): a submit holding this draw counts as timed out.
+    pub fake: u32,
+    /// The last frame's draws (development: picking one to fake).
+    pub seen: Vec<u32>,
+}
+
+
+impl Hangs {
+    /// The wait just made (`ms`) was for the last submit, or (`both`) for it and the one being
+    /// made: a timeout there makes its draws suspects, or names the culprit when it held a lone
+    /// suspect. True when it timed out (or `fake` says so).
+    fn waited(&mut self, ms: u32, both: bool) -> bool {
+        let fake = self.fake != 0 && (self.prev.iter().any(|r| r.sig == self.fake) || both && self.cur.iter().any(|r| r.sig == self.fake));
+        if ms < TIMEOUT_MS && !fake {
+            return false;
+        }
+        self.quiet_frames = 0;
+        let mut waited: Vec<DrawRec> = core::mem::take(&mut self.prev);
+        if both {
+            waited.extend_from_slice(&self.cur);
+        }
+        let room = 96usize.saturating_sub(self.hung.len());
+        self.hung.extend(waited.iter().take(room).copied());
+        true
+    }
+
+    /// A submit was made: its draws are what the next wait is for.
+    fn submitted(&mut self) {
+        core::mem::swap(&mut self.prev, &mut self.cur);
+        self.cur.clear();
+    }
+
+    /// Waited for everything mid-frame: nothing outstanding.
+    fn drained(&mut self) {
+        self.prev.clear();
+        self.cur.clear();
+    }
+
+    /// The frame is done (the GPU waited for): nothing outstanding.
+    fn finished(&mut self) {
+        self.seen.clear();
+        self.seen.extend(self.prev.iter().chain(self.cur.iter()).map(|r| r.sig));
+        self.prev.clear();
+        self.cur.clear();
+        self.quiet_frames += 1;
+    }
+}
+
 /// Pixels of the rectangle `b` (path units) moved by `offset` and cut to `clip` (target pixels).
 fn bounds_px(b: [i16; 4], offset: (f32, f32), clip: [i32; 4]) -> u32 {
     let k = 1.0 / bal2d_render::PATH_SCALE;
@@ -625,6 +702,7 @@ pub struct Renderer {
     /// Draws batched for the GPU (None: each through the driver), and whether they are wanted.
     pub stream: Option<Stream>,
     stream_wanted: bool,
+    pub hangs: Hangs,
 }
 
 fn page_sizes(pages: &[Page]) -> [(f32, f32); 16] {
@@ -645,6 +723,7 @@ struct Sink<'a> {
     offset: (f32, f32),
     clip: [i32; 4],
     stream: &'a mut Option<Stream>,
+    hangs: &'a mut Hangs,
 }
 
 impl Sink<'_> {
@@ -673,12 +752,23 @@ impl Sink<'_> {
                 self.stats.extent_bounds = b;
             }
         }
+        // Kept for the log: what went into a submit that times out.
+        let sig = (call.tag & 0x8FFF_FFFF) | (self.hangs.layer & 7) << 28;
+        let m = call.matrix;
+        let det = m[0] * m[4] - m[1] * m[3];
+        if self.hangs.cur.len() < 256 {
+            self.hangs.cur.push(DrawRec { sig, page: call.page as u8, blend: call.blend as u8, len: call.path.len().min(65535) as u16, bounds: call.bounds, det });
+        }
+        self.submit_one(target, pages, call);
+    }
+
+    fn submit_one(&mut self, target: &mut VgBuffer, pages: &mut [Page], call: &bal2d_render::Call) {
         if call.rect.is_none() && self.fp32.is_none() && self.stream.is_some() {
             self.batch(target, pages, call);
             return;
         }
         self.carry(target, pages);
-        let Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode, clut_page, offset, clip, .. } = self;
+        let Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode, clut_page, offset, clip, hangs, .. } = self;
         let pattern_mode = *pattern_mode;
         let Some(page) = pages.get_mut(call.page as usize) else { return };
         if let Some(c) = &page.clut {
@@ -706,7 +796,7 @@ impl Sink<'_> {
             stats.calls += 1;
             let px = ((m[0] * m[4] - m[1] * m[3]).abs() * rect[2] as f32 * rect[3] as f32) as u32;
             if stats.queue(px) {
-                timed_flush(stats);
+                timed_flush(stats, hangs);
             }
             if rc != 0 {
                 stats.errors += 1;
@@ -757,7 +847,7 @@ impl Sink<'_> {
         // next paths (it would otherwise start only at `finish`), and in pieces it gets through
         // well within the driver's timeout.
         if stats.queue(bounds_px(call.bounds, *offset, *clip)) {
-            timed_flush(stats);
+            timed_flush(stats, hangs);
         }
         if rc != 0 {
             stats.errors += 1;
@@ -798,7 +888,11 @@ impl Sink<'_> {
             // Full: the GPU runs what is there before it is written over.
             let t0 = super::lv::now_ms();
             let rc = fw::vg_finish();
-            self.stats.waited(super::lv::now_ms().wrapping_sub(t0), 6);
+            let dt = super::lv::now_ms().wrapping_sub(t0);
+            if self.hangs.waited(dt, true) {
+                self.stats.waited(dt.max(TIMEOUT_MS), 6);
+            }
+            self.hangs.drained();
             if rc != 0 {
                 self.stats.errors += 1;
                 self.stats.last_error = rc;
@@ -854,17 +948,20 @@ impl Sink<'_> {
             self.stats.errors += 1;
             self.stats.last_error = rc;
         }
-        timed_flush(self.stats);
+        timed_flush(self.stats, self.hangs);
     }
 }
 
 /// `vg_lite_flush`, timed: it returns once the GPU has freed the other command buffer, so its
 /// time is the CPU waiting for the GPU.
-fn timed_flush(stats: &mut Stats) {
+fn timed_flush(stats: &mut Stats, hangs: &mut Hangs) {
     let t0 = super::lv::now_ms();
     let rc = fw::vg_flush();
     let dt = super::lv::now_ms().wrapping_sub(t0);
-    stats.waited(dt, 1);
+    if hangs.waited(dt, false) {
+        stats.waited(dt.max(TIMEOUT_MS), 1);
+    }
+    hangs.submitted();
     stats.flush_ms += dt;
     stats.queued = 0;
     stats.queued_px = 0;
@@ -966,6 +1063,7 @@ impl Renderer {
             clip: [0; 4],
             stream: None,
             stream_wanted: true,
+            hangs: Hangs::default(),
         }
     }
 
@@ -1028,8 +1126,8 @@ impl Renderer {
     pub fn draw(&mut self, target: &mut VgBuffer, size: (f32, f32), layer: usize, list: &DrawList, pages: &mut [Page], cam: (f32, f32, f32)) {
         let sizes = page_sizes(pages);
         let page_count = pages.len();
-        let Renderer { path, paths, path_matrix, image_matrix, stats, fp32, pattern_mode, offset, clip, stream, .. } = self;
-        let mut sink = Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode: *pattern_mode, clut_page: usize::MAX, offset: *offset, clip: *clip, stream };
+        let Renderer { path, paths, path_matrix, image_matrix, stats, fp32, pattern_mode, offset, clip, stream, hangs, .. } = self;
+        let mut sink = Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode: *pattern_mode, clut_page: usize::MAX, offset: *offset, clip: *clip, stream, hangs };
         let triangles = paths.triangles;
         paths.draw(layer, list, cam, size, |p| ((p as usize) < page_count.min(16)).then(|| sizes[p as usize]), |call| sink.submit(target, pages, call));
         sink.carry(target, pages);
@@ -1041,8 +1139,8 @@ impl Renderer {
     pub fn draw_calls(&mut self, target: &mut VgBuffer, pages: &mut [Page], produce: impl FnOnce(&dyn Fn(u32) -> Option<(f32, f32)>, &mut dyn FnMut(&bal2d_render::Call)) -> u32) {
         let sizes = page_sizes(pages);
         let page_count = pages.len();
-        let Renderer { path, path_matrix, image_matrix, stats, fp32, pattern_mode, offset, clip, stream, .. } = self;
-        let mut sink = Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode: *pattern_mode, clut_page: usize::MAX, offset: *offset, clip: *clip, stream };
+        let Renderer { path, path_matrix, image_matrix, stats, fp32, pattern_mode, offset, clip, stream, hangs, .. } = self;
+        let mut sink = Sink { path, path_matrix, image_matrix, stats, fp32, pattern_mode: *pattern_mode, clut_page: usize::MAX, offset: *offset, clip: *clip, stream, hangs };
         let size = |p: u32| ((p as usize) < page_count.min(16)).then(|| sizes[p as usize]);
         let triangles = produce(&size, &mut |call| sink.submit(target, pages, call));
         sink.carry(target, pages);
@@ -1051,13 +1149,20 @@ impl Renderer {
 
     /// Submits what is queued (waiting only for a free command buffer).
     pub fn flush(&mut self) {
-        timed_flush(&mut self.stats);
+        timed_flush(&mut self.stats, &mut self.hangs);
     }
 
     pub fn finish(&mut self) {
         let t0 = super::lv::now_ms();
         let rc = fw::vg_finish();
-        self.stats.waited(super::lv::now_ms().wrapping_sub(t0), 2);
+        let dt = super::lv::now_ms().wrapping_sub(t0);
+        if self.hangs.waited(dt, true) {
+            self.stats.waited(dt.max(TIMEOUT_MS), 2);
+            if dt >= 2 * TIMEOUT_MS {
+                self.stats.waited(dt, 2);
+            }
+        }
+        self.hangs.finished();
         self.stats.queued = 0;
         self.stats.queued_px = 0;
         if rc != 0 {
