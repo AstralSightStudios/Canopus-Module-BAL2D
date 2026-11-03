@@ -30,8 +30,9 @@ const ORDER: [u8; 4] = [NATIVE, STREAM, BAKE, PAD];
 const FILE: &str = "gpu-trust.bin";
 /// Bumped when the drawing changes enough that old verdicts mean nothing (3: submits sized by
 /// the GPU's measured speed; 4: live draws as outlines — the hangs every verdict before was
-/// polluted by came from long triangle-soup paths of live layers).
-const VERSION: u8 = 4;
+/// polluted by came from long triangle-soup paths of live layers; 5: batched draws written as
+/// the driver writes draws — that verdict alone starts over, the others are kept).
+const VERSION: u8 = 5;
 /// Timeouts during a trial that make the feature bad.
 pub const BAD_RESETS: u32 = 2;
 /// Frames drawn without a timeout before a trial starts, and for one to pass.
@@ -50,8 +51,16 @@ impl Trust {
     pub fn load() -> Trust {
         let mut t = Trust::default();
         if let Some(b) = Fs::read(FILE, 8) {
-            if b.len() >= 4 && b[0] == VERSION {
+            if b.len() >= 4 && (b[0] == VERSION || b[0] == 4) {
                 t = Trust { good: b[1] & ALL, bad: b[2] & ALL, trying: b[3] & ALL };
+                if b[0] == 4 {
+                    t.good &= !STREAM;
+                    t.bad &= !STREAM;
+                    if t.trying == STREAM {
+                        t.trying = 0;
+                    }
+                    t.save();
+                }
             }
         }
         if t.trying != 0 {

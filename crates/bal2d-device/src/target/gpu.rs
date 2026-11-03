@@ -387,15 +387,22 @@ pub struct Stream {
 }
 
 const ST_COLOR: u32 = 0x0A02;
-const ST_IMAGE_C: u32 = 0x0A18;
 const ST_FLUSH: u32 = 0x0A1B;
-const ST_IMAGE_X: u32 = 0x0A1C;
-const ST_TESS_WINDOW: u32 = 0x0A39;
+/// Written by the driver right before every path's window (0x3A9 for every S16, low-quality,
+/// non-zero path of the frames: Mirage captures of 9248 driver draws).
+const ST_PATH_SETUP: u32 = 0x0A3D;
+const PATH_SETUP: u32 = 0x3A9;
+const ST_TESS_ORIGIN: u32 = 0x0A39;
+const ST_TESS_SIZE: u32 = 0x0A3A;
+/// The image coordinate generator, register by register as the driver writes it: c0..c2 at
+/// 0x0A18-0x0A1A, x0..x2 at 0x0A1C-0x0A1E, 0x0A1F = 1, y0..y2 at 0x0A20-0x0A22.
+const GENERATOR_REGS: [u32; 10] = [0x0A18, 0x0A19, 0x0A1A, 0x0A1C, 0x0A1D, 0x0A1E, 0x0A1F, 0x0A20, 0x0A21, 0x0A22];
 /// What the driver writes to 0x0A1B before each path's window, and the generator's 0x0A1F.
 const FLUSH_BEFORE_PATH: u32 = 0x0001_1000;
 const GENERATOR_ON: u32 = 1;
-/// Bytes a draw takes besides its path: states 16 + 32 + 8 + 8 + 16, data header 8; and the end.
-const DRAW_OVERHEAD: usize = 88;
+/// Bytes a draw takes besides its path: 15 single-register states of 8, the data header 8;
+/// and the end.
+const DRAW_OVERHEAD: usize = 15 * 8 + 8;
 const STREAM_END: usize = 8;
 
 impl Stream {
@@ -427,14 +434,11 @@ impl Stream {
         self.at += 4;
     }
 
-    fn states(&mut self, reg: u32, values: &[u32]) {
-        self.put(0x3000_0000 | (values.len() as u32) << 16 | reg);
-        for &v in values {
-            self.put(v);
-        }
-        if values.len() % 2 == 0 {
-            self.put(0);
-        }
+    /// One register, one STATE command (as the driver writes every per-draw register; the
+    /// multi-register form is only known to work on the watch for the palette).
+    fn state(&mut self, reg: u32, value: u32) {
+        self.put(0x3001_0000 | reg);
+        self.put(value);
     }
 
     /// Appends a draw of `path` (S16, END-terminated) with the image coordinate generator
@@ -451,12 +455,19 @@ impl Stream {
             self.lo = [self.lo[0].min(bounds[0] as i32), self.lo[1].min(bounds[1] as i32)];
             self.hi = [self.hi[0].max(bounds[2] as i32), self.hi[1].max(bounds[3] as i32)];
         }
+        // In the driver's order: the generator, the colour, then right before the path the
+        // flush, the path setup and the tessellation window (the batched draws of an earlier
+        // build wrote no path setup and used multi-register writes; the watch's GPU hung).
         let g = generator;
-        self.states(ST_IMAGE_C, &[g[0], g[1], g[2]]);
-        self.states(ST_IMAGE_X, &[g[3], g[4], g[5], GENERATOR_ON, g[6], g[7], g[8]]);
-        self.states(ST_COLOR, &[color]);
-        self.states(ST_FLUSH, &[FLUSH_BEFORE_PATH]);
-        self.states(ST_TESS_WINDOW, &[(window[0] as u32) | (window[1] as u32) << 16, (window[2] as u32) | (window[3] as u32) << 16]);
+        let values = [g[0], g[1], g[2], g[3], g[4], g[5], GENERATOR_ON, g[6], g[7], g[8]];
+        for (reg, v) in GENERATOR_REGS.into_iter().zip(values) {
+            self.state(reg, v);
+        }
+        self.state(ST_COLOR, color);
+        self.state(ST_FLUSH, FLUSH_BEFORE_PATH);
+        self.state(ST_PATH_SETUP, PATH_SETUP);
+        self.state(ST_TESS_ORIGIN, (window[0] as u32) | (window[1] as u32) << 16);
+        self.state(ST_TESS_SIZE, (window[2] as u32) | (window[3] as u32) << 16);
         let bytes = path.len() * 2;
         let units = bytes.div_ceil(8);
         self.put(0x4000_0000 | units as u32);

@@ -44,6 +44,9 @@ pub struct IdleLayer {
     /// vertices the run touched.
     boxes: Vec<[i16; 4]>,
     touched: Vec<u16>,
+    /// Per shape: the box of its vertices' texture coordinates (u0, v0, u1, v1): its affine
+    /// maps it onto a parallelogram holding the whole shape, whose corners bound the call.
+    uv_box: Vec<[f32; 4]>,
     /// Per live run: the slots left out of its draw list; and the list and grouping it uses.
     live_skip: Vec<Vec<bool>>,
     live_list: DrawList,
@@ -63,6 +66,8 @@ impl IdleLayer {
         vert_at.try_reserve_exact(n + 1).ok()?;
         outline_at.try_reserve_exact(n + 1).ok()?;
         let mut used: Vec<u16> = Vec::new();
+        let mut uv_box: Vec<[f32; 4]> = Vec::new();
+        uv_box.try_reserve_exact(n).ok()?;
         let mut scratch = OutlineScratch::default();
         vert_at.push(0u32);
         outline_at.push(0u32);
@@ -86,6 +91,13 @@ impl IdleLayer {
             outline_at.push(outline.len() as u32);
             used.sort_unstable();
             used.dedup();
+            let uv = uvs(data, s.attachment);
+            let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+            for &v in &used {
+                let (x, y) = (*uv.get(v as usize * 2)?, *uv.get(v as usize * 2 + 1)?);
+                b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+            }
+            uv_box.push(b);
             all.extend_from_slice(&used);
             vert_at.push(all.len() as u32);
         }
@@ -121,6 +133,7 @@ impl IdleLayer {
             mats: Vec::new(),
             boxes: Vec::new(),
             touched: Vec::new(),
+            uv_box,
             live_skip,
             live_list: DrawList::default(),
             live_paths: {
@@ -277,24 +290,28 @@ impl IdleLayer {
                 // uv -> path units.
                 let u = [m[0] * pw * k, m[1] * ph * k, m[2] * k, m[3] * pw * k, m[4] * ph * k, m[5] * k];
                 let vs = &self.verts[self.vert_at[c.shape as usize] as usize..self.vert_at[c.shape as usize + 1] as usize];
-                let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
                 let acc = &mut self.acc[..verts];
                 for &v in vs {
                     let v = v as usize;
                     // SAFETY: `IdleLayer::new` checked every vertex of every shape against the
                     // attachment's vertex count `verts`; `uvs` holds `verts` pairs (above).
                     let (x, y, a) = unsafe { (*uvs.get_unchecked(v * 2), *uvs.get_unchecked(v * 2 + 1), acc.get_unchecked_mut(v)) };
+                    if a[2] == 0.0 {
+                        self.touched.push(v as u16);
+                    }
+                    a[0] += u[0] * x + u[1] * y + u[2];
+                    a[1] += u[3] * x + u[4] * y + u[5];
+                    a[2] += 1.0;
+                }
+                // The texture box's corners, placed: they bound every vertex of the call.
+                let tb = self.uv_box[c.shape as usize];
+                let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                for (x, y) in [(tb[0], tb[1]), (tb[2], tb[1]), (tb[0], tb[3]), (tb[2], tb[3])] {
                     let (px, py) = (u[0] * x + u[1] * y + u[2], u[3] * x + u[4] * y + u[5]);
                     x0 = x0.min(px);
                     x1 = x1.max(px);
                     y0 = y0.min(py);
                     y1 = y1.max(py);
-                    if a[2] == 0.0 {
-                        self.touched.push(v as u16);
-                    }
-                    a[0] += px;
-                    a[1] += py;
-                    a[2] += 1.0;
                 }
                 self.boxes.push([(x0 - margin) as i16, (y0 - margin) as i16, (x1 + margin) as i16, (y1 + margin) as i16]);
                 self.mats.push(m);
