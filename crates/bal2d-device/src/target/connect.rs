@@ -204,6 +204,27 @@ impl Store for DeviceStore {
     fn stats(&mut self) -> Option<bal2d_proto::Stats> {
         Some(super::stats())
     }
+
+    fn read_log(&mut self, offset: u32, out: &mut [u8]) -> Option<(u32, usize)> {
+        let total = Fs::stat(super::LOG_FILE)?.size as u32;
+        if offset >= total {
+            return Some((total, 0));
+        }
+        let mut file = Fs::open(super::LOG_FILE, FS_READ)?;
+        if !file.seek(offset) {
+            return None;
+        }
+        let want = out.len().min((total - offset) as usize);
+        let mut n = 0;
+        while n < want {
+            let got = file.read(&mut out[n..want]);
+            if got == 0 {
+                break;
+            }
+            n += got;
+        }
+        Some((total, n))
+    }
 }
 
 struct Endpoint {

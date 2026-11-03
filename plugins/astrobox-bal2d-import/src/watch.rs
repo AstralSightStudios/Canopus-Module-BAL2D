@@ -14,6 +14,7 @@ use bal2d_proto::sender::{Failure, Sender, State};
 use bal2d_proto::{Event, Incoming, Reply, Request, Status, VERSION, op};
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use crate::astrobox::psys_host_v4::dialog::{self, FilterConfig};
 use crate::astrobox::psys_host_v4::timer;
 use crate::{connect, state};
 
@@ -81,6 +82,66 @@ pub async fn delete_pack(id: u32) {
     }
 }
 
+/// The watch's diagnostic log being fetched (`LOG`, one part at a time), then saved.
+static LOG: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// Stop at this size whatever the watch says (a log is a few tens of KB).
+const LOG_MAX: usize = 1024 * 1024;
+
+/// Fetches the module's `log.txt` from the selected watch and offers to save it.
+pub async fn fetch_log() {
+    let Some(addr) = selected() else { return };
+    *LOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    state::set_status("正在读取手表上的日志…", false);
+    if let Err(e) = send(&addr, Request::Log { req: next_req(), offset: 0 }).await {
+        *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        state::set_status(format!("读取日志失败：{e}"), true);
+    }
+}
+
+async fn on_log(addr: &str, total: u32, offset: u32, bytes: &[u8]) {
+    let next = {
+        let mut guard = LOG.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(buf) = guard.as_mut() else { return };
+        if offset as usize == buf.len() {
+            buf.extend_from_slice(bytes);
+        }
+        let done = bytes.is_empty() || buf.len() >= total as usize || buf.len() >= LOG_MAX;
+        if done { None } else { Some(buf.len() as u32) }
+    };
+    match next {
+        Some(at) => {
+            state::set_status(format!("正在读取手表上的日志… {} / {} KB", at / 1024, total / 1024), false);
+            let _ = send(addr, Request::Log { req: next_req(), offset: at }).await;
+        }
+        None => {
+            let Some(log) = LOG.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+            save_log(log).await;
+        }
+    }
+}
+
+async fn save_log(log: Vec<u8>) {
+    let filter = FilterConfig { multiple: false, extensions: vec!["txt".into()], default_directory: String::new(), default_file_name: "ba_l2d-log.txt".into() };
+    let session = match dialog::save_file_start(filter).await {
+        Ok(s) => s,
+        Err(e) => {
+            state::set_status(format!("无法保存日志：{e}"), true);
+            return;
+        }
+    };
+    for chunk in log.chunks(256 * 1024) {
+        if let Err(e) = dialog::save_file_write_chunk(session.session_id, chunk.to_vec()).await {
+            dialog::save_file_abort(session.session_id).await;
+            state::set_status(format!("保存日志失败：{e}"), true);
+            return;
+        }
+    }
+    match dialog::save_file_finish(session.session_id).await {
+        Ok(()) => state::set_status(format!("日志已保存为 {}（{} KB）。", session.name, log.len().div_ceil(1024)), false),
+        Err(e) => state::set_status(format!("保存日志失败：{e}"), true),
+    }
+}
+
 pub async fn set_options(options: u8) {
     let Some(addr) = selected() else { return };
     if let Err(e) = send(&addr, Request::Options { req: next_req(), options }).await {
@@ -115,6 +176,7 @@ pub async fn on_frame(addr: &str, frame: &[u8]) {
         Reply::Stats { status: Status::Ok, stats, .. } => {
             state::with_state(|s| s.stats = Some(stats));
         }
+        Reply::Log { status: Status::Ok, total, offset, bytes, .. } => on_log(addr, total, offset, &bytes).await,
         Reply::Ack { op: op::HELLO, status, value, .. } => {
             state::set_status(
                 format!("手表上的 BAL2D 模块不兼容（{}，模块协议版本 {value}），请更新插件或模块。", status.describe()),
@@ -122,6 +184,12 @@ pub async fn on_frame(addr: &str, frame: &[u8]) {
             );
         }
         Reply::Ack { op: code, status, .. } => {
+            if code == op::LOG {
+                *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                let why = if status == Status::NotFound { "手表上还没有日志".to_string() } else { status.describe().to_string() };
+                state::set_status(format!("读取日志失败：{why}（旧版模块不支持，请先更新模块）"), true);
+                return;
+            }
             let what = match code {
                 op::SELECT => "切换角色",
                 op::DELETE => "删除角色",

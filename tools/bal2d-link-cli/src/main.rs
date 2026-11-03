@@ -195,6 +195,7 @@ fn request_reply(bridge: &mut Bridge, request: Request) -> Option<Reply> {
                 Reply::Hello { .. } => bal2d_proto::op::HELLO,
                 Reply::List { .. } => bal2d_proto::op::LIST,
                 Reply::Stats { .. } => bal2d_proto::op::STATS,
+                Reply::Log { .. } => bal2d_proto::op::LOG,
                 Reply::Ack { op, .. } => *op,
             };
             if code == op && reply.req() == req {
@@ -390,6 +391,30 @@ fn main() {
             None => false,
         },
         Some("bench") => bench(&mut bridge, &command[1..]),
+        Some("log") => {
+            // The module's log.txt, part by part, to stdout.
+            let mut log = Vec::new();
+            let mut req = 20u16;
+            let ok = loop {
+                req = req.wrapping_add(1);
+                match request_reply(&mut bridge, Request::Log { req, offset: log.len() as u32 }) {
+                    Some(Reply::Log { total, offset, bytes, .. }) if offset as usize == log.len() => {
+                        let done = bytes.is_empty() || log.len() + bytes.len() >= total as usize;
+                        log.extend_from_slice(&bytes);
+                        if done {
+                            break true;
+                        }
+                    }
+                    other => {
+                        eprintln!("log: {other:?}");
+                        break false;
+                    }
+                }
+            };
+            print!("{}", String::from_utf8_lossy(&log));
+            eprintln!("({} bytes)", log.len());
+            ok
+        }
         Some("options") => {
             let reply = request_reply(&mut bridge, Request::Options { req: 5, options: number(&command[1]) as u8 });
             println!("{reply:?}");

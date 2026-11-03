@@ -29,7 +29,15 @@ pub trait Store {
     fn stats(&mut self) -> Option<Stats> {
         None
     }
+    /// Reads the diagnostic log from `offset` into `out`: (the log's size, bytes read). `None`
+    /// when there is none.
+    fn read_log(&mut self, _offset: u32, _out: &mut [u8]) -> Option<(u32, usize)> {
+        None
+    }
 }
+
+/// Log bytes a `LOG` reply carries (the frame less its header).
+pub const LOG_CHUNK: usize = crate::FRAME_MAX - 12;
 
 /// What this build of the module runs on.
 #[derive(Clone, Copy, Debug)]
@@ -143,6 +151,16 @@ impl Receiver {
                 Some(stats) => out.frames.push(Reply::Stats { req, status: Status::Ok, stats }.encode()),
                 None => out.ack(op::STATS, req, Status::Unsupported, 0),
             },
+            Request::Log { req, offset } => {
+                let mut buf = alloc::vec![0u8; LOG_CHUNK];
+                match store.read_log(offset, &mut buf) {
+                    Some((total, n)) => {
+                        buf.truncate(n);
+                        out.frames.push(Reply::Log { req, status: Status::Ok, total, offset, bytes: buf }.encode());
+                    }
+                    None => out.ack(op::LOG, req, Status::NotFound, 0),
+                }
+            }
             Request::Begin { req, id, size, crc32, name } => {
                 self.reset(store);
                 let status = self.begin(store, id, size, crc32, name);

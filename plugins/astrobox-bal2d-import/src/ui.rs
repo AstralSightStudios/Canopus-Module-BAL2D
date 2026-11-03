@@ -29,6 +29,7 @@ const EV_DELETE: &str = "action:pack.delete.";
 const EV_OVERLAY: &str = "action:overlay";
 const EV_FLUENT: &str = "action:fluent";
 const EV_DIRECT: &str = "action:direct";
+const EV_LOG: &str = "action:export-log";
 const EV_SINGLE: &str = "action:single";
 const EV_FACE_PICK: &str = "action:face.pick";
 const EV_FACE_Z: &str = "input:face.z";
@@ -269,6 +270,7 @@ pub async fn on_event(event: &str, payload: &str) {
             let current = state::snapshot().hello.map(|h| h.options).unwrap_or(0);
             watch::set_options(current ^ bal2d_proto::options::SINGLE).await;
         }
+        EV_LOG => watch::fetch_log().await,
         EV_FACE_PICK => pick_face().await,
         EV_FACE_Z => state::with_state(|s| {
             s.face.z = value.parse().unwrap_or(0);
@@ -865,7 +867,7 @@ fn watch_tab(s: &UiState) -> View {
         .child(card().child(row().child(heading("手表上的角色").grow()).child(button("刷新", EV_CONNECT, "ghost"))).child(list))
         .child(
             card()
-                .child(heading("手表上的性能"))
+                .child(row().child(heading("手表上的性能").grow()).child(button("导出手表日志", EV_LOG, "ghost")))
                 .child(text(&perf, 13, tone::MUTED))
                 .child(
                     row()
@@ -975,7 +977,7 @@ fn face_tab(s: &UiState) -> View {
 
 /// What the watch's GPU self-test changed (Stats flags bits 16..23), for the performance card.
 /// The GPU self-test probes (module selftest.rs `probe`), bit by bit.
-const PROBES: [&str; 19] = [
+const PROBES: [&str; 20] = [
     "FP32 路径",
     "S16 路径",
     "大贴图",
@@ -995,6 +997,7 @@ const PROBES: [&str; 19] = [
     "区域贴图",
     "批量绘制 1",
     "批量绘制 2",
+    "右端 S16 路径",
 ];
 
 fn selftest_note(flags: u32, passed: u32) -> String {

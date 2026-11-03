@@ -52,7 +52,9 @@ pub mod probe {
     /// take).
     pub const STREAM: u32 = 1 << 17;
     pub const STREAM2: u32 = 1 << 18;
-    pub const ALL: u32 = (1 << 19) - 1;
+    /// The S16 probe again in the target's last cell.
+    pub const S16_END: u32 = 1 << 19;
+    pub const ALL: u32 = (1 << 20) - 1;
 }
 
 /// Summary bits for `Stats::flags` (bits 16..23).
@@ -74,6 +76,13 @@ pub mod flag {
 pub struct Outcome {
     pub passed: u32,
     pub flags: u32,
+    /// The probes right when read back at once after their own GPU wait, a while after all of
+    /// them, and through the cache after dropping its lines.
+    pub now: u32,
+    pub late: u32,
+    pub cached: u32,
+    /// The first probe a call failed for: (probe index + 1) << 24 | the return code, 0: none.
+    pub first_error: u32,
 }
 
 struct Tex {
@@ -202,9 +211,14 @@ impl Square {
     }
 }
 
-/// Reads target pixel (x, y) through the non-cached alias as 8-bit channels (565 expanded).
+/// Target pixel (x, y) at `base` (the non-cached alias, or the cached one) as stored.
+fn raw(base: usize, x: u32, y: u32) -> u16 {
+    unsafe { core::ptr::read_volatile((base + (y * W * 2 + x * 2) as usize) as *const u16) }
+}
+
+/// Target pixel (x, y) as 8-bit channels (565 expanded).
 fn pixel(base: usize, x: u32, y: u32) -> [i32; 3] {
-    let v = unsafe { core::ptr::read_volatile((base + (y * W * 2 + x * 2) as usize) as *const u16) } as i32;
+    let v = raw(base, x, y) as i32;
     [(v >> 11) << 3, ((v >> 5) & 63) << 2, (v & 31) << 3]
 }
 
@@ -220,7 +234,7 @@ fn exp(c: [u8; 3]) -> [i32; 3] {
 
 /// Runs the probes; applies the fallbacks to `renderer` and the upload paths.
 pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
-    let mut out = Outcome { passed: 0, flags: flag::RAN };
+    let mut out = Outcome { flags: flag::RAN, ..Default::default() };
     let Some(mut tmem) = GpuMem::new((W * H * 2) as usize) else {
         out.flags |= flag::UNVERIFIED;
         return out;
@@ -236,8 +250,22 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
     let white = 0xFFFF_FFFFu32;
     fw::vg_set_scissor(0, 0, W as i32, H as i32);
     fw::vg_enable_scissor();
-    let mut rc = fw::vg_clear(target.ptr(), core::ptr::null(), bg);
+    // Every probe is submitted and waited for on its own and read back at once: one that the
+    // GPU or driver chokes on cannot take the later ones with it, and each return code is kept.
+    let clear_rc = fw::vg_clear(target.ptr(), core::ptr::null(), bg);
+    let clear_finish = fw::vg_finish();
+    let clear_ok = (0..CELLS).all(|c| near(pixel(nc, c * 8 + 4, 4), exp(BG), 0));
     let mut wants: Vec<(u32, u32, [i32; 3], i32)> = Vec::new(); // (probe, cell, colour, tolerance)
+    let mut log: Vec<(u32, i32, i32, u16, u16)> = Vec::new(); // (probe, draw rc, finish rc, pixels)
+    let mut now = 0u32;
+    let mut step = |wants: &mut Vec<(u32, u32, [i32; 3], i32)>, bit: u32, cell: u32, want: [i32; 3], tol: i32, draw_rc: i32| {
+        let finish_rc = fw::vg_finish();
+        if near(pixel(nc, cell * 8 + 4, 4), want, tol) && near(pixel(nc, cell * 8 + 3, 3), want, tol) {
+            now |= bit;
+        }
+        log.push((bit, draw_rc, finish_rc, raw(nc, cell * 8 + 4, 4), raw(nc, cell * 8 + 3, 3)));
+        wants.push((bit, cell, want, tol));
+    };
     // The large textures first: cleaning one (over 0x1FE0 bytes) cleans the whole cache, which
     // would also publish small textures made before it and hide a failing per-line clean.
     let (large, mlarge) = (texture(PageFormat::Bgra8888, 64, A, 0xFF, false), texture(PageFormat::Bgra8888, 64, A, 0xFF, true));
@@ -259,38 +287,38 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
     let src_over = 1;
     let pad = 0x1D01;
     let a4 = [0xFF, 0x88, 0x44];
-    let d = |rc: &mut i32, r: i32| {
-        if r != 0 {
-            *rc = r;
-        }
-    };
-    d(&mut rc, sq.draw(&mut target, 0, &mut small, true, 0.0, src_over, pad, white));
-    wants.push((probe::FP32, 0, exp(A), 0));
-    d(&mut rc, sq.draw(&mut target, 1, &mut small, false, 0.0, src_over, pad, white));
-    wants.push((probe::S16, 1, exp(A), 0));
-    d(&mut rc, sq.draw(&mut target, 2, &mut large, false, 0.0, src_over, pad, white));
-    wants.push((probe::LARGE, 2, exp(A), 0));
-    d(&mut rc, sq.draw(&mut target, 3, &mut t4444, false, 0.0, src_over, pad, white));
+    let rc;
+    let r = sq.draw(&mut target, 0, &mut small, true, 0.0, src_over, pad, white);
+    step(&mut wants, probe::FP32, 0, exp(A), 0, r);
+    let r = sq.draw(&mut target, 1, &mut small, false, 0.0, src_over, pad, white);
+    step(&mut wants, probe::S16, 1, exp(A), 0, r);
+    let r = sq.draw(&mut target, 2, &mut large, false, 0.0, src_over, pad, white);
+    step(&mut wants, probe::LARGE, 2, exp(A), 0, r);
+    let r = sq.draw(&mut target, 3, &mut t4444, false, 0.0, src_over, pad, white);
     // 4-bit channels widened by replication (0x8 -> 0x88) or by shifting (0x80): either is right.
-    wants.push((probe::ARGB4444, 3, exp(a4), 4));
-    d(&mut rc, sq.draw(&mut target, 4, &mut t8565, false, 0.0, src_over, pad, white));
-    wants.push((probe::ARGB8565, 4, exp(A), 0));
-    d(&mut rc, sq.draw(&mut target, 5, &mut ti8, false, 0.0, src_over, pad, white));
-    wants.push((probe::INDEX8, 5, exp(A), 0));
+    step(&mut wants, probe::ARGB4444, 3, exp(a4), 4, r);
+    let r = sq.draw(&mut target, 4, &mut t8565, false, 0.0, src_over, pad, white);
+    step(&mut wants, probe::ARGB8565, 4, exp(A), 0, r);
+    let r = sq.draw(&mut target, 5, &mut ti8, false, 0.0, src_over, pad, white);
+    step(&mut wants, probe::INDEX8, 5, exp(A), 0, r);
     // The square samples texels 42..46 of a 16-texel image: PAD gives the edge texel.
-    d(&mut rc, sq.draw(&mut target, 6, &mut small, false, 40.0, src_over, pad, white));
-    wants.push((probe::PAD, 6, exp(A), 0));
+    let r = sq.draw(&mut target, 6, &mut small, false, 40.0, src_over, pad, white);
+    step(&mut wants, probe::PAD, 6, exp(A), 0, r);
     // Tint (1, 0.5, 0.25) in multiply image mode: ABGR 0xFF 40 80 FF.
-    d(&mut rc, sq.draw(&mut target, 7, &mut small, false, 0.0, src_over, pad, 0xFF40_80FF));
-    wants.push((probe::TINT, 7, exp([0xF8, 0x40, 0x10]), 6));
-    d(&mut rc, sq.draw(&mut target, 8, &mut gray, false, 0.0, 9, pad, white));
-    wants.push((probe::ADDITIVE, 8, exp([0xC0, 0xC0, 0xC0]), 6));
-    d(&mut rc, sq.draw(&mut target, 9, &mut gray, false, 0.0, 5, pad, white));
-    wants.push((probe::MULTIPLY, 9, exp([0x20, 0x20, 0x20]), 6));
-    d(&mut rc, sq.draw(&mut target, 10, &mut gray, false, 0.0, 6, pad, white));
-    wants.push((probe::SCREEN, 10, exp([0xA0, 0xA0, 0xA0]), 6));
-    d(&mut rc, sq.draw(&mut target, 11, &mut half, false, 0.0, src_over, pad, white));
-    wants.push((probe::ALPHA, 11, exp([0x9C, 0x60, 0x40]), 6));
+    let r = sq.draw(&mut target, 7, &mut small, false, 0.0, src_over, pad, 0xFF40_80FF);
+    step(&mut wants, probe::TINT, 7, exp([0xF8, 0x40, 0x10]), 6, r);
+    let r = sq.draw(&mut target, 8, &mut gray, false, 0.0, 9, pad, white);
+    step(&mut wants, probe::ADDITIVE, 8, exp([0xC0, 0xC0, 0xC0]), 6, r);
+    let r = sq.draw(&mut target, 9, &mut gray, false, 0.0, 5, pad, white);
+    step(&mut wants, probe::MULTIPLY, 9, exp([0x20, 0x20, 0x20]), 6, r);
+    let r = sq.draw(&mut target, 10, &mut gray, false, 0.0, 6, pad, white);
+    step(&mut wants, probe::SCREEN, 10, exp([0xA0, 0xA0, 0xA0]), 6, r);
+    let r = sq.draw(&mut target, 11, &mut half, false, 0.0, src_over, pad, white);
+    step(&mut wants, probe::ALPHA, 11, exp([0x9C, 0x60, 0x40]), 6, r);
+    // The plain S16 draw again at the far end of the target: wrong only there means the
+    // results depend on where in the target they are.
+    let r = sq.draw(&mut target, CELLS - 1, &mut small, false, 0.0, src_over, pad, white);
+    step(&mut wants, probe::S16_END, CELLS - 1, exp(A), 0, r);
     // The bake path: a 4 x 4 BGR565 blit, no blending.
     let blit_c = (10u16 << 11) | (20 << 5) | 30;
     if let Some(mut bm) = GpuMem::new(16 * 16 * 2) {
@@ -301,8 +329,8 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
         let mut bb = VgBuffer::new(&mut bm, 16, 16, 32, gpu::VG_FMT_BGR565);
         let rect = [0i32, 0, 4, 4];
         let m = [1.0f32, 0.0, (12 * 8 + 2) as f32, 0.0, 1.0, 2.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
-        d(&mut rc, fw::vg_blit_rect(target.ptr(), bb.ptr(), rect.as_ptr(), m.as_ptr(), 0, 0, 0));
-        wants.push((probe::BLIT, 12, [10 << 3, 20 << 2, 30 << 3], 0));
+        let r = fw::vg_blit_rect(target.ptr(), bb.ptr(), rect.as_ptr(), m.as_ptr(), 0, 0, 0);
+        step(&mut wants, probe::BLIT, 12, [10 << 3, 20 << 2, 30 << 3], 0, r);
         // An atlas region as `Call::rect` draws it: texels [4, 12) x [4, 12) of a 16 x 16 image
         // (the probe colour, blue around it) turned a quarter, halved and tinted onto cell 15's
         // square. The blit's matrix maps rectangle-relative texels (the rectangle is the image
@@ -323,8 +351,8 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
         if let Some((_, rb)) = region.as_mut() {
             let rect = [4i32, 4, 8, 8];
             let m = [0.0f32, -0.5, 126.0, 0.5, 0.0, 2.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
-            d(&mut rc, fw::vg_blit_rect(target.ptr(), rb.ptr(), rect.as_ptr(), m.as_ptr(), src_over, 0xFF40_80FF, 0x2000));
-            wants.push((probe::BLIT_REGION, 15, exp([0xF8, 0x40, 0x10]), 6));
+            let r = fw::vg_blit_rect(target.ptr(), rb.ptr(), rect.as_ptr(), m.as_ptr(), src_over, 0xFF40_80FF, 0x2000);
+            step(&mut wants, probe::BLIT_REGION, 15, exp([0xF8, 0x40, 0x10]), 6, r);
         }
         // Two draws in one command stream, carried by one driver call: cells 16 and 17 sample
         // the region texture's inside (texels 6..10) through their own matrices; the second
@@ -343,46 +371,80 @@ pub fn run(renderer: &mut gpu::Renderer) -> Outcome {
             }
             if let Some((path, _, _, m, color)) = st.close() {
                 *sq.image_matrix = [m[0], m[1], m[2], m[3], m[4], m[5], 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
-                d(&mut rc, fw::vg_draw_pattern(target.ptr(), path, 0x1901, sq.path_matrix.as_ptr(), rb.ptr(), sq.image_matrix.as_ptr(), src_over, pad, 0, color, 0x2000));
-                wants.push((probe::STREAM, 16, exp([0xF8, 0x40, 0x10]), 6));
-                wants.push((probe::STREAM2, 17, exp(A), 0));
+                let r = fw::vg_draw_pattern(target.ptr(), path, 0x1901, sq.path_matrix.as_ptr(), rb.ptr(), sq.image_matrix.as_ptr(), src_over, pad, 0, color, 0x2000);
+                step(&mut wants, probe::STREAM, 16, exp([0xF8, 0x40, 0x10]), 6, r);
+                step(&mut wants, probe::STREAM2, 17, exp(A), 0, 0);
             }
         }
         // Kept alive until the GPU is done.
-        d(&mut rc, sq.draw(&mut target, 13, &mut msmall, false, 0.0, src_over, pad, white));
-        wants.push((probe::MIRROR_SMALL, 13, exp(A), 0));
-        d(&mut rc, sq.draw(&mut target, 14, &mut mlarge, false, 0.0, src_over, pad, white));
-        wants.push((probe::MIRROR_LARGE, 14, exp(A), 0));
-        d(&mut rc, fw::vg_finish());
+        let r = sq.draw(&mut target, 13, &mut msmall, false, 0.0, src_over, pad, white);
+        step(&mut wants, probe::MIRROR_SMALL, 13, exp(A), 0, r);
+        let r = sq.draw(&mut target, 14, &mut mlarge, false, 0.0, src_over, pad, white);
+        step(&mut wants, probe::MIRROR_LARGE, 14, exp(A), 0, r);
+        rc = fw::vg_finish();
         drop(stream);
         drop(region);
         drop(bb);
         drop(bm);
     } else {
-        d(&mut rc, fw::vg_finish());
+        rc = fw::vg_finish();
     }
-    let mut passed = 0;
-    for (bit, cell, want, tol) in &wants {
-        if near(pixel(nc, cell * 8 + 4, 4), *want, *tol) && near(pixel(nc, cell * 8 + 3, 3), *want, *tol) {
-            passed |= bit;
-        }
-    }
-    let bgx = exp(BG);
-    let outside_ok = (0..CELLS).all(|c| near(pixel(nc, c * 8, 0), bgx, 0) && near(pixel(nc, c * 8 + 7, 7), bgx, 0) && near(pixel(nc, c * 8 + 6, 4), bgx, 0));
-    if outside_ok {
-        passed |= probe::OUTSIDE;
-    }
-    // Cell 15's square is the region blit; everything around it stays background: checked above.
-    if passed & probe::BLIT_REGION == 0 {
-        for y in 0..H {
-            let mut row = alloc::string::String::new();
-            for x in 120..W {
-                let v = unsafe { core::ptr::read_volatile((nc + (y * W * 2 + x * 2) as usize) as *const u16) };
-                row += &alloc::format!(" {v:04x}");
+    // The same pixels again a while later, and through the cache after dropping its lines: a
+    // probe right only then says the read came too early or the GPU's writes sit somewhere the
+    // non-cached alias does not see.
+    let t0 = super::lv::now_ms();
+    while super::lv::now_ms().wrapping_sub(t0) < 30 {}
+    let judge = |px: &dyn Fn(u32, u32) -> [i32; 3]| {
+        let mut m = 0u32;
+        for (bit, cell, want, tol) in &wants {
+            if near(px(cell * 8 + 4, 4), *want, *tol) && near(px(cell * 8 + 3, 3), *want, *tol) {
+                m |= bit;
             }
-            super::trace(&alloc::format!("region blit row {y}:{row}"));
+        }
+        let bgx = exp(BG);
+        if (0..CELLS).all(|c| near(px(c * 8, 0), bgx, 0) && near(px(c * 8 + 7, 7), bgx, 0) && near(px(c * 8 + 6, 4), bgx, 0)) {
+            m |= probe::OUTSIDE;
+        }
+        m
+    };
+    let late = judge(&|x, y| pixel(nc, x, y));
+    fw::cache_flush_invalidate(tmem.ptr(), (W * H * 2) as usize);
+    let cached_base = tmem.ptr() as usize;
+    let cached = judge(&|x, y| pixel(cached_base, x, y));
+    // A probe counts when any read found its colour (nothing else puts it there).
+    let mut passed = late | cached | (now & !probe::OUTSIDE);
+    out.now = now;
+    out.late = late;
+    out.cached = cached;
+    out.first_error = log.iter().position(|e| e.1 != 0 || e.2 != 0).map_or(0, |i| {
+        let e = log[i];
+        (e.0.trailing_zeros() + 1) << 24 | ((if e.1 != 0 { e.1 } else { e.2 }) as u32 & 0xFFFF)
+    });
+    super::trace(&alloc::format!(
+        "gpu self-test: target {:#x} (nc {nc:#x}); clear: rc {clear_rc}/{clear_finish} ok {clear_ok}; passed now {now:#07x} late {late:#07x} cached {cached:#07x}",
+        tmem.ptr() as usize
+    ));
+    for chunk in log.chunks(4) {
+        let mut line = alloc::string::String::from("gpu probes:");
+        for (bit, draw_rc, finish_rc, a, b) in chunk {
+            line += &alloc::format!(" [{} rc {draw_rc}/{finish_rc} px {a:04x} {b:04x}]", bit.trailing_zeros());
+        }
+        super::trace(&line);
+    }
+    // Outside pixels of the first cells that are not background (what is there instead).
+    let mut bad = alloc::string::String::new();
+    for c in 0..CELLS {
+        for (x, y) in [(c * 8, 0), (c * 8 + 7, 7), (c * 8 + 6, 4)] {
+            let v = raw(nc, x, y);
+            if !near(pixel(nc, x, y), exp(BG), 0) && bad.len() < 200 {
+                bad += &alloc::format!(" ({x},{y})={v:04x}");
+            }
         }
     }
+    if !bad.is_empty() {
+        super::trace(&alloc::format!("gpu self-test: not background:{bad}"));
+    }
+    passed &= probe::ALL;
     out.passed = passed;
     super::trace(&alloc::format!("gpu self-test: passed {passed:#07x} of {:#07x}, rc {rc}", probe::ALL));
     // Development: `selftest-force` (text, a hex probe mask) marks those probes failed, so the

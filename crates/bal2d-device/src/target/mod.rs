@@ -292,6 +292,18 @@ pub fn rt() -> &'static mut Runtime {
 }
 
 static mut TRACE_LEFT: u32 = 200;
+/// The diagnostic log (the phone can fetch it: `LOG`); past `LOG_KEEP` bytes at start it moves
+/// to `LOG_PREVIOUS`, so it holds the last few boots.
+pub const LOG_FILE: &str = "log.txt";
+const LOG_PREVIOUS: &str = "log-previous.txt";
+const LOG_KEEP: u32 = 96 * 1024;
+
+fn rotate_log() {
+    if Fs::stat(LOG_FILE).is_some_and(|st| st.size as u32 > LOG_KEEP) {
+        Fs::remove(LOG_PREVIOUS);
+        Fs::rename(LOG_FILE, LOG_PREVIOUS);
+    }
+}
 
 /// Diagnostic line in `log.txt` (bounded per boot).
 pub fn trace(line: &str) {
@@ -303,7 +315,7 @@ pub fn trace(line: &str) {
     }
     let mut text = alloc::format!("[{}] {line}\n", lv::now_ms()).into_bytes();
     text.truncate(300);
-    Fs::append("log.txt", &text);
+    Fs::append(LOG_FILE, &text);
 }
 
 /// What `STATS` reports.
@@ -474,7 +486,13 @@ pub fn status_text() -> String {
         text += &selftest_text(t.flags);
         let failed = probe_names(selftest::probe::ALL & !t.passed);
         if t.flags & selftest::flag::RAN != 0 && !failed.is_empty() {
-            text += &alloc::format!("未通过：{failed}\n");
+            text += &alloc::format!("未通过的探针：{failed}\n");
+            // What the read-backs found (hex probe masks): at once after each probe's own wait,
+            // a while after all of them, through the cache; and the first failed call.
+            text += &alloc::format!("自检读回：立即 {:x} · 稍后 {:x} · 缓存 {:x}\n", t.now, t.late, t.cached);
+            if t.first_error != 0 {
+                text += &alloc::format!("自检返回码：第 {} 项 {}\n", t.first_error >> 24, t.first_error & 0xFFFF);
+            }
         }
     }
     match r.boot_error {
@@ -529,9 +547,9 @@ pub fn selftest_text(flags: u32) -> String {
 
 /// The self-test probes in `mask`, by short name (for the status page and its screenshots).
 pub fn probe_names(mask: u32) -> String {
-    const NAMES: [&str; 19] = [
+    const NAMES: [&str; 20] = [
         "FP32", "S16", "大纹理", "4444", "8565", "索引色", "边缘", "着色", "叠加", "正片叠底", "滤色", "透明度", "贴图",
-        "直写小", "直写大", "越界", "区域贴图", "批量1", "批量2",
+        "直写小", "直写大", "越界", "区域贴图", "批量1", "批量2", "右端",
     ];
     let mut t = String::new();
     for (i, n) in NAMES.iter().enumerate() {
@@ -755,6 +773,7 @@ pub fn start() -> i32 {
         return 0;
     }
     r.screen = screen_size();
+    rotate_log();
     Fs::mkdirs(PACK_DIR);
     // The pack is loaded on the first frame, outside the Supervisor's stage callback.
     r.timer = unsafe { lvx_timer_create(frame, FRAME_MS, core::ptr::null_mut()) };

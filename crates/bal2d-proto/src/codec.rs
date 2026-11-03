@@ -5,6 +5,7 @@
 //! | `0x01` | `HELLO` | `version: u8` | `version: u8, caps: u8, max_data: u16, free_kib: u32, width: u16, height: u16, target: u8, active: u32, packs: u8, options: u8` |
 //! | `0x02` | `LIST` | `offset: u8, max: u8` | `total: u8, offset: u8, count: u8, {id: u32, size: u32, name}…` |
 //! | `0x03` | `STATS` | — | `Stats` (see [`Stats`]) |
+//! | `0x04` | `LOG` | `offset: u32` | `total: u32, offset: u32, bytes` (the module's `log.txt` from `offset`) |
 //! | `0x10` | `BEGIN` | `id: u32, size: u32, crc32: u32, name` | `value: u32` |
 //! | `0x11` | `DATA` | (no `req`) `offset: u32, bytes` | — |
 //! | `0x12` | `END` | — | `value: u32` (the installed id) |
@@ -24,6 +25,7 @@ pub mod op {
     pub const HELLO: u8 = 0x01;
     pub const LIST: u8 = 0x02;
     pub const STATS: u8 = 0x03;
+    pub const LOG: u8 = 0x04;
     pub const BEGIN: u8 = 0x10;
     pub const DATA: u8 = 0x11;
     pub const END: u8 = 0x12;
@@ -210,6 +212,7 @@ pub enum Request {
     Hello { req: u16, version: u8 },
     List { req: u16, offset: u8, max: u8 },
     Stats { req: u16 },
+    Log { req: u16, offset: u32 },
     Begin { req: u16, id: u32, size: u32, crc32: u32, name: String },
     Data { offset: u32, bytes: Vec<u8> },
     End { req: u16 },
@@ -224,19 +227,25 @@ pub enum Reply {
     Hello { req: u16, status: Status, hello: Hello },
     List { req: u16, status: Status, total: u8, offset: u8, packs: Vec<PackInfo> },
     Stats { req: u16, status: Status, stats: Stats },
+    /// Part of the module's diagnostic log: `bytes` from `offset` of a file of `total` bytes.
+    Log { req: u16, status: Status, total: u32, offset: u32, bytes: Vec<u8> },
     Ack { op: u8, req: u16, status: Status, value: u32 },
 }
 
 impl Reply {
     pub fn req(&self) -> u16 {
         match self {
-            Reply::Hello { req, .. } | Reply::List { req, .. } | Reply::Stats { req, .. } | Reply::Ack { req, .. } => *req,
+            Reply::Hello { req, .. } | Reply::List { req, .. } | Reply::Stats { req, .. } | Reply::Log { req, .. } | Reply::Ack { req, .. } => *req,
         }
     }
 
     pub fn status(&self) -> Status {
         match self {
-            Reply::Hello { status, .. } | Reply::List { status, .. } | Reply::Stats { status, .. } | Reply::Ack { status, .. } => *status,
+            Reply::Hello { status, .. }
+            | Reply::List { status, .. }
+            | Reply::Stats { status, .. }
+            | Reply::Log { status, .. }
+            | Reply::Ack { status, .. } => *status,
         }
     }
 }
@@ -335,6 +344,11 @@ impl Request {
                 w.u16(*req);
                 w
             }
+            Request::Log { req, offset } => {
+                let mut w = W::new(op::LOG);
+                w.u16(*req).u32(*offset);
+                w
+            }
             Request::Begin { req, id, size, crc32, name } => {
                 let mut w = W::new(op::BEGIN);
                 w.u16(*req).u32(*id).u32(*size).u32(*crc32).str(name);
@@ -390,6 +404,7 @@ impl Request {
             op::HELLO => Request::Hello { req, version: r.u8()? },
             op::LIST => Request::List { req, offset: r.u8()?, max: r.u8()? },
             op::STATS => Request::Stats { req },
+            op::LOG => Request::Log { req, offset: r.u32()? },
             op::BEGIN => Request::Begin { req, id: r.u32()?, size: r.u32()?, crc32: r.u32()?, name: r.str()? },
             op::END => Request::End { req },
             op::ABORT => Request::Abort { req },
@@ -406,6 +421,7 @@ impl Request {
             Request::Hello { req, .. } => (op::HELLO, *req),
             Request::List { req, .. } => (op::LIST, *req),
             Request::Stats { req } => (op::STATS, *req),
+            Request::Log { req, .. } => (op::LOG, *req),
             Request::Begin { req, .. } => (op::BEGIN, *req),
             Request::Data { .. } => (op::DATA, 0),
             Request::End { req } => (op::END, *req),
@@ -459,6 +475,13 @@ impl Reply {
                 for x in stats.words() {
                     w.u32(x);
                 }
+                w.0
+            }
+            Reply::Log { req, status, total, offset, bytes } => {
+                let mut w = W::new(op::LOG | op::REPLY);
+                w.u16(*req).u8(*status as u8).u32(*total).u32(*offset);
+                let room = FRAME_MAX - w.0.len();
+                w.0.extend_from_slice(&bytes[..bytes.len().min(room)]);
                 w.0
             }
             Reply::Ack { op: code, req, status, value } => {
@@ -545,7 +568,12 @@ impl Incoming {
                 }
                 Reply::Stats { req, status, stats: Stats::from_words(words) }
             }
-            op::HELLO | op::LIST | op::STATS => Reply::Ack { op: request, req, status, value: 0 },
+            op::LOG if status == Status::Ok => {
+                let total = r.u32()?;
+                let offset = r.u32()?;
+                Reply::Log { req, status, total, offset, bytes: r.0.to_vec() }
+            }
+            op::HELLO | op::LIST | op::STATS | op::LOG => Reply::Ack { op: request, req, status, value: 0 },
             _ => Reply::Ack { op: request, req, status, value: r.u32().unwrap_or(0) },
         }))
     }
@@ -569,6 +597,7 @@ mod tests {
             Request::Delete { req: 6, id: 1 },
             Request::Select { req: 7, id: 2 },
             Request::Options { req: 8, options: 1 },
+            Request::Log { req: 11, offset: 4096 },
         ];
         for r in all {
             let f = r.encode();
@@ -611,6 +640,8 @@ mod tests {
         }
         let st = Reply::Stats { req: 3, status: Status::Ok, stats: Stats { fps_x10: 287, calls: 300, flags: 5, ..Default::default() } };
         assert_eq!(Incoming::decode(&st.encode()).unwrap(), Incoming::Reply(st));
+        let log = Reply::Log { req: 12, status: Status::Ok, total: 9000, offset: 470, bytes: vec![b'x'; 300] };
+        assert_eq!(Incoming::decode(&log.encode()).unwrap(), Incoming::Reply(log));
         let ack = Reply::Ack { op: op::END, req: 9, status: Status::Crc, value: 77 };
         assert_eq!(Incoming::decode(&ack.encode()).unwrap(), Incoming::Reply(ack));
         let refused = Reply::Ack { op: op::HELLO, req: 1, status: Status::Unsupported, value: 0 };
