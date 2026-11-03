@@ -802,9 +802,6 @@ impl Bytes<'_> {
     fn f32(&mut self) -> Option<f32> {
         self.u32().map(f32::from_bits)
     }
-    fn i16(&mut self) -> Option<i16> {
-        self.u16().map(|v| v as i16)
-    }
 }
 
 /// Decodes an [`IdleBake`] stream frame after frame (the matrices are deltas from the frame

@@ -434,12 +434,6 @@ impl Stream {
         self.at += 4;
     }
 
-    /// One register, one STATE command (as the driver writes every per-draw register; the
-    /// multi-register form is only known to work on the watch for the palette).
-    fn state(&mut self, reg: u32, value: u32) {
-        self.put(0x3001_0000 | reg);
-        self.put(value);
-    }
 
     /// Appends a draw of `path` (S16, END-terminated) with the image coordinate generator
     /// `generator`, colour `color` and tessellation window `window` ((x, y, w, h) in target
@@ -457,28 +451,37 @@ impl Stream {
         }
         // In the driver's order: the generator, the colour, then right before the path the
         // flush, the path setup and the tessellation window (the batched draws of an earlier
-        // build wrote no path setup and used multi-register writes; the watch's GPU hung).
+        // build wrote no path setup and used multi-register writes; the watch's GPU hung). Built
+        // on the stack and copied in once, the path after it in one piece.
         let g = generator;
-        let values = [g[0], g[1], g[2], g[3], g[4], g[5], GENERATOR_ON, g[6], g[7], g[8]];
-        for (reg, v) in GENERATOR_REGS.into_iter().zip(values) {
-            self.state(reg, v);
-        }
-        self.state(ST_COLOR, color);
-        self.state(ST_FLUSH, FLUSH_BEFORE_PATH);
-        self.state(ST_PATH_SETUP, PATH_SETUP);
-        self.state(ST_TESS_ORIGIN, (window[0] as u32) | (window[1] as u32) << 16);
-        self.state(ST_TESS_SIZE, (window[2] as u32) | (window[3] as u32) << 16);
         let bytes = path.len() * 2;
         let units = bytes.div_ceil(8);
-        self.put(0x4000_0000 | units as u32);
-        self.put(0);
+        let values = [g[0], g[1], g[2], g[3], g[4], g[5], GENERATOR_ON, g[6], g[7], g[8]];
+        let mut w = [0u32; 32];
+        for (k, (reg, v)) in GENERATOR_REGS.into_iter().zip(values).enumerate() {
+            (w[2 * k], w[2 * k + 1]) = (0x3001_0000 | reg, v);
+        }
+        let tail = [
+            (ST_COLOR, color),
+            (ST_FLUSH, FLUSH_BEFORE_PATH),
+            (ST_PATH_SETUP, PATH_SETUP),
+            (ST_TESS_ORIGIN, (window[0] as u32) | (window[1] as u32) << 16),
+            (ST_TESS_SIZE, (window[2] as u32) | (window[3] as u32) << 16),
+        ];
+        for (k, (reg, v)) in tail.into_iter().enumerate() {
+            (w[20 + 2 * k], w[21 + 2 * k]) = (0x3001_0000 | reg, v);
+        }
+        (w[30], w[31]) = (0x4000_0000 | units as u32, 0);
         let at = self.at;
-        let dst = &mut self.mem.slice()[at..at + units * 8];
-        for (d, v) in dst.chunks_exact_mut(2).zip(path) {
+        let dst = &mut self.mem.slice()[at..at + 128 + units * 8];
+        for (d, v) in dst[..128].chunks_exact_mut(4).zip(w) {
             d.copy_from_slice(&v.to_le_bytes());
         }
-        dst[bytes..].fill(0);
-        self.at += units * 8;
+        // SAFETY: i16 is plain data; the watch (and every host) is little-endian like the GPU.
+        let src = unsafe { core::slice::from_raw_parts(path.as_ptr() as *const u8, bytes) };
+        dst[128..128 + bytes].copy_from_slice(src);
+        dst[128 + bytes..].fill(0);
+        self.at += 128 + units * 8;
         self.n += 1;
     }
 
