@@ -843,9 +843,9 @@ impl Renderer {
     /// Turned on, the stream is allocated `now` (a pack is shown) or with the next pack.
     pub fn want_stream(&mut self, on: bool, now: bool) {
         self.stream_wanted = on;
-        if !on {
+        if !on || STREAM_OFF.load(Ordering::Relaxed) {
             self.stream = None;
-        } else if now && self.stream.is_none() && !STREAM_OFF.load(Ordering::Relaxed) {
+        } else if now && self.stream.is_none() {
             self.stream = Stream::new(STREAM_BYTES);
         }
     }
@@ -859,6 +859,11 @@ impl Renderer {
     /// Lets the pattern outside an image be transparent instead of its edge.
     pub fn use_pattern_color(&mut self) {
         self.pattern_mode = PATTERN_COLOR;
+    }
+
+    /// PAD pattern edges (the image's edge texels outside it) or transparent ones.
+    pub fn set_pad(&mut self, pad: bool) {
+        self.pattern_mode = if pad { PATTERN_PAD } else { PATTERN_COLOR };
     }
 
     pub fn new() -> Renderer {

@@ -17,6 +17,7 @@ pub mod gpu;
 pub mod host;
 pub mod lv;
 pub mod selftest;
+pub mod trust;
 pub mod view;
 
 use host::Fs;
@@ -220,8 +221,23 @@ pub struct Runtime {
     gpu_cool_until: u32,
     gpu_window_resets: u32,
     gpu_window_at: u32,
-    gpu_step: u8,
     gpu_paused: bool,
+    gpu_hidden: bool,
+    /// GPU features (`trust`): the verdicts, those on, and what the self-test allows of them
+    /// (page formats it found wrong, batched draws, PAD edges, the background blit); frames
+    /// drawn since the last timeout and since the trial began.
+    trust: trust::Trust,
+    features: u8,
+    st_formats: u32,
+    st_stream: bool,
+    st_pad: bool,
+    st_blit: bool,
+    bake_allowed: bool,
+    clean_frames: u32,
+    trial_frames: u32,
+    /// Development (`dev-gpu-timeout`, a hex feature mask): frames with any of these features on
+    /// count a timeout, to try the trials where the GPU never times out (Mirage).
+    force_timeout: u8,
     /// LVGL's layer, wrapped for the GPU.
     layer_buffer: Option<gpu::VgBuffer>,
     /// When the module started and when the phone link last changed (breathers).
@@ -296,8 +312,18 @@ pub fn rt() -> &'static mut Runtime {
                 gpu_cool_until: 0,
                 gpu_window_resets: 0,
                 gpu_window_at: 0,
-                gpu_step: 0,
                 gpu_paused: false,
+                gpu_hidden: false,
+                trust: trust::Trust { good: 0, bad: 0, trying: 0 },
+                features: 0,
+                st_formats: 0,
+                st_stream: false,
+                st_pad: false,
+                st_blit: false,
+                bake_allowed: false,
+                clean_frames: 0,
+                trial_frames: 0,
+                force_timeout: 0,
                 layer_buffer: None,
                 started_at: 0,
                 link_changed_at: 0,
@@ -494,12 +520,19 @@ pub fn status_text() -> String {
     }
     if r.gpu_resets != 0 {
         text += &alloc::format!("GPU 超时复位 {} 次（开机以来）\n", r.gpu_resets);
-        text += match r.gpu_step {
-            0 => "",
-            1 => "已因 GPU 超时关闭批量绘制\n",
-            2 => "已因 GPU 超时关闭批量绘制、贴图改用 32 位\n",
-            _ => "GPU 反复超时，已暂停动画（重新选择角色可重试）\n",
-        };
+        if r.gpu_paused {
+            text += "GPU 反复超时，已暂停动画\n";
+        }
+    }
+    if r.selftest.is_some() {
+        text += &alloc::format!("GPU 功能：已开 {}", trust::names(r.features));
+        if r.trust.trying != 0 {
+            text += &alloc::format!("（正在试 {}）", trust::names(r.trust.trying));
+        }
+        if r.trust.bad != 0 {
+            text += &alloc::format!("；会超时 {}", trust::names(r.trust.bad));
+        }
+        text += "\n";
     }
     if r.direct_broken {
         text += "直接绘制自检未通过（GPU 没写进系统缓冲区），已改用缓冲绘制\n";
@@ -668,9 +701,10 @@ fn load_step() -> Option<i32> {
     let Some(lobby) = l.lobby.as_ref() else {
         match Lobby::load_from(&mut l.src) {
             Ok((mut lobby, pages)) => {
-                // The background image is drawn with a blit: without a working one (self-test),
-                // the baked slots are drawn as they are.
-                if r.selftest.is_some_and(|t| t.flags & selftest::flag::RAN != 0 && t.passed & selftest::probe::BLIT == 0) {
+                // The background image is drawn with a blit: without a working one (self-test)
+                // or before the watch has shown it draws it without timeouts (`trust`), the
+                // baked slots are drawn as they are.
+                if !r.bake_allowed {
                     lobby.bake = None;
                 }
                 trace(&alloc::format!("parsed in {} ms; {} pages; heap: free {} KB, largest {} KB", lv::now_ms().wrapping_sub(l.t0), pages.len(), heap_free_kb(), largest_block_kb()));
@@ -1036,6 +1070,23 @@ extern "C" fn frame(timer: *mut c_void) {
         if Fs::read("dev-nostream", 4).is_some() {
             gpu::STREAM_OFF.store(true, Ordering::Relaxed);
         }
+        // What the self-test allows; the features on are the ones the watch has shown it
+        // draws without timeouts.
+        r.st_formats = gpu::BAD_FORMATS.load(Ordering::Relaxed);
+        r.st_stream = !gpu::STREAM_OFF.load(Ordering::Relaxed);
+        r.st_pad = t.passed & selftest::probe::PAD != 0;
+        r.st_blit = !(t.flags & selftest::flag::RAN != 0 && t.passed & selftest::probe::BLIT == 0);
+        r.force_timeout = Fs::read("dev-gpu-timeout", 8)
+            .and_then(|b| u8::from_str_radix(core::str::from_utf8(&b).ok()?.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        r.trust = trust::Trust::load();
+        r.features = r.trust.good;
+        apply_features(r);
+        trace(&alloc::format!(
+            "gpu features: on {}; bad {}",
+            trust::names(r.features),
+            trust::names(r.trust.bad)
+        ));
         r.pace_traced = Fs::read("dev-pacetrace", 4).is_none();
         trace(&alloc::format!("self-test flags {:#x}, region blits {}, baked idle off {}, batched draws {}", t.flags, r.renderer.paths.blits, r.idle_off, !gpu::STREAM_OFF.load(Ordering::Relaxed)));
         r.selftest = Some(t);
@@ -1081,16 +1132,20 @@ extern "C" fn frame(timer: *mut c_void) {
         }
         return;
     }
-    // GPU timeouts: a rest, or no more frames (the last one drawn stays up).
-    if r.gpu_paused || (r.gpu_cool_until.wrapping_sub(now) as i32) > 0 {
+    // GPU timeouts: a rest (no new frame; what is on the screen stays), or no more frames (the
+    // layer hidden: the watchface without the character).
+    if r.gpu_paused {
         r.last_ms = now;
-        if r.direct {
+        if !r.gpu_hidden {
+            r.gpu_hidden = true;
             r.direct = false;
-            if !r.gpu_paused {
-                draw_own(r, v.rect);
-            }
             v.set_direct(false);
+            v.set_hidden(true);
         }
+        return;
+    }
+    if (r.gpu_cool_until.wrapping_sub(now) as i32) > 0 {
+        r.last_ms = now;
         return;
     }
     // A gap (the layer away, the screen off) is no frame rate: the stats window starts over.
@@ -1282,31 +1337,90 @@ impl Marks {
     }
 }
 
-/// Timeouts within `GPU_WINDOW_MS` that make the module step back once more: batched draws
-/// off, then every page widened to BGRA8888 (the pack reloads), then no more frames.
-const GPU_STEP_RESETS: u32 = 3;
+/// Timeouts within `GPU_WINDOW_MS` with only trusted features on that turn them all off, and
+/// then (with none on) that pause drawing.
+const GPU_STEP_RESETS: u32 = 2;
 const GPU_WINDOW_MS: u32 = 10_000;
 const GPU_COOL_MS: u32 = 1000;
 
+/// Turns the GPU features in `r.features` on and the rest off, as far as the self-test allows
+/// them. Page formats and the background blit take a reload of the shown pack.
+fn apply_features(r: &mut Runtime) {
+    use bal2d_pack::PageFormat;
+    let f = r.features;
+    gpu::STREAM_OFF.store(f & trust::STREAM == 0 || !r.st_stream, Ordering::Relaxed);
+    r.renderer.want_stream(!r.single, r.lobby.is_some());
+    r.renderer.set_pad(f & trust::PAD != 0 && r.st_pad);
+    let wide = 1 << PageFormat::Argb4444 as u32 | 1 << PageFormat::Argb8565 as u32 | 1 << PageFormat::Index8 as u32;
+    let formats = if f & trust::NATIVE != 0 { r.st_formats } else { r.st_formats | wide };
+    let old = gpu::BAD_FORMATS.swap(formats, Ordering::Relaxed);
+    let bake = f & trust::BAKE != 0 && r.st_blit;
+    let reload = old != formats || bake != r.bake_allowed;
+    r.bake_allowed = bake;
+    if reload && (r.lobby.is_some() || r.loader.is_some()) {
+        RELOAD.store(true, Ordering::Release);
+    }
+}
+
+/// A frame drawn without a timeout: trials start and pass (see `trust`).
+fn trust_tick(r: &mut Runtime) {
+    r.clean_frames += 1;
+    let t = &mut r.trust;
+    if t.trying != 0 {
+        r.trial_frames += 1;
+        if r.trial_frames >= trust::CLEAN_FRAMES {
+            trace(&alloc::format!("gpu trust: {} drew {} frames clean: good", trust::names(t.trying), r.trial_frames));
+            t.good |= t.trying;
+            t.trying = 0;
+            t.save();
+            r.clean_frames = 0;
+        }
+        return;
+    }
+    if r.clean_frames < trust::CLEAN_FRAMES || r.loader.is_some() {
+        return;
+    }
+    let Some(f) = t.next() else { return };
+    // Into the file before it is on: a watch that freezes over it marks it bad when it restarts.
+    t.trying = f;
+    t.save();
+    trace(&alloc::format!("gpu trust: trying {}", trust::names(f)));
+    r.trial_frames = 0;
+    r.features |= f;
+    apply_features(r);
+}
+
 /// Counts the frame's GPU timeouts (`gpu::Stats::resets`); the first few go to the log. Each
-/// costs 100 ms with the LVGL thread blocked and loses part of the frame; several in a row
-/// starve the system (the watch froze on the third real test), so the module rests and then
-/// steps back to plainer drawing.
+/// costs 100 ms with the LVGL thread blocked and loses part of the frame, and a few in a row
+/// froze the watch: the module rests, turns off the feature under trial, or all of them, and
+/// in the end stops drawing.
 fn note_resets(r: &mut Runtime) {
+    if r.force_timeout & r.features != 0 {
+        r.renderer.stats.resets += 1;
+    }
     let s = r.renderer.stats;
     if s.resets == 0 {
         return;
     }
     let now = lv::now_ms();
     r.gpu_resets += s.resets;
+    r.clean_frames = 0;
     if r.gpu_resets <= 8 {
         trace(&alloc::format!(
-            "gpu timeout: {} in this frame ({} since start); calls {} batches {}, waited for the GPU {} ms",
-            s.resets, r.gpu_resets, s.calls, s.batches, s.flush_ms
+            "gpu timeout: {} in this frame ({} since start); calls {} batches {}, waited for the GPU {} ms; features {}",
+            s.resets, r.gpu_resets, s.calls, s.batches, s.flush_ms, trust::names(r.features)
         ));
     }
-    if s.resets >= 2 {
-        r.gpu_cool_until = now.wrapping_add(GPU_COOL_MS);
+    r.gpu_cool_until = now.wrapping_add(GPU_COOL_MS);
+    let t = &mut r.trust;
+    if t.trying != 0 {
+        trace(&alloc::format!("gpu trust: {} timed out: bad", trust::names(t.trying)));
+        t.bad |= t.trying;
+        r.features &= !t.trying;
+        t.trying = 0;
+        t.save();
+        apply_features(r);
+        return;
     }
     if now.wrapping_sub(r.gpu_window_at) > GPU_WINDOW_MS {
         r.gpu_window_at = now;
@@ -1318,23 +1432,16 @@ fn note_resets(r: &mut Runtime) {
     }
     r.gpu_window_resets = 0;
     r.gpu_window_at = now;
-    r.gpu_step += 1;
-    match r.gpu_step {
-        1 => {
-            gpu::STREAM_OFF.store(true, Ordering::Relaxed);
-            trace("gpu timeouts: batched draws off");
-        }
-        2 => {
-            use bal2d_pack::PageFormat;
-            let wide = 1 << PageFormat::Argb4444 as u32 | 1 << PageFormat::Argb8565 as u32 | 1 << PageFormat::Index8 as u32;
-            gpu::BAD_FORMATS.fetch_or(wide, Ordering::Relaxed);
-            RELOAD.store(true, Ordering::Release);
-            trace("gpu timeouts: pages widened to BGRA8888, reloading");
-        }
-        _ => {
-            r.gpu_paused = true;
-            trace("gpu timeouts: drawing paused");
-        }
+    if r.features != 0 {
+        // Trusted ones time out after all: all off, to be tried again one by one.
+        trace(&alloc::format!("gpu trust: timeouts with {} on: all turned off", trust::names(r.features)));
+        r.features = 0;
+        t.good = 0;
+        t.save();
+        apply_features(r);
+    } else {
+        trace("gpu timeouts with every feature off: drawing paused");
+        r.gpu_paused = true;
     }
 }
 
@@ -1342,6 +1449,9 @@ fn note_resets(r: &mut Runtime) {
 /// waiting for the GPU to finish).
 fn count_draw(r: &mut Runtime, draw: u32, gpu: u32) {
     let s = r.renderer.stats;
+    if s.resets == 0 && !r.gpu_paused {
+        trust_tick(r);
+    }
     let w = &mut r.window;
     w.drawn += 1;
     w.draw_ms += draw;
@@ -1422,6 +1532,10 @@ fn render(r: &mut Runtime, target: &mut gpu::VgBuffer, offset: (i32, i32), clip:
 pub fn on_draw_main(e: *mut c_void) {
     let r = rt();
     if !r.direct || r.lobby.is_none() {
+        return;
+    }
+    // Resting after GPU timeouts: nothing touches the GPU (the layer keeps what it showed).
+    if r.gpu_paused || (r.gpu_cool_until.wrapping_sub(lv::now_ms()) as i32) > 0 {
         return;
     }
     let v = view::view();
