@@ -159,6 +159,17 @@ pub fn suggested_name(assets: &[Asset]) -> String {
         .unwrap_or_default()
 }
 
+/// Names that identify the lobby for the game tables: the skeletons' and atlases' file names, and
+/// the atlases' page names (which survive Android's content-URI file names).
+pub fn lobby_names(assets: &[Asset]) -> Vec<String> {
+    let mut out: Vec<String> = assets.iter().filter(|a| a.kind == FileKind::Skeleton).map(|a| stem(&a.name).to_string()).collect();
+    for a in assets.iter().filter(|a| a.kind == FileKind::Atlas) {
+        out.push(stem(&a.name).to_string());
+        out.extend(Atlas::parse(&String::from_utf8_lossy(&a.data)).pages.into_iter().map(|p| p.name));
+    }
+    out
+}
+
 /// The prefab entry for the main skeleton in a community interaction dump (`interactions.json`:
 /// keys like `SpineLobbies/<lobby>/<skeleton>`), if one was added.
 pub(crate) fn interactions(assets: &[Asset], layers: &[LayerInput]) -> Option<bal2d_pack::Interactions> {
@@ -194,6 +205,11 @@ pub struct BuildRequest {
     pub idle_mode: String,
     /// From the framing editor: a camera per phase (else the default framing at `zoom`).
     pub framing: Option<crate::framing::Framing>,
+    /// The talks' lines for the speech bubble (the compiler keeps those the lobby plays).
+    pub dialogue: Option<bal2d_pack::Dialogue>,
+    /// What the summary says when there is no dialogue (why it is missing; empty when it was
+    /// turned off).
+    pub dialogue_note: String,
 }
 
 /// Compiles the pack and renders a frame after the intro; `progress` gets what it is doing and
@@ -220,6 +236,7 @@ pub fn build(req: &BuildRequest, progress: &mut dyn FnMut(&str, f32)) -> Result<
             .framing
             .map(|f| (1..f.len()).filter_map(|p| f[p].map(|c| (p as u8, c))).collect())
             .unwrap_or_default(),
+        dialogue: req.dialogue.clone(),
         ..Default::default()
     };
     let inter = interactions(&req.assets, &layers);
@@ -250,7 +267,12 @@ pub fn build(req: &BuildRequest, progress: &mut dyn FnMut(&str, f32)) -> Result<
         bytes.len() as f64 / 1024.0,
         original as f64 / 1048576.0,
         if report.budget_scale < 0.999 { format!(" · 为适配手表内存缩小到 {:.0}%", report.budget_scale * 100.0) } else { String::new() }
-    ) + &idle_note(&report.idle, opts.idle);
+    ) + &idle_note(&report.idle, opts.idle)
+        + &match &req.dialogue {
+            Some(_) if report.dialogue_talks > 0 => format!(" · 对话 {} 段", report.dialogue_talks),
+            Some(_) => " · 没有与大厅动画对应的对话台词".to_string(),
+            None => req.dialogue_note.clone(),
+        };
     // The same lobby always lands on the same id, so sending it again replaces it on the watch.
     let id = bal2d_proto::crc32(layers.last().map(|l| l.name.as_bytes()).unwrap_or(b"")) | 1;
     Ok(Built {
@@ -281,6 +303,7 @@ mod tests {
     use super::*;
 
     const DIR: &str = "/Volumes/EXT0/tmp/bal2d-ext/assets/Hoshino_home";
+    const DIALOG: &str = "/private/tmp/claude-501/-Volumes-EXT0-Canopus-Module-BAL2D/c01d7433-0cae-46f5-81e9-7dca51e4f2ce/scratchpad/basv/g-dialog.json";
 
     /// The Hoshino lobby (two skeletons) as picked files, or `None` when the local copy is absent.
     fn files() -> Option<Vec<(String, Vec<u8>)>> {
@@ -331,8 +354,34 @@ mod tests {
             recognise(&name, data, &mut assets);
         }
         let t0 = std::time::Instant::now();
-        let built = build(&BuildRequest { assets, name: String::new(), screen: (336, 480), zoom: 100, high_quality: false, idle_mode: String::new(), framing: None }, &mut |_, _| {}).unwrap();
+        // Hoshino's lines from the game table, when a copy is around.
+        let dialogue = std::fs::File::open(DIALOG).ok().map(|f| {
+            let map = crate::library::extract_dialogue(f).unwrap();
+            let names = lobby_names(&assets);
+            assert!(names.iter().any(|n| n == "Hoshino_home"));
+            crate::library::dialogue(&map[&10005], crate::library::Lang::Hans)
+        });
+        let with_lines = dialogue.is_some();
+        let req = BuildRequest {
+            assets,
+            name: String::new(),
+            screen: (336, 480),
+            zoom: 100,
+            high_quality: false,
+            idle_mode: String::new(),
+            framing: None,
+            dialogue,
+            dialogue_note: String::new(),
+        };
+        let built = build(&req, &mut |_, _| {}).unwrap();
         eprintln!("built in {:?}: {}", t0.elapsed(), built.summary);
+        if with_lines {
+            assert!(built.summary.contains(" · 对话 "), "{}", built.summary);
+            let reader = bal2d_pack::Reader::new(&built.bytes).unwrap();
+            let entry = reader.find(bal2d_pack::KIND_DIALOGUE, 0, 0).expect("dialogue section");
+            let d = bal2d_pack::Dialogue::decode(&reader.read(entry).unwrap()).unwrap();
+            assert!(d.talks.len() >= 3 && d.talks.iter().all(|t| !t.lines.is_empty()), "{d:?}");
+        }
         assert!(built.bytes.starts_with(b"BL2D"));
         assert!(built.preview.starts_with("data:image/png;base64,"));
         assert_eq!(built.screen, (336, 480));

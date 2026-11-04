@@ -9,7 +9,7 @@ use crate::astrobox::psys_host_v4::{
 };
 use crate::state::{self, Tab, UiState};
 use crate::view::{Kind, On, View};
-use crate::{assets, face, watch};
+use crate::{assets, face, library, online, watch};
 
 const EV_TAB: &str = "action:tab.";
 const EV_DEVICE: &str = "input:device";
@@ -47,6 +47,17 @@ const EV_FRAME_UP: &str = "pointer:frame.up";
 const EV_FRAME_ZOOM: &str = "input:frame.zoom";
 const EV_FRAME_X: &str = "input:frame.x";
 const EV_FRAME_Y: &str = "input:frame.y";
+const EV_LANG: &str = "input:lang";
+const EV_LIB_LOAD: &str = "action:lib.load";
+const EV_LIB_QUERY: &str = "input:lib.query";
+const EV_LIB_GET: &str = "action:lib.get.";
+const EV_LIB_ROUTE: &str = "input:lib.route";
+const EV_LIB_PREFIX: &str = "input:lib.prefix";
+const EV_LIB_AUTO: &str = "action:lib.auto";
+/// Rows of the online library shown at once (the rest are reached by searching).
+const LIB_ROWS: usize = 50;
+/// Download progress redraws the page at most this often (ms).
+const PROGRESS_REDRAW_MS: u128 = 150;
 /// The box is redrawn at most this often while dragged (ms): each redraw sends the whole page.
 const FRAME_REDRAW_MS: u128 = 40;
 
@@ -179,6 +190,22 @@ pub async fn on_event(event: &str, payload: &str) {
             set_frame_camera(s, next);
         }),
         EV_NAME => return state::with_state(|s| s.name = value),
+        EV_LANG => state::with_state(|s| {
+            s.bubble_lang = value;
+            s.built = None;
+        }),
+        EV_LIB_LOAD => load_library().await,
+        EV_LIB_QUERY => state::with_state(|s| s.lib.query = value),
+        EV_LIB_ROUTE => {
+            online::forget_source();
+            state::with_state(|s| s.lib.route = value);
+        }
+        EV_LIB_PREFIX => {
+            online::forget_source();
+            return state::with_state(|s| s.lib.custom_prefix = value.trim().to_string());
+        }
+        EV_LIB_AUTO => state::with_state(|s| s.lib.auto_install = !s.lib.auto_install),
+        e if e.starts_with(EV_LIB_GET) => download_lobby(&e[EV_LIB_GET.len()..]).await,
         EV_ZOOM => {
             state::with_state(|s| {
                 s.zoom = value.parse().unwrap_or(100);
@@ -232,6 +259,8 @@ pub async fn on_event(event: &str, payload: &str) {
             s.overview = None;
             s.framing = None;
             s.name.clear();
+            s.name_rev += 1;
+            s.character = None;
             s.status.clear();
         }),
         EV_BUILD => build().await,
@@ -336,12 +365,16 @@ async fn add_files() {
     let n = assets::recognise(&name, data, &mut assets);
     let suggested = assets::suggested_name(&assets);
     state::with_state(|s| {
+        if s.assets.is_empty() {
+            s.character = None;
+        }
         s.assets = assets;
         s.built = None;
         s.overview = None;
         s.framing = None;
-        if s.name.is_empty() {
+        if s.name.is_empty() && !suggested.is_empty() {
             s.name = suggested;
+            s.name_rev += 1;
         }
     });
     if n == 0 {
@@ -363,6 +396,21 @@ async fn build() {
     });
     state::set_status("", false);
     rerender();
+    let (dialogue, dialogue_note) = match library::Lang::from_setting(&s.bubble_lang) {
+        None => (None, String::new()),
+        Some(lang) => {
+            let mut show = progress_sink(|s, p| s.progress = p);
+            show("准备对话台词", 0.0);
+            match online::dialogue(s.character, &assets::lobby_names(&s.assets), lang, &route(&s), &mut show) {
+                Ok(Some(d)) => (Some(d), String::new()),
+                Ok(None) => (None, " · 没有找到这个大厅的对话台词".to_string()),
+                Err(e) => {
+                    tracing::warn!("dialogue: {e}");
+                    (None, " · 对话台词未能下载（网络不可用）".to_string())
+                }
+            }
+        }
+    };
     let req = assets::BuildRequest {
         assets: s.assets.clone(),
         name: s.name.clone(),
@@ -371,6 +419,8 @@ async fn build() {
         high_quality: s.high_quality,
         idle_mode: s.idle_mode.clone(),
         framing: s.framing,
+        dialogue,
+        dialogue_note,
     };
     // Each step is shown as it starts (the compile runs in this call; the UI is redrawn from here).
     let mut shown = (String::new(), u32::MAX);
@@ -398,6 +448,120 @@ async fn build() {
             }
         }
     });
+}
+
+fn route(s: &UiState) -> online::Route {
+    online::Route { kind: s.lib.route.clone(), prefix: s.lib.custom_prefix.clone() }
+}
+
+/// A progress callback for blocking work (downloads): stores `(label, percent)` with `set` and
+/// redraws the page at most every [`PROGRESS_REDRAW_MS`].
+fn progress_sink(set: fn(&mut UiState, Option<(String, u32)>)) -> impl FnMut(&str, f32) {
+    let mut shown = (String::new(), u32::MAX);
+    let mut drawn: Option<std::time::Instant> = None;
+    move |label, f| {
+        let percent = (f.clamp(0.0, 1.0) * 100.0) as u32;
+        if label == shown.0 && percent == shown.1 {
+            return;
+        }
+        shown = (label.to_string(), percent);
+        state::with_state(|s| set(s, Some((label.to_string(), percent))));
+        if drawn.is_none_or(|t| t.elapsed().as_millis() >= PROGRESS_REDRAW_MS) {
+            drawn = Some(std::time::Instant::now());
+            rerender();
+        }
+    }
+}
+
+/// Downloads the online library's lobby list (with Chinese names).
+async fn load_library() {
+    let s = state::snapshot();
+    if s.lib.loading || s.lib.active.is_some() {
+        return;
+    }
+    state::with_state(|s| {
+        s.lib.loading = true;
+        s.lib.progress = Some(("连接".into(), 0));
+    });
+    state::set_status("", false);
+    rerender();
+    let result = online::load_catalog(&route(&s), &mut progress_sink(|s, p| s.lib.progress = p));
+    state::with_state(|s| {
+        s.lib.loading = false;
+        s.lib.progress = None;
+    });
+    match result {
+        Ok((entries, warning)) => {
+            state::with_state(|s| s.lib.entries = entries);
+            state::set_status(warning.unwrap_or_default(), false);
+        }
+        Err(e) => state::set_status(format!("{e}。可以在“下载线路”里换一条线路再试。"), true),
+    }
+}
+
+/// One click in the online library: downloads the lobby's files into the asset list (replacing
+/// it), names the pack after the student, builds it with the current settings and, if the
+/// watch is connected and the toggle is on, installs it.
+async fn download_lobby(id: &str) {
+    let s = state::snapshot();
+    if s.busy || s.transfer.is_some() || s.lib.loading || s.lib.active.is_some() {
+        return;
+    }
+    let Some(entry) = s.lib.entries.iter().find(|e| e.id == id).cloned() else { return };
+    state::with_state(|s| {
+        s.busy = true;
+        s.lib.active = Some(entry.id.clone());
+        s.lib.progress = Some(("准备下载".into(), 0));
+    });
+    state::set_status("", false);
+    rerender();
+    let result = online::download_lobby(&entry, &route(&s), &mut progress_sink(|s, p| s.lib.progress = p));
+    let files = match result {
+        Ok(files) => files,
+        Err(e) => {
+            state::with_state(|s| {
+                s.busy = false;
+                s.lib.active = None;
+                s.lib.progress = None;
+            });
+            state::set_status(format!("{e}。可以在“下载线路”里换一条线路再试。"), true);
+            return;
+        }
+    };
+    let mut assets = Vec::new();
+    for (name, data) in files {
+        assets::recognise(&name, data, &mut assets);
+    }
+    state::with_state(|s| {
+        s.assets = assets;
+        s.name = entry.name.clone();
+        s.name_rev += 1;
+        s.character = entry.character;
+        s.built = None;
+        s.overview = None;
+        s.framing = None;
+        s.busy = false;
+        s.lib.progress = None;
+    });
+    if state::snapshot().hello.is_none() {
+        state::with_state(|s| s.lib.active = None);
+        state::set_status(format!("已下载“{}”的素材。连接手表后点“编译并预览”。", entry.name), false);
+        return;
+    }
+    build().await;
+    state::with_state(|s| s.lib.active = None);
+    let after = state::snapshot();
+    if after.built.is_none() {
+        return;
+    }
+    if after.lib.auto_install && after.hello.is_some() {
+        rerender();
+        if let Err(e) = watch::install().await {
+            state::set_status(e, true);
+        }
+    } else {
+        state::set_status(format!("已编译“{}”。确认预览后点“安装到手表”。", entry.name), false);
+    }
 }
 
 /// Generates the scene overview for the framing editor (a small compile, then a frame of each
@@ -591,7 +755,7 @@ fn header(s: &UiState) -> View {
     card()
         .child(row().child(heading("BA 记忆大厅").grow()).child(status).child(button("刷新", EV_REFRESH, "ghost")))
         .child(text(
-            "把你自己从游戏中提取的记忆大厅（Spine 骨骼 + 图集 + 贴图）编译成手表角色包。插件不包含任何游戏素材；素材仅限个人使用，请勿分享。",
+            "把记忆大厅（Spine 骨骼 + 图集 + 贴图）编译成手表角色包：用你自己从游戏中提取的文件，或从在线角色库（第三方社区仓库）直接下载。插件不包含任何游戏素材；素材仅限个人使用，请勿分享。",
             13,
             tone::MUTED,
         ))
@@ -632,7 +796,7 @@ fn import_tab(s: &UiState) -> View {
                     .prop("size", "2")
                     .prop("placeholder", "显示在手表与列表中的名称")
                     .prop("default-value", &s.name)
-                    .prop("key", EV_NAME)
+                    .prop("key", &format!("{EV_NAME}.{}", s.name_rev))
                     .on(On::Input, EV_NAME),
             ),
         )
@@ -661,6 +825,21 @@ fn import_tab(s: &UiState) -> View {
                 ),
             )),
         )
+        .child(
+            row().child(field(
+                "气泡文字",
+                select(
+                    EV_LANG,
+                    if s.bubble_lang.is_empty() { "zh-hans" } else { &s.bubble_lang },
+                    &[("zh-hans", "简体中文"), ("zh-hant", "繁體中文"), ("ja", "日本語"), ("en", "English"), ("off", "关闭（不显示对话）")],
+                ),
+            )),
+        )
+        .child(text(
+            "对话时手表上显示角色的台词气泡。台词取自游戏数据表（electricgoat/ba-data），编译时联网下载；简体中文由繁体逐字转换（OpenCC 字表）。没有这种语言台词的新角色用日语。离线时照常编译，只是没有气泡。",
+            12,
+            tone::MUTED,
+        ))
         .child(row().child(button(if s.busy { "正在编译…" } else { "编译并预览" }, EV_BUILD, "solid").disabled_if(!can_build)))
         .maybe(s.progress.as_ref().map(|(label, percent)| {
             stack(6)
@@ -668,7 +847,7 @@ fn import_tab(s: &UiState) -> View {
                 .child(View::new(Kind::Progress, None).prop("value", &percent.to_string()).prop("max", "100").prop("size", "2"))
         }))
         .maybe(s.hello.is_none().then(|| text("连接手表后才能编译：角色包按手表的屏幕尺寸生成。", 12, tone::MUTED)));
-    let mut out = stack(16).child(assets_card).maybe((!s.assets.is_empty()).then(|| framing_card(s))).child(settings);
+    let mut out = stack(16).child(library_card(s)).child(assets_card).maybe((!s.assets.is_empty()).then(|| framing_card(s))).child(settings);
     if let Some(b) = &s.built {
         let mut c = card()
             .child(row().child(heading(&format!("预览 · {}", b.name)).grow()).child(badge(&format!("{}×{}", b.screen.0, b.screen.1), "gray")))
@@ -704,6 +883,129 @@ fn import_tab(s: &UiState) -> View {
         out = out.child(c);
     }
     out
+}
+
+/// The online character library: route, list, search, one-click download.
+fn library_card(s: &UiState) -> View {
+    let l = &s.lib;
+    let blocked = s.busy || l.loading || l.active.is_some() || s.transfer.is_some();
+    let load_label = if l.loading {
+        "正在载入…"
+    } else if l.entries.is_empty() {
+        "载入角色列表"
+    } else {
+        "刷新列表"
+    };
+    let route_value = if l.route.is_empty() { "auto" } else { l.route.as_str() };
+    let mut c = card()
+        .child(
+            row()
+                .child(heading("在线角色库").grow())
+                .child(button(load_label, EV_LIB_LOAD, if l.entries.is_empty() { "solid" } else { "ghost" }).disabled_if(blocked)),
+        )
+        .child(text(
+            "从第三方社区仓库在线下载记忆大厅：素材来自 asdfdsa12/BA-Spine-Viewer-Asset，中文名来自 SchaleDB，对话台词来自 electricgoat/ba-data。插件本身不包含、也不托管任何素材；仅限个人使用，请勿分享。",
+            13,
+            tone::MUTED,
+        ))
+        .child(
+            row().child(field(
+                "下载线路",
+                select(
+                    EV_LIB_ROUTE,
+                    route_value,
+                    &[("auto", "自动（jsDelivr → GitHub）"), ("jsdelivr", "jsDelivr"), ("github", "GitHub 直连"), ("custom", "自定义")],
+                ),
+            )),
+        )
+        .maybe((route_value == "custom").then(|| {
+            field(
+                "自定义前缀（加在 GitHub 原始链接前）",
+                View::new(Kind::Input, None)
+                    .width_full()
+                    .prop("size", "2")
+                    .prop("placeholder", "例如 https://ghfast.top/")
+                    .prop("default-value", &l.custom_prefix)
+                    .prop("key", EV_LIB_PREFIX)
+                    .on(On::Input, EV_LIB_PREFIX),
+            )
+        }))
+        .child(
+            row()
+                .child(
+                    text(
+                        if l.auto_install { "下载后直接安装到手表：开（编译完成后自动安装）" } else { "下载后直接安装到手表：关（只编译并预览）" },
+                        13,
+                        tone::TEXT,
+                    )
+                    .grow(),
+                )
+                .child(button(if l.auto_install { "关闭" } else { "开启" }, EV_LIB_AUTO, "soft")),
+        );
+    let progress = l.progress.as_ref().or(if l.active.is_some() { s.progress.as_ref() } else { None });
+    if let Some((label, percent)) = progress {
+        c = c
+            .child(text(&format!("{label} · {percent}%"), 13, tone::MUTED))
+            .child(View::new(Kind::Progress, None).prop("value", &percent.to_string()).prop("max", "100").prop("size", "2"));
+    }
+    if l.entries.is_empty() {
+        return c;
+    }
+    let found: Vec<&library::LibEntry> = l.entries.iter().filter(|e| library::matches(e, &l.query)).collect();
+    let count = if l.query.trim().is_empty() {
+        format!("共 {} 个大厅", l.entries.len())
+    } else {
+        format!("找到 {} 个", found.len())
+    };
+    let count = if found.len() > LIB_ROWS { format!("{count}，显示前 {LIB_ROWS} 个（输入名字搜索其他）") } else { count };
+    let r = route(s);
+    let rows: Vec<View> = found
+        .iter()
+        .take(LIB_ROWS)
+        .map(|e| {
+            let active = l.active.as_deref() == Some(e.id.as_str());
+            let sub = if e.extras.is_empty() { e.id.clone() } else { format!("{} · 含背景层", e.id) };
+            View::new(Kind::Div, None)
+                .row()
+                .align_center()
+                .gap(10)
+                .padding(8)
+                .radius(8)
+                .bg(if active { tone::GREEN_WELL } else { tone::WELL })
+                .child(View::new(Kind::Image, Some(&online::icon_url(&e.id, &r))).prop("alt", "").square(44).radius(8))
+                .child(
+                    stack(2)
+                        .grow()
+                        .child(
+                            View::new(Kind::Div, None)
+                                .row()
+                                .align_center()
+                                .gap(6)
+                                .child(text(&e.name, 14, if active { tone::GREEN } else { tone::TEXT }).class("rt-r-weight-medium rt-truncate"))
+                                .maybe(e.new.then(|| badge("新", "orange"))),
+                        )
+                        .child(text(&sub, 12, tone::MUTED).class("rt-truncate")),
+                )
+                .child(button(if active { "处理中…" } else { "下载并导入" }, &format!("{EV_LIB_GET}{}", e.id), "soft").disabled_if(blocked))
+        })
+        .collect();
+    let height = (rows.len().max(1) as u32 * 68).min(420);
+    c = c
+        .child(
+            View::new(Kind::Input, None)
+                .width_full()
+                .prop("size", "2")
+                .prop("placeholder", "搜索：中文名、韩文名或 ID")
+                .prop("default-value", &l.query)
+                .prop("key", EV_LIB_QUERY)
+                .on(On::Input, EV_LIB_QUERY),
+        )
+        .child(text(&count, 12, tone::MUTED));
+    if rows.is_empty() {
+        return c.child(text("没有匹配的大厅。", 13, tone::MUTED));
+    }
+    c.child(View::new(Kind::ScrollArea, None).prop("type", "auto").prop("scrollbars", "vertical").height(height).child(stack(8).children(rows)))
+        .maybe(s.hello.is_none().then(|| text("未连接手表时只下载素材；连接后点“编译并预览”。", 12, tone::MUTED)))
 }
 
 /// The framing editor: the scene with the watch-shaped box over it, per phase.
@@ -1039,5 +1341,49 @@ fn selftest_flags_note(flags: u32) -> String {
         " · GPU 自检通过".into()
     } else {
         format!(" · GPU 自检：{}", notes.join("；"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn events(v: &serde_json::Value, out: &mut Vec<String>) {
+        for l in v["event_listeners"].as_array().into_iter().flatten() {
+            out.push(l["id"].as_str().unwrap_or("").to_string());
+        }
+        for c in v["children"].as_array().into_iter().flatten() {
+            events(c, out);
+        }
+    }
+
+    fn page_events(s: &UiState) -> (Vec<String>, String) {
+        let json = page(s).to_json(&mut 0);
+        let mut out = Vec::new();
+        events(&json, &mut out);
+        (out, json.to_string())
+    }
+
+    #[test]
+    fn the_library_lists_a_limited_searchable_set_of_rows() {
+        let mut s = UiState::default();
+        let (ev, _) = page_events(&s);
+        assert!(ev.iter().any(|e| e == EV_LIB_LOAD) && ev.iter().any(|e| e == EV_LANG));
+        assert!(!ev.iter().any(|e| e.starts_with(EV_LIB_GET)));
+        s.lib.entries = (0..80)
+            .map(|i| library::LibEntry { id: format!("CH{i:04}_home"), name: format!("学生{i}"), kr: format!("학생{i}"), new: i < 3, ..Default::default() })
+            .collect();
+        s.lib.entries.push(library::LibEntry { id: "Hoshino_home".into(), name: "星野".into(), character: Some(10005), extras: vec!["Hoshino_home_background".into()], ..Default::default() });
+        let (ev, json) = page_events(&s);
+        assert_eq!(ev.iter().filter(|e| e.starts_with(EV_LIB_GET)).count(), LIB_ROWS);
+        assert!(json.contains("SCROLL_AREA") && json.contains("Lobbyillust_Icon_CH0000_01.png") && json.contains("共 81 个大厅"));
+        s.lib.query = "星野".into();
+        let (ev, json) = page_events(&s);
+        assert_eq!(ev.iter().filter(|e| e.starts_with(EV_LIB_GET)).collect::<Vec<_>>(), [&format!("{EV_LIB_GET}Hoshino_home")]);
+        assert!(json.contains("含背景层"));
+        // The custom prefix field shows only for the custom route.
+        assert!(!ev.iter().any(|e| e == EV_LIB_PREFIX));
+        s.lib.route = "custom".into();
+        assert!(page_events(&s).0.iter().any(|e| e == EV_LIB_PREFIX));
     }
 }

@@ -30,6 +30,7 @@ pub enum Kind {
     Separator,
     Badge,
     Slider,
+    ScrollArea,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +334,7 @@ impl From<Kind> for ui::ElementType {
             Kind::Separator => ui::ElementType::Separator,
             Kind::Badge => ui::ElementType::Badge,
             Kind::Slider => ui::ElementType::Slider,
+            Kind::ScrollArea => ui::ElementType::ScrollArea,
         }
     }
 }
@@ -437,6 +439,7 @@ impl View {
             Kind::Separator => "SEPARATOR",
             Kind::Badge => "BADGE",
             Kind::Slider => "SLIDER",
+            Kind::ScrollArea => "SCROLL_AREA",
         };
         let own_id = *id;
         let children: Vec<Value> = self.children.iter().map(|child| child.to_json(id)).collect();

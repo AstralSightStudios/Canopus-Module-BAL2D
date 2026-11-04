@@ -80,6 +80,26 @@ pub struct FaceState {
     pub patched: Option<(String, Vec<u8>)>,
 }
 
+/// The online character library card.
+#[derive(Clone, Debug, Default)]
+pub struct LibraryState {
+    /// The lobbies, once the list has been loaded.
+    pub entries: Vec<crate::library::LibEntry>,
+    pub query: String,
+    /// The list is being downloaded.
+    pub loading: bool,
+    /// The lobby being downloaded, built and installed.
+    pub active: Option<String>,
+    /// What the download is doing and the percent done.
+    pub progress: Option<(String, u32)>,
+    /// Download route: "auto" (or empty), "jsdelivr", "github", "custom".
+    pub route: String,
+    /// The custom route's prefix (put before the GitHub raw URL).
+    pub custom_prefix: String,
+    /// Install the pack on the watch once built (on by default).
+    pub auto_install: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
     pub root: Option<String>,
@@ -93,6 +113,13 @@ pub struct UiState {
     pub stats: Option<Stats>,
     pub assets: Vec<Asset>,
     pub name: String,
+    /// Bumped when the name is set by the plugin, so the name field shows it.
+    pub name_rev: u32,
+    /// The student of the lobby in `assets`, when it came from the online library.
+    pub character: Option<u32>,
+    /// Speech bubble language: "zh-hans" (or empty), "zh-hant", "ja", "en", "off".
+    pub bubble_lang: String,
+    pub lib: LibraryState,
     /// Framing zoom in percent.
     pub zoom: u32,
     pub high_quality: bool,
@@ -117,7 +144,7 @@ pub struct UiState {
 static STATE: OnceLock<Mutex<UiState>> = OnceLock::new();
 
 fn state() -> &'static Mutex<UiState> {
-    STATE.get_or_init(|| Mutex::new(UiState { zoom: 100, ..Default::default() }))
+    STATE.get_or_init(|| Mutex::new(UiState { zoom: 100, lib: LibraryState { auto_install: true, ..Default::default() }, ..Default::default() }))
 }
 
 pub fn with_state<T>(f: impl FnOnce(&mut UiState) -> T) -> T {

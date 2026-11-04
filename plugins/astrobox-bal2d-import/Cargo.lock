@@ -26,13 +26,15 @@ dependencies = [
  "bal2d-proto",
  "bal2d-spine",
  "base64",
+ "flate2",
  "futures",
  "png",
  "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
- "wit-bindgen",
+ "wasip2",
+ "wit-bindgen 0.63.0",
 ]
 
 [[package]]
@@ -563,6 +565,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "wasip2"
+version = "2.0.1+wasi-0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89aafd4b69fb41a64cfd5d7f214cde92ab422ec4d9bcd55fcc816d3f5f49bbf3"
+dependencies = [
+ "wit-bindgen 0.62.0",
+]
+
+[[package]]
 name = "wasm-encoder"
 version = "0.262.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -609,6 +620,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "wit-bindgen"
+version = "0.62.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53cb4b5556c3a791e86838ea287782bdafa704d55b0e68b5b81a3a16b9ea5f4b"
+dependencies = [
+ "bitflags 2.13.2",
 ]
 
 [[package]]
