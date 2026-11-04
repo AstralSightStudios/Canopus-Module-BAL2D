@@ -12,8 +12,10 @@ use canopus_target_private::*;
 
 pub mod app;
 pub mod bench;
+pub mod bubble;
 pub mod connect;
 pub mod fw;
+pub mod fx;
 pub mod gpu;
 pub mod host;
 pub mod lv;
@@ -255,6 +257,8 @@ pub struct Runtime {
     link_changed_at: u32,
     /// The previous drawn frame (a gap ends the stats window: hidden time is no frame rate).
     last_frame_at: u32,
+    /// Touch effects, drawn over the lobby.
+    fx: fx::Fx,
 }
 
 static mut RUNTIME: Option<Runtime> = None;
@@ -342,6 +346,7 @@ pub fn rt() -> &'static mut Runtime {
                 started_at: 0,
                 link_changed_at: 0,
                 last_frame_at: 0,
+                fx: fx::Fx::new(),
             });
         }
         slot.as_mut().unwrap()
@@ -945,6 +950,8 @@ fn unload() {
     r.load_tried = false;
     r.loader = None;
     r.boot_error = 0;
+    r.fx = fx::Fx::new();
+    bubble::bubble().clear();
     view::view().set_hidden(true);
     trace(&alloc::format!("unloaded; heap: free {} KB", heap_free_kb()));
 }
@@ -1260,6 +1267,7 @@ extern "C" fn frame(timer: *mut c_void) {
     if gate != 0 {
         // Pressed state belongs to the screen that went away.
         v.touches.len = 0;
+        bubble::bubble().clear();
         r.last_ms = now;
         // A page sliding over makes LVGL redraw the layer at its own rate: from the buffer, not
         // by drawing the scene again each time.
@@ -1301,13 +1309,29 @@ extern "C" fn frame(timer: *mut c_void) {
             r.pressed = false;
         }
         lobby.touch(kind, (e.x + v.rect.0) as f32, (e.y + v.rect.1) as f32);
+        r.fx.touch(e.kind, e.x as f32, e.y as f32);
     }
     let t0 = lv::now_ms();
     // Layers that only play their idle loop are drawn from their bakes, not animated.
     let baked = lobby.update_with(dt_ms as f32 / 1000.0, !r.idle_off);
     r.idle_active = baked != 0;
     r.baked_mask = baked;
+    // A talk with lines: its speech bubble (LVGL draws it over the layer).
+    let b = bubble::bubble();
+    for n in &lobby.notices {
+        if let bal2d_core::Notice::TalkStarted(i) = n {
+            match lobby.lines.get(*i).filter(|l| !l.is_empty()) {
+                Some(lines) => b.start(lines),
+                None => b.stop(),
+            }
+        }
+    }
     lobby.notices.clear();
+    if b.active() {
+        let anchor = lobby.grab_box().map(|(x, y, w, _)| (x + w * 0.5, y));
+        b.update(dt_ms as f32, bubble_parent(v.obj, r.screen), r.screen, anchor);
+    }
+    r.fx.update(dt_ms as f32 / 1000.0);
     let t1 = lv::now_ms();
     // Straight into LVGL's layer while it stays where it is framed (it is drawn there in the
     // redraw this frame asks for); through the module's buffer while it scrolls.
@@ -1404,6 +1428,22 @@ extern "C" fn frame(timer: *mut c_void) {
         r.window = Perf::default();
         r.window_start = now;
     }
+}
+
+/// Where the speech bubble goes: over all of the watchface's widgets, inside its page. The
+/// layer's parent holds the widgets of its level; stock watchfaces keep more widgets in later
+/// siblings of that parent (the complications at the bottom), so the grandparent, when it spans
+/// the screen, is above them all.
+fn bubble_parent(obj: *mut c_void, screen: (i32, i32)) -> *mut c_void {
+    let parent = unsafe { lv::parent(obj) };
+    let grand = unsafe { lv::parent(parent) };
+    if !grand.is_null() {
+        let (x, y, w, h) = unsafe { lv::measured(grand) };
+        if (x, y) == (0, 0) && w >= screen.0 && h >= screen.1 && !unsafe { lv::parent(grand) }.is_null() {
+            return grand;
+        }
+    }
+    parent
 }
 
 /// Direct DRAW_MAIN calls that may fail in a row before frames go through the module's buffer.
@@ -1672,7 +1712,7 @@ fn draw_own(r: &mut Runtime, rect: (i32, i32, i32, i32)) -> (u32, u32) {
 /// pixels) has its top-left corner at target pixel `offset`, and only `clip` (target pixels:
 /// x, y, right, bottom) is drawn.
 fn render(r: &mut Runtime, target: &mut gpu::VgBuffer, offset: (i32, i32), clip: [i32; 4], rect: (i32, i32, i32, i32)) {
-    let Runtime { lobby, pages, bake, renderer, list, baked_mask, bake_active, .. } = r;
+    let Runtime { lobby, pages, bake, renderer, list, baked_mask, bake_active, fx, .. } = r;
     let Some(lobby) = lobby.as_mut() else { return };
     let (w, h) = (rect.2, rect.3);
     let (fw_w, fw_h) = (lobby.width, lobby.height);
@@ -1708,6 +1748,8 @@ fn render(r: &mut Runtime, target: &mut gpu::VgBuffer, offset: (i32, i32), clip:
         lobby.draw_list(li, list);
         renderer.draw(target, size, li, list, pages, (cx, cy, cam.scale));
     }
+    renderer.hangs.layer = 7;
+    fx.draw(renderer, target);
 }
 
 /// LVGL draws the view (its DRAW_MAIN, after the image's own, which draws nothing in direct

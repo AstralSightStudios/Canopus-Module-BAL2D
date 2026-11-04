@@ -286,6 +286,21 @@ impl Page {
     }
 }
 
+impl Page {
+    /// A page made by the module (premultiplied BGRA8888, `width` a multiple of 16).
+    pub fn from_bgra8888(width: u32, height: u32, pixels: &[u8]) -> Option<Page> {
+        if width % 16 != 0 || pixels.len() != (width * height * 4) as usize {
+            return None;
+        }
+        let mut mem = GpuMem::new(pixels.len())?;
+        mem.slice().copy_from_slice(pixels);
+        mem.clean();
+        let mut buffer = VgBuffer::new(&mut mem, width, height, width * 4, VG_FMT_BGRA8888);
+        buffer.set_image_mode(IMAGE_MODE_MULTIPLY);
+        Some(Page { mem, buffer, clut: None })
+    }
+}
+
 /// Expands page pixels to BGRA8888 (premultiplied, as the page is).
 pub fn to_bgra8888(format: PageFormat, src: &[u8], clut: Option<&[u32; 256]>, dst: &mut [u8]) {
     let px = dst.len() / 4;
