@@ -195,6 +195,11 @@ impl View {
         }
     }
 
+    /// Whether the image shows `data` at `width` x `height` (what [`View::bind`] set).
+    pub fn shows(&self, data: *const u8, width: u32, height: u32) -> bool {
+        self.dsc.iter().all(|d| d.data == data && d.header[1] == width | (height << 16))
+    }
+
     pub fn attached(&self) -> bool {
         !self.obj.is_null()
     }

@@ -359,6 +359,8 @@ pub struct Target {
     pub mem: GpuMem,
     pub buffer: VgBuffer,
     pub pixels: *mut u8,
+    /// Bytes per line and lines the memory holds (a smaller view keeps the stride).
+    cap: (u32, u32),
 }
 
 impl Target {
@@ -369,9 +371,19 @@ impl Target {
         mem.clean();
         let buffer = VgBuffer::new(&mut mem, width, height, stride, VG_FMT_BGR565);
         let pixels = mem.ptr();
-        Some(Target { mem, buffer, pixels })
+        Some(Target { mem, buffer, pixels, cap: (stride, height) })
     }
 
+    /// Whether a `width` x `height` view fits the memory.
+    pub fn holds(&self, width: u32, height: u32) -> bool {
+        width.div_ceil(16) * 16 * 2 <= self.cap.0 && height <= self.cap.1
+    }
+
+    /// Uses the memory for a `width` x `height` view (see [`Target::holds`]), rows at the
+    /// memory's stride.
+    pub fn view(&mut self, width: u32, height: u32) {
+        self.buffer = VgBuffer::new(&mut self.mem, width, height, self.cap.0, VG_FMT_BGR565);
+    }
 }
 
 /// Draws batched into a command stream of our own, run by the GPU through one driver call.
@@ -1014,6 +1026,17 @@ impl Default for Renderer {
 }
 
 impl Renderer {
+    /// Frees what [`Renderer::reserve`] allocated for the shown pack. Kept, they would stay in
+    /// the middle of the heap when the pack's memory around them is freed (the next pack's
+    /// pages need large blocks); the next pack reserves its own after its pages.
+    pub fn release(&mut self) {
+        self.paths.release();
+        if let Some(v) = &mut self.fp32 {
+            *v = Vec::new();
+        }
+        self.stream = None;
+    }
+
     /// Sizes the per-batch buffers for the largest batch up front: nothing large is allocated
     /// while drawing (the firmware heap asserts on failure).
     pub fn reserve(&mut self, max_triangles: usize) -> bool {

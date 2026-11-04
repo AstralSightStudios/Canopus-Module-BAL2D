@@ -820,6 +820,7 @@ struct CurveBuilder {
     curve: Curve,
     frame_count: usize,
     bezier: usize,
+    channels: usize,
 }
 
 impl CurveBuilder {
@@ -829,9 +830,10 @@ impl CurveBuilder {
             curves[frame_count - 1] = CURVE_STEPPED;
         }
         CurveBuilder {
-            curve: Curve { entries: entries as u8, frames: vec![0.0; frame_count * entries], curves, constant: false },
+            curve: Curve { entries: entries as u8, channels: 0, frames: vec![0.0; frame_count * entries], curves, constant: false },
             frame_count,
             bezier: 0,
+            channels: 0,
         }
     }
 
@@ -866,6 +868,7 @@ impl CurveBuilder {
             return Err(ReadError::Invalid("bezier count"));
         }
         self.bezier += 1;
+        self.channels = self.channels.max(value + 1);
         if value == 0 {
             self.curve.curves[frame] = CURVE_BEZIER + i as f32;
         }
@@ -899,6 +902,8 @@ impl CurveBuilder {
                         c.curves.get(b + 3).is_some_and(|_| c.curves[b + 1].to_bits() == x && c.curves[b + 3].to_bits() == x)
                     })
             });
+        c.channels = self.channels as u8;
+        c.share_easings();
         self.curve
     }
 }

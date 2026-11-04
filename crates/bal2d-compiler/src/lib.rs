@@ -98,6 +98,9 @@ pub struct Options {
     /// Texels per screen pixel to keep (1.0 = exactly screen density).
     pub quality: f32,
     pub max_page: u32,
+    /// Largest page in texels (each page is one heap block on the watch; see
+    /// [`pack_atlas::build_pages`]).
+    pub max_page_texels: u32,
     /// Extra viewport margin in screen pixels when deciding visibility.
     pub margin: f32,
     /// Simulation step for sampling animations (seconds).
@@ -136,6 +139,7 @@ impl Default for Options {
             budget: 1_200_000,
             quality: 1.0,
             max_page: 1024,
+            max_page_texels: MAX_PAGE_TEXELS,
             margin: 24.0,
             step: 1.0 / 15.0,
             intro_weight: 0.4,
@@ -216,6 +220,10 @@ fn load(input: &LayerInput) -> Result<Layer, String> {
 /// The work atlas may hold this many times the texel budget (its regions at the density they
 /// are drawn at, before the budget scales them down): enough for the bake and for an exact
 /// final resampling, bounded whatever the source pages are.
+/// Largest texture page, in texels (about 1.4 MB in ARGB8565): a standard lobby's texture
+/// (about 2.7 MB) takes two pages, which still find free blocks once the watch's heap is broken
+/// up by lobby switches.
+pub const MAX_PAGE_TEXELS: u32 = 500_000;
 const WORK_BUDGET: f64 = 4.0;
 /// Work pages live only in memory: no GPU limit on their size.
 const WORK_MAX_PAGE: u32 = 16384;
@@ -251,7 +259,7 @@ fn work_atlases(layers: &mut [Layer], inputs: &[LayerInput], cam: Camera, opts: 
         let items: Vec<pack_atlas::Item> = needs
             .iter()
             .zip(&scales)
-            .map(|(&(region, _, crop), &scale)| pack_atlas::Item { region, scale, rotated: layer.atlas.regions[region].degrees != 0, crop })
+            .map(|(&(region, _, crop, _), &scale)| pack_atlas::Item { region, scale, rotated: layer.atlas.regions[region].degrees != 0, crop })
             .collect();
         let images = extract_items(&layer.atlas, input, &items, &mut |page, pages| {
             progress.at(Stage::Textures { page, pages }, lo + span * (0.3 + 0.7 * (page - 1) as f32 / pages.max(1) as f32))
@@ -330,15 +338,16 @@ fn region_paths(a: &Attachment) -> Vec<String> {
 /// Per atlas region of the live attachments: the highest density they are drawn at and the
 /// visible crop in logical pixels (two texels of margin for bilinear filtering; the whole region
 /// when its bounds are empty).
-fn region_needs(layer: &Layer, seen: &[Seen]) -> Vec<(usize, f32, [u32; 4])> {
-    let mut density: BTreeMap<usize, (f32, [f32; 4])> = BTreeMap::new();
-    let live: Vec<u32> = layer.data.skins.iter().flat_map(|s| s.attachments.iter().map(|e| e.2)).collect();
-    for id in live {
+fn region_needs(layer: &Layer, seen: &[Seen]) -> Vec<(usize, f32, [u32; 4], u32)> {
+    let mut density: BTreeMap<usize, (f32, [f32; 4], u32)> = BTreeMap::new();
+    let live: Vec<(u16, u32)> = layer.data.skins.iter().flat_map(|s| s.attachments.iter().map(|e| (e.0, e.2))).collect();
+    for (slot, id) in live {
         let sn = &seen[id as usize];
         for path in region_paths(&layer.data.attachments[id as usize]) {
             if let Some(ri) = layer.atlas.find(&path) {
-                let e = density.entry(ri).or_insert((0.0, [f32::MAX, f32::MAX, f32::MIN, f32::MIN]));
+                let e = density.entry(ri).or_insert((0.0, [f32::MAX, f32::MAX, f32::MIN, f32::MIN], u32::MAX));
                 e.0 = e.0.max(sn.density);
+                e.2 = e.2.min(slot as u32);
                 e.1[0] = e.1[0].min(sn.bounds[0]);
                 e.1[1] = e.1[1].min(sn.bounds[1]);
                 e.1[2] = e.1[2].max(sn.bounds[2]);
@@ -348,7 +357,7 @@ fn region_needs(layer: &Layer, seen: &[Seen]) -> Vec<(usize, f32, [u32; 4])> {
     }
     density
         .into_iter()
-        .map(|(ri, (d, b))| {
+        .map(|(ri, (d, b, rank))| {
             let r = &layer.atlas.regions[ri];
             let (w, h) = (r.width as f32, r.height as f32);
             let crop = if b[0] <= b[2] && b[1] <= b[3] {
@@ -363,7 +372,7 @@ fn region_needs(layer: &Layer, seen: &[Seen]) -> Vec<(usize, f32, [u32; 4])> {
             };
             let crop = if crop[2] > crop[0] && crop[3] > crop[1] { crop } else { [0, 0, r.width as u32, r.height as u32] };
             let crop = if std::env::var("BAL2D_NO_CROP").is_ok() { [0, 0, r.width as u32, r.height as u32] } else { crop };
-            (ri, d, crop)
+            (ri, d, crop, rank)
         })
         .collect()
 }
@@ -753,6 +762,8 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
         density: f32,
         /// Visible crop in logical pixels (x0, y0, x1, y1).
         crop: [u32; 4],
+        /// The first slot (setup draw order) that draws it.
+        rank: u32,
     }
     let mut needs: Vec<RegionNeed> = Vec::new();
     for (li, layer) in layers.iter_mut().enumerate() {
@@ -796,8 +807,8 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
             vertices_simplified: verts_simplified,
             ..Default::default()
         });
-        for (ri, d, crop) in region_list {
-            needs.push(RegionNeed { layer: li, region: ri, density: d, crop });
+        for (ri, d, crop, rank) in region_list {
+            needs.push(RegionNeed { layer: li, region: ri, density: d, crop, rank });
         }
     }
 
@@ -842,15 +853,17 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
     let mut sections = Vec::new();
     for (li, layer) in layers.iter().enumerate() {
         let mut items = Vec::new();
+        let mut ranks = Vec::new();
         for (n, s) in needs.iter().zip(&scales).filter(|(n, _)| n.layer == li) {
             let r = &layer.atlas.regions[n.region];
             items.push(pack_atlas::Item { region: n.region, scale: *s, rotated: r.degrees != 0, crop: n.crop });
+            ranks.push(n.rank);
         }
         let (lo, span) = (0.65 + 0.3 * li as f32 / layers.len() as f32, 0.3 / layers.len() as f32);
         let images = extract_items(&layer.atlas, &inputs[li], &items, &mut |page, pages| {
             progress.at(Stage::Textures { page, pages }, lo + span * (page - 1) as f32 / pages.max(1) as f32)
         })?;
-        let packed = pack_atlas::build_images(&layer.atlas, &items, images, opts.max_page)?;
+        let packed = pack_atlas::build_pages(&layer.atlas, &items, images, opts.max_page, opts.max_page_texels as u64, &ranks)?;
         let skel = writer::write_skeleton(&layer.data, 1.0);
         // Verify the re-encoded skeleton binds to the new atlas before shipping it.
         let mut check = read_skeleton(&skel, 1.0).map_err(|e| format!("{}: re-read: {e}", layer.name))?;

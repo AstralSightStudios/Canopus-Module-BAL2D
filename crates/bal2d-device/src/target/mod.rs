@@ -145,6 +145,8 @@ pub struct Runtime {
     load_tried: bool,
     /// The pack being loaded, one step per frame.
     loader: Option<Loader>,
+    /// The next load leaves the baked idles until after the pages.
+    late_idles: bool,
     /// Show full screen above watchfaces without a BAL2D layer.
     overlay: bool,
     /// `options::FLUENT` (read with the overlay option when the options change).
@@ -288,6 +290,7 @@ pub fn rt() -> &'static mut Runtime {
                 attach_check: 0,
                 load_tried: false,
                 loader: None,
+                late_idles: false,
                 overlay: false,
                 fluent: false,
                 connect: 1,
@@ -720,6 +723,10 @@ struct Loader {
     pages: Vec<bal2d_core::Page>,
     per_layer: Vec<Vec<gpu::Page>>,
     next: usize,
+    /// Baked idles were loaded before the pages; and whether that is allowed (not on the retry
+    /// after a page did not fit next to them).
+    early: bool,
+    early_allowed: bool,
 }
 
 /// One loading step: `None` while more remain, else the result (0: the pack is shown).
@@ -729,7 +736,8 @@ fn load_step() -> Option<i32> {
         let Some(name) = pick_pack() else { return Some(-2) };
         trace(&alloc::format!("loading {name}; heap: free {} KB, largest {} KB", heap_free_kb(), largest_block_kb()));
         let Some(file) = Fs::open(&alloc::format!("{PACK_DIR}/{name}"), canopus_abi::FS_READ) else { return Some(-5) };
-        r.loader = Some(Loader { name, src: FileSource { file }, t0: lv::now_ms(), lobby: None, pages: Vec::new(), per_layer: Vec::new(), next: 0 });
+        let early_allowed = !core::mem::take(&mut r.late_idles);
+        r.loader = Some(Loader { name, src: FileSource { file }, t0: lv::now_ms(), lobby: None, pages: Vec::new(), per_layer: Vec::new(), next: 0, early: false, early_allowed });
         return None;
     };
     let Some(lobby) = l.lobby.as_ref() else {
@@ -742,7 +750,7 @@ fn load_step() -> Option<i32> {
                     lobby.bake = None;
                 }
                 trace(&alloc::format!("parsed in {} ms; {} pages; heap: free {} KB, largest {} KB", lv::now_ms().wrapping_sub(l.t0), pages.len(), heap_free_kb(), largest_block_kb()));
-                early_idle(&mut lobby, &pages, &mut l.src);
+                l.early = l.early_allowed && early_idle(&mut lobby, &pages, &mut l.src);
                 l.per_layer = (0..lobby.layers.len()).map(|_| Vec::new()).collect();
                 l.lobby = Some(lobby);
                 l.pages = pages;
@@ -764,6 +772,14 @@ fn load_step() -> Option<i32> {
         }
         if !heap_allows(page_bytes(p) + 64 * 1024) {
             trace(&alloc::format!("page {}: {} KB do not fit; heap: free {} KB, largest {} KB", l.next, page_bytes(p) / 1024, heap_free_kb(), largest_block_kb()));
+            // The holes the early idles left can be where a page needs one block: once more
+            // from the start, the pages into a whole heap and the idles last.
+            if l.early {
+                trace("loading again with the baked idles after the pages");
+                r.loader = None;
+                r.late_idles = true;
+                return None;
+            }
             return Some(-12);
         }
         let up = gpu::Page::from_pack(&mut l.src, p);
@@ -856,8 +872,15 @@ fn load_step() -> Option<i32> {
             if lobby.idle.get(li).is_some_and(|i| i.is_some()) || skip_idle() & (1 << li.min(31)) != 0 {
                 continue;
             }
-            let need = e.raw_len as usize + e.stored_len as usize + e.raw_len as usize / 4;
-            let loaded = heap_allows(need + IDLE_HEADROOM) && lobby.load_idle(&mut l.src, li);
+            // As before the pages: each part is a block of its own (the bake, for a moment the
+            // stored section, what is derived), so the largest must find a free block and the
+            // sum leave the headroom free (asking one block for all of it skipped bakes that
+            // fit: CH0334's 950 KB bake wanted a 2.3 MB block).
+            let (raw, stored) = (e.raw_len as usize, e.stored_len as usize);
+            let need = raw + stored + raw / 4;
+            let (free, largest) = fw::heap_info();
+            let fits = (largest as usize) >= raw.max(stored) + 64 * 1024 && (free as usize).saturating_sub(need) >= IDLE_HEADROOM;
+            let loaded = fits && lobby.load_idle(&mut l.src, li);
             trace(&alloc::format!("baked idle {li}: {} KB, {}; heap: free {} KB", e.raw_len / 1024, if loaded { "loaded" } else { "skipped" }, heap_free_kb()));
         }
     }
@@ -894,10 +917,6 @@ fn page_bytes(p: &bal2d_core::Page) -> usize {
     p.header.width as usize * p.header.height as usize * bpp + 64
 }
 
-/// Loads baked idles before the pages when what the rest of the pack needs (pages as they will
-/// be uploaded, the background image, working buffers) still fits after them: loaded last, the
-/// transient copy of a compressed section did not fit next to the pages on the watch (Hoshino's
-/// 1.4 MB background idle was skipped and animated live, the frame's largest CPU cost).
 /// Development (`dev-skip-idle`, a hex layer mask): layers whose baked idle is not loaded (to
 /// time a layer animated live).
 fn skip_idle() -> u32 {
@@ -906,12 +925,18 @@ fn skip_idle() -> u32 {
         .unwrap_or(0)
 }
 
-fn early_idle(lobby: &mut Lobby, pages: &[bal2d_core::Page], src: &mut FileSource) {
+/// Loads baked idles before the pages when what the rest of the pack needs (pages as they will
+/// be uploaded, the background image, working buffers) still fits after them: loaded last, the
+/// transient copy of a compressed section did not fit next to the pages on the watch (Hoshino's
+/// 1.4 MB background idle was skipped and animated live, the frame's largest CPU cost). Returns
+/// whether any was loaded (if a page then finds no block, the load starts over without them).
+fn early_idle(lobby: &mut Lobby, pages: &[bal2d_core::Page], src: &mut FileSource) -> bool {
     let skip = skip_idle();
     let page_bytes: usize = pages.iter().map(page_bytes).sum();
     let bake_bytes = lobby.bake.as_ref().map_or(0, |b| b.header.width as usize * b.header.height as usize * 2 + 64);
     // Vertex, path and outline buffers, the GPU stream (a few hundred KB).
     let rest = page_bytes + bake_bytes + 640 * 1024;
+    let mut any = false;
     for li in 0..lobby.layers.len() {
         let Some(Some(e)) = lobby.idle_entries.get(li).copied() else { continue };
         if skip & (1 << li.min(31)) != 0 {
@@ -928,8 +953,10 @@ fn early_idle(lobby: &mut Lobby, pages: &[bal2d_core::Page], src: &mut FileSourc
             continue;
         }
         let loaded = lobby.load_idle(src, li);
+        any |= loaded;
         trace(&alloc::format!("baked idle {li}: {} KB, {} before the pages; heap: free {} KB", raw / 1024, if loaded { "loaded" } else { "not loaded" }, heap_free_kb()));
     }
+    any
 }
 
 /// Writes the placeholder image an LVGL image object shows until the module takes it over
@@ -948,9 +975,15 @@ fn ensure_layer_file() {
 /// Drops the shown pack (its pages free their GPU memory); the next frame loads the current one.
 fn unload() {
     let r = rt();
+    // The GPU is done with the pages and buffers before they go.
+    r.renderer.finish();
     r.lobby = None;
     r.pages = Vec::new();
     r.bake = None;
+    // The working buffers sized for this pack go too: allocated after its pages, they would
+    // stay above the freed memory and split it (the next pack's pages need large blocks).
+    r.list = bal2d_render::DrawList::default();
+    r.renderer.release();
     r.pack = String::new();
     r.load_tried = false;
     r.loader = None;
@@ -970,6 +1003,11 @@ pub fn start() -> i32 {
     r.screen = screen_size();
     rotate_log();
     Fs::mkdirs(PACK_DIR);
+    // The target before any pack, low in the heap: every view is drawn in it, and a pack's
+    // memory is then one free range again when the pack goes.
+    if r.target.is_none() {
+        r.target = gpu::Target::new(r.screen.0.max(1) as u32, r.screen.1.max(1) as u32);
+    }
     // The pack is loaded on the first frame, outside the Supervisor's stage callback.
     r.timer = unsafe { lvx_timer_create(frame, FRAME_MS, core::ptr::null_mut()) };
     if r.timer.is_null() {
@@ -1059,10 +1097,26 @@ fn ensure_attached(now: u32) {
             }
         }
     }
-    // (Re)size the target to the view.
+    // (Re)size the target to the view: in the memory allocated at start while it holds the
+    // view (allocated after a pack, it would stay above the pack's memory once the pack goes).
     let (w, h) = (v.rect.2.max(1) as u32, v.rect.3.max(1) as u32);
     let need = r.target.as_ref().is_none_or(|t| t.buffer.width != w || t.buffer.height != h);
+    // The target from start already has the view's size the first time: the image still has to
+    // be pointed at it (without, LVGL has nothing to draw and never asks the layer to draw).
+    if !need {
+        if let Some(t) = r.target.as_ref().filter(|t| !v.shows(t.pixels, w, h)) {
+            v.bind(t.pixels, w, h, t.buffer.stride);
+            trace(&alloc::format!("target {w}x{h} stride {} bound (memory from start)", t.buffer.stride));
+        }
+        return;
+    }
     if need {
+        if let Some(t) = r.target.as_mut().filter(|t| t.holds(w, h)) {
+            t.view(w, h);
+            v.bind(t.pixels, w, h, t.buffer.stride);
+            trace(&alloc::format!("target {w}x{h} stride {} (memory from start)", t.buffer.stride));
+            return;
+        }
         r.target = None;
         match gpu::Target::new(w, h) {
             Some(t) => {

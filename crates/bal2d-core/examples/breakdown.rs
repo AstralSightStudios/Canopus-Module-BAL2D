@@ -66,8 +66,7 @@ fn main() {
                     timelines += 1;
                     f += curve.frames.len();
                     c += curve.curves.len();
-                    let frames = curve.frames.len() / curve.entries.max(1) as usize;
-                    beziers += (curve.curves.len() - frames) / bal2d_spine::BEZIER_SIZE;
+                    beziers += curve.bezier_count();
                 }
             }
         }
@@ -89,12 +88,11 @@ fn main() {
                 }
                 for k in 0..n.saturating_sub(1) {
                     let ty = curve.curves[k];
-                    if ty < 2.0 {
+                    if ty > -2.0 && ty < 2.0 {
                         continue;
                     }
-                    let base = ty as usize - 2;
                     for v in 1..e {
-                        let c = &curve.curves[base + (v - 1) * 4..base + (v - 1) * 4 + 4];
+                        let c = curve.controls(ty, k * e, v);
                         let (t1, v1) = (curve.frames[k * e], curve.frames[k * e + v]);
                         let (t2, v2) = (curve.frames[(k + 1) * e], curve.frames[(k + 1) * e + v]);
                         if v1 == v2 && c[1] == v1 && c[3] == v1 {
@@ -134,13 +132,12 @@ fn main() {
                 }
                 for k in 0..n.saturating_sub(1) {
                     let ty = curve.curves[k];
-                    if ty < 2.0 {
+                    if ty > -2.0 && ty < 2.0 {
                         continue;
                     }
                     bezier_frames += 1;
-                    let base = ty as usize - 2;
                     let all = (1..e).all(|v| {
-                        let c = &curve.curves[base + (v - 1) * 4..base + (v - 1) * 4 + 4];
+                        let c = curve.controls(ty, k * e, v);
                         let (t1, v1) = (curve.frames[k * e], curve.frames[k * e + v]);
                         let (t2, v2) = (curve.frames[(k + 1) * e], curve.frames[(k + 1) * e + v]);
                         let on = |cx: f32, cy: f32| {

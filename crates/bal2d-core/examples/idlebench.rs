@@ -20,22 +20,28 @@ fn main() {
         }
         let (w, h) = (lobby.width, lobby.height);
         let frames = (seconds * 30.0) as usize;
-        let (mut calls, mut words, mut dt) = (0usize, 0usize, 0f64);
+        let (mut calls, mut words, mut dt, mut runs) = (0usize, 0usize, 0f64, 0usize);
         for _ in 0..frames {
             lobby.update_with(1.0 / 30.0, true);
             lobby.notices.clear();
             let t0 = std::time::Instant::now();
+            // Runs of calls on one page and blend (what the watch batches into one draw).
+            let mut last = None;
             for li in 0..lobby.layers.len() {
                 let ps = &sizes[li];
                 lobby.draw_idle(li, (0.0, 0.0), (w, h), &|p| ps.get(p as usize).copied(), &mut |c| {
                     calls += 1;
                     words += c.path.len();
+                    if last != Some((li, c.page, c.blend as u8)) {
+                        runs += 1;
+                        last = Some((li, c.page, c.blend as u8));
+                    }
                 });
             }
             dt += t0.elapsed().as_secs_f64();
         }
         let f = frames as f64;
         let work: Vec<f64> = (0..4).map(|k| lobby.idle.iter().flatten().map(|l| l.work[k] as f64).sum::<f64>() / f).collect();
-        println!("{path}: {:.1} us/frame, {:.0} calls, {:.0} path words a frame; vertices {:.0}, clipped {:.1} ({:.0} words), covered {:.1}", dt / f * 1e6, calls as f64 / f, words as f64 / f, work[0], work[1], work[3], work[2]);
+        println!("{path}: {:.1} us/frame, {:.0} calls in {:.1} page/blend runs, {:.0} path words a frame; vertices {:.0}, clipped {:.1} ({:.0} words), covered {:.1}", dt / f * 1e6, calls as f64 / f, runs as f64 / f, words as f64 / f, work[0], work[1], work[3], work[2]);
     }
 }

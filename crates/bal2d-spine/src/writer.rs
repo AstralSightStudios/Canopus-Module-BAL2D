@@ -401,10 +401,9 @@ fn write_curve_type(o: &mut Out, c: &Curve, frame: usize, frame_count: usize, va
         o.u8(1);
     } else {
         o.u8(2);
-        let first = t as usize - 2;
+        let _ = frame_count;
         for k in 0..values {
-            let i = first + k * BEZIER_SIZE;
-            let ctrl = bezier_controls(c, frame, k, i, frame_count);
+            let ctrl = c.bezier_controls(frame, k);
             o.f32(ctrl[0]);
             o.f32(ctrl[1] / scales[k]);
             o.f32(ctrl[2]);
@@ -413,14 +412,9 @@ fn write_curve_type(o: &mut Out, c: &Curve, frame: usize, frame_count: usize, va
     }
 }
 
-/// The stored control values (cx1, cy1, cx2, cy2) of the Bezier at `i`.
-fn bezier_controls(c: &Curve, _frame: usize, _value: usize, i: usize, _frame_count: usize) -> [f32; 4] {
-    [c.curves[i], c.curves[i + 1], c.curves[i + 2], c.curves[i + 3]]
-}
-
-/// Number of Bezier segments a curve stores.
+/// Number of Bezier segments a curve stores (per channel, as the file counts them).
 fn bezier_count(c: &Curve) -> usize {
-    (c.curves.len() - c.frame_count()) / BEZIER_SIZE
+    c.bezier_count()
 }
 
 fn write_color_curve(o: &mut Out, c: &Curve, n: usize) {
@@ -864,9 +858,8 @@ fn write_animation(o: &mut Out, d: &SkeletonData, a: &Animation, scale: f32) {
                 o.f32(f[2] / scale);
             }
             if frame > 0 && flags & 128 != 0 {
-                let first = curve.curves[frame - 1] as usize - 2;
                 for (k, sc) in [1.0, scale].iter().enumerate() {
-                    let ctrl = bezier_controls(curve, frame - 1, k, first + k * BEZIER_SIZE, n);
+                    let ctrl = curve.bezier_controls(frame - 1, k);
                     o.f32(ctrl[0]);
                     o.f32(ctrl[1] / sc);
                     o.f32(ctrl[2]);
@@ -1115,8 +1108,7 @@ fn write_animation(o: &mut Out, d: &SkeletonData, a: &Animation, scale: f32) {
 
 /// Deform curves store the percent Bezier (value 0 -> 1).
 fn deform_controls(c: &Curve, frame: usize) -> [f32; 4] {
-    let i = c.curves[frame] as usize - 2;
-    [c.curves[i], c.curves[i + 1], c.curves[i + 2], c.curves[i + 3]]
+    c.bezier_controls(frame, 0)
 }
 
 /// Encodes a draw order (setup slot index per draw position) as Spine's (slot, offset) list,

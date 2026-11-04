@@ -183,13 +183,127 @@ impl Curve {
         self.frames.len() / self.entries as usize
     }
 
-    /// The sampled Bezier stored at `i` between the frame at float index `frame_index` and the
-    /// next one, for value `value_offset` of the frame. Deform curves (`value_offset == 0`) run
-    /// from 0 to 1.
+    /// Control values (cx1, cy1, cx2, cy2) of value `v` (1-based offset within a frame; 0 for
+    /// deform curves, which run from 0 to 1) of the Bezier frame at float index `i`, whose curve
+    /// type is `t`: as stored, or rebuilt from the shared normalised easing.
     #[inline]
-    pub fn samples(&self, frame_index: usize, value_offset: usize, i: usize) -> [f32; BEZIER_SAMPLES] {
+    pub fn controls(&self, t: f32, i: usize, v: usize) -> [f32; BEZIER_SIZE] {
+        if t >= CURVE_BEZIER {
+            let b = t as usize - 2 + v.saturating_sub(1) * BEZIER_SIZE;
+            return [self.curves[b], self.curves[b + 1], self.curves[b + 2], self.curves[b + 3]];
+        }
+        let b = (-t) as usize - 2;
+        let q = &self.curves[b..b + BEZIER_SIZE];
         let e = self.entries as usize;
-        let c = &self.curves[i..i + BEZIER_SIZE];
+        let (t1, t2) = (self.frames[i], self.frames[i + e]);
+        let (v1, v2) = if v == 0 { (0.0, 1.0) } else { (self.frames[i + v], self.frames[i + e + v]) };
+        let (dt, dv) = (t2 - t1, v2 - v1);
+        [t1 + q[0] * dt, v1 + q[1] * dv, t1 + q[2] * dt, v1 + q[3] * dv]
+    }
+
+    /// The control values of channel `k` (0-based) of the Bezier between frame `frame` and the
+    /// next (for writers).
+    pub fn bezier_controls(&self, frame: usize, k: usize) -> [f32; BEZIER_SIZE] {
+        let e = self.entries as usize;
+        self.controls(self.curves[frame], frame * e, if e == 1 { 0 } else { k + 1 })
+    }
+
+    /// Bezier segments stored per channel, as a skeleton file counts them.
+    pub fn bezier_count(&self) -> usize {
+        let n = self.frame_count();
+        (0..n.saturating_sub(1)).filter(|&k| self.curves[k] >= CURVE_BEZIER || self.curves[k] <= -CURVE_BEZIER).count() * self.channels as usize
+    }
+
+    /// Stores once, normalised, each Bezier frame whose channels follow one easing: Spine's
+    /// linked curves (x and y of a translate, the channels of a colour) give every channel the
+    /// same handles once its keys are mapped to 0..1, and most multi-channel keys are such (half
+    /// the floats of a big lobby's curves). A channel that does not move (keys and handles at one
+    /// value) fits any easing. Rebuilt control values are within float rounding of the stored
+    /// ones ([`SHARE_TOLERANCE`] of their magnitude).
+    pub fn share_easings(&mut self) {
+        let (ch, e, n) = (self.channels as usize, self.entries as usize, self.frame_count());
+        if ch < 2 || n < 2 || e < ch + 1 {
+            self.curves.shrink_to_fit();
+            return;
+        }
+        let mut out: Vec<f32> = Vec::with_capacity(self.curves.len());
+        out.extend_from_slice(&self.curves[..n]);
+        for k in 0..n - 1 {
+            let t = self.curves[k];
+            if t < CURVE_BEZIER {
+                continue;
+            }
+            let base = t as usize - 2;
+            match self.shared_easing(k * e, base, ch) {
+                Some(q) => {
+                    out[k] = -(CURVE_BEZIER + out.len() as f32);
+                    out.extend_from_slice(&q);
+                }
+                None => {
+                    out[k] = CURVE_BEZIER + out.len() as f32;
+                    out.extend_from_slice(&self.curves[base..base + ch * BEZIER_SIZE]);
+                }
+            }
+        }
+        out.shrink_to_fit();
+        self.curves = out;
+    }
+
+    /// The normalised easing every channel of the Bezier frame at float index `i` (channels from
+    /// `curves[base]`) follows, if there is one.
+    fn shared_easing(&self, i: usize, base: usize, ch: usize) -> Option<[f32; BEZIER_SIZE]> {
+        let e = self.entries as usize;
+        let f = &self.frames;
+        let (t1, t2) = (f[i], f[i + e]);
+        let dt = t2 - t1;
+        if !(dt > 0.0) {
+            return None;
+        }
+        // The channel that moves most gives the easing (the most precise once normalised).
+        let mut reference = None;
+        let mut most = 0.0f32;
+        for v in 0..ch {
+            let dv = (f[i + e + v + 1] - f[i + v + 1]).abs();
+            if dv > most {
+                most = dv;
+                reference = Some(v);
+            }
+        }
+        let c0 = &self.curves[base..base + BEZIER_SIZE];
+        let q = match reference {
+            Some(v) => {
+                let c = &self.curves[base + v * BEZIER_SIZE..base + (v + 1) * BEZIER_SIZE];
+                let (v1, v2) = (f[i + v + 1], f[i + e + v + 1]);
+                [(c[0] - t1) / dt, (c[1] - v1) / (v2 - v1), (c[2] - t1) / dt, (c[3] - v1) / (v2 - v1)]
+            }
+            None => [(c0[0] - t1) / dt, 0.0, (c0[2] - t1) / dt, 0.0],
+        };
+        if !q.iter().all(|x| x.is_finite()) {
+            return None;
+        }
+        let mt = 1.0f32.max(t1.abs()).max(t2.abs());
+        for v in 0..ch {
+            let c = &self.curves[base + v * BEZIER_SIZE..base + (v + 1) * BEZIER_SIZE];
+            let (v1, v2) = (f[i + v + 1], f[i + e + v + 1]);
+            if v1 == v2 && c[1] == v1 && c[3] == v1 {
+                continue;
+            }
+            let dv = v2 - v1;
+            let mv = 1.0f32.max(v1.abs()).max(v2.abs()).max(c[1].abs()).max(c[3].abs());
+            let near = |a: f32, b: f32, m: f32| (a - b).abs() <= SHARE_TOLERANCE * m;
+            if !(near(t1 + q[0] * dt, c[0], mt) && near(t1 + q[2] * dt, c[2], mt) && near(v1 + q[1] * dv, c[1], mv) && near(v1 + q[3] * dv, c[3], mv)) {
+                return None;
+            }
+        }
+        Some(q)
+    }
+
+    /// The sampled Bezier between the frame at float index `frame_index` and the next one, for
+    /// value `value_offset` of the frame. Deform curves (`value_offset == 0`) run from 0 to 1.
+    #[inline]
+    pub fn samples(&self, frame_index: usize, value_offset: usize) -> [f32; BEZIER_SAMPLES] {
+        let e = self.entries as usize;
+        let c = self.controls(self.curves[frame_index / e], frame_index, value_offset);
         let f = &self.frames;
         let (v1, v2) = if value_offset == 0 { (0.0, 1.0) } else { (f[frame_index + value_offset], f[frame_index + e + value_offset]) };
         let mut s = [0f32; BEZIER_SAMPLES];
@@ -197,9 +311,8 @@ impl Curve {
         s
     }
 
-    pub fn bezier_value(&self, time: f32, frame_index: usize, value_offset: usize, i: usize) -> f32 {
+    pub fn bezier_value(&self, time: f32, frame_index: usize, value_offset: usize, c: [f32; BEZIER_SIZE]) -> f32 {
         let e = self.entries as usize;
-        let c = &self.curves[i..i + BEZIER_SIZE];
         let frames = &self.frames;
         let (t1, v1) = (frames[frame_index], frames[frame_index + value_offset]);
         let (t2, v2) = (frames[frame_index + e], frames[frame_index + e + value_offset]);
@@ -235,8 +348,7 @@ impl Curve {
         } else if curve_type == CURVE_STEPPED {
             self.frames[i + v]
         } else {
-            let base = curve_type as usize - 2;
-            self.bezier_value(time, i, v, base + (v - 1) * BEZIER_SIZE)
+            self.bezier_value(time, i, v, self.controls(curve_type, i, v))
         }
     }
 
@@ -250,21 +362,22 @@ impl Curve {
         }
         let e = self.entries as usize;
         let curve_type = self.curves[i / e];
-        let shared = curve_type >= CURVE_BEZIER && out.len() > 1 && {
-            let base = curve_type as usize - 2;
-            let (cx1, cx2) = (self.curves[base].to_bits(), self.curves[base + 2].to_bits());
-            (1..out.len()).all(|v| self.curves[base + v * BEZIER_SIZE].to_bits() == cx1 && self.curves[base + v * BEZIER_SIZE + 2].to_bits() == cx2)
-        };
+        let shared = out.len() > 1
+            && (curve_type <= -CURVE_BEZIER
+                || curve_type >= CURVE_BEZIER && {
+                    let base = curve_type as usize - 2;
+                    let (cx1, cx2) = (self.curves[base].to_bits(), self.curves[base + 2].to_bits());
+                    (1..out.len()).all(|v| self.curves[base + v * BEZIER_SIZE].to_bits() == cx1 && self.curves[base + v * BEZIER_SIZE + 2].to_bits() == cx2)
+                });
         if !shared {
             for (v, o) in out.iter_mut().enumerate() {
                 *o = self.value_at(time, i, v + 1);
             }
             return;
         }
-        let base = curve_type as usize - 2;
         let frames = &self.frames;
         let (t1, t2) = (frames[i], frames[i + e]);
-        let c = &self.curves[base..base + BEZIER_SIZE];
+        let c = self.controls(curve_type, i, 1);
         // The time axis of `Bezier` (the same operations), up to the sample past `time`.
         let tmpx = (t1 - c[0] * 2.0 + c[2]) * 0.03;
         let dddx = ((c[0] - c[2]) * 3.0 - t1 + t2) * 0.006;
@@ -286,7 +399,7 @@ impl Curve {
         let end = steps == BEZIER_SAMPLES / 2;
         let q = if end { (time - x) / (t2 - x) } else { (time - x) / (sx - x) };
         for (v, o) in out.iter_mut().enumerate() {
-            let c = &self.curves[base + v * BEZIER_SIZE..base + (v + 1) * BEZIER_SIZE];
+            let c = self.controls(curve_type, i, v + 1);
             let (v1, v2) = (frames[i + v + 1], frames[i + e + v + 1]);
             // The value axis: sample `steps` (the one past `time`) and the one before it.
             let tmpy = (v1 - c[1] * 2.0 + c[3]) * 0.03;
@@ -332,7 +445,7 @@ impl Curve {
         if i == CURVE_STEPPED {
             return 0.0;
         }
-        let c = &self.curves[i as usize - 2..i as usize - 2 + BEZIER_SIZE];
+        let c = self.controls(i, frame, 0);
         let (t1, t2) = (self.frames[frame], self.frames[frame + 1]);
         let mut b = Bezier::new(t1, 0.0, c[0], c[1], c[2], c[3], t2, 1.0);
         let (s0, s1) = b.next();
@@ -1381,5 +1494,59 @@ impl Bezier {
         self.x += self.dx;
         self.y += self.dy;
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    /// Three keys of (x, y) with Beziers between them: the first segment linked (y's handles are
+    /// x's easing mapped to y's keys), the second not. The third channel never moves.
+    fn translate() -> Curve {
+        let frames = vec![0.0, 10.0, -4.0, 7.0, 1.5, 30.0, 6.0, 7.0, 3.0, 20.0, 8.0, 7.0];
+        let ease = |t1: f32, t2: f32, v1: f32, v2: f32| [t1 + 0.25 * (t2 - t1), v1 + 0.1 * (v2 - v1), t1 + 0.7 * (t2 - t1), v1 + 1.2 * (v2 - v1)];
+        let mut curves = vec![CURVE_BEZIER + 3.0, CURVE_BEZIER + 15.0, CURVE_STEPPED];
+        for (t1, t2, k) in [(0.0, 1.5, 0), (1.5, 3.0, 1)] {
+            curves.extend_from_slice(&ease(t1, t2, frames[k * 4 + 1], frames[k * 4 + 5]));
+            let mut y = ease(t1, t2, frames[k * 4 + 2], frames[k * 4 + 6]);
+            if k == 1 {
+                y[1] += 0.5;
+            }
+            curves.extend_from_slice(&y);
+            curves.extend_from_slice(&[t1 + 0.4, 7.0, t2 - 0.4, 7.0]);
+        }
+        Curve { entries: 4, channels: 3, frames, curves, constant: false }
+    }
+
+    #[test]
+    fn linked_channels_store_one_easing_and_evaluate_the_same() {
+        let plain = translate();
+        let mut shared = plain.clone();
+        shared.share_easings();
+        assert!(shared.curves[0] <= -CURVE_BEZIER && shared.curves[1] >= CURVE_BEZIER);
+        assert_eq!(shared.curves.len(), plain.curves.len() - 2 * BEZIER_SIZE);
+        assert_eq!(shared.bezier_count(), plain.bezier_count());
+        // The channel that never moves takes the shared timing (its value stays put either way).
+        for k in 0..2 {
+            for v in 0..3 {
+                let (a, b) = (plain.bezier_controls(k, v), shared.bezier_controls(k, v));
+                let check = if v == 2 { &[1, 3][..] } else { &[0, 1, 2, 3][..] };
+                assert!(check.iter().all(|&j| (a[j] - b[j]).abs() <= 1e-5 * a[j].abs().max(1.0)), "{k} {v}: {a:?} {b:?}");
+            }
+        }
+        let (mut va, mut vb) = ([0f32; 3], [0f32; 3]);
+        for s in 0..300 {
+            let t = s as f32 * 0.01;
+            let i = plain.index(t);
+            plain.values_at(t, i, &mut va);
+            shared.values_at(t, i, &mut vb);
+            for v in 0..3 {
+                assert!((va[v] - vb[v]).abs() < 1e-4, "t {t} value {v}: {} vs {}", va[v], vb[v]);
+                assert!((plain.value_at(t, i, v + 1) - shared.value_at(t, i, v + 1)).abs() < 1e-4);
+            }
+            assert_eq!(vb[2], 7.0);
+        }
     }
 }

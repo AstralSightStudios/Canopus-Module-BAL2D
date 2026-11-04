@@ -517,6 +517,9 @@ pub struct EventKey {
 pub const BEZIER_SIZE: usize = 4;
 /// Floats of a sampled Bezier: 9 (x, y) points.
 pub const BEZIER_SAMPLES: usize = 18;
+/// How far (relative to their magnitude) control values rebuilt from a shared easing may be from
+/// the stored ones: a few float roundings.
+pub const SHARE_TOLERANCE: f32 = 4e-6;
 pub const CURVE_LINEAR: f32 = 0.0;
 pub const CURVE_STEPPED: f32 = 1.0;
 pub const CURVE_BEZIER: f32 = 2.0;
@@ -524,9 +527,17 @@ pub const CURVE_BEZIER: f32 = 2.0;
 /// Key frames with per-segment interpolation: `frames` holds `entries` floats per frame
 /// (time first), `curves` holds one curve type per frame followed by the Bezier segments'
 /// control values ([`BEZIER_SIZE`] floats each).
+///
+/// A Bezier frame's type is `CURVE_BEZIER + i` when its `channels` Beziers are stored one after
+/// another from `curves[i]`, or `-(CURVE_BEZIER + i)` when the channels share one easing (Spine's
+/// linked curves) stored once from `curves[i]`, normalised: (x1, y1, x2, y2) with x from the
+/// frame's time to the next's and y from each channel's value to the next's (see
+/// [`Curve::share_easings`]). [`Curve::controls`] gives a channel's control values either way.
 #[derive(Clone, Debug, Default)]
 pub struct Curve {
     pub entries: u8,
+    /// Bezier channels of a Bezier frame (the values with curves: all of them, but two for IK).
+    pub channels: u8,
     pub frames: Vec<f32>,
     pub curves: Vec<f32>,
     /// Every value holds the same value at every key and along every Bezier between keys (its

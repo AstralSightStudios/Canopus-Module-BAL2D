@@ -670,6 +670,11 @@ impl Paths {
         Paths { tolerance: 0.75, outline_paths: cfg!(feature = "outline"), ..Default::default() }
     }
 
+    /// Frees the buffers [`Paths::reserve`] sized (the settings stay).
+    pub fn release(&mut self) {
+        *self = Paths { tolerance: self.tolerance, outline_paths: self.outline_paths, blits: self.blits, ..Default::default() };
+    }
+
     /// Room for batches of up to `max_triangles` triangles.
     pub fn reserve(&mut self, max_triangles: usize) -> bool {
         let n = max_triangles;

@@ -88,37 +88,53 @@ pub fn build(atlas: &Atlas, pages: &[Rgba], items: &[Item], max_page: u32) -> Re
 
 /// Packs already resampled item images (`images[i]` is `items[i]` at [`item_size`]).
 pub fn build_images(atlas: &Atlas, items: &[Item], images: Vec<Rgba>, max_page: u32) -> Result<Packed, String> {
+    build_pages(atlas, items, images, max_page, u64::MAX, &[])
+}
+
+/// Like [`build_images`], with no page over `max_texels`: the watch allocates each page in one
+/// block, and after a few lobby switches its heap rarely has a free block much over 2.5 MB (a
+/// standard lobby's whole texture is about 2.7 MB). Pages that would be larger are split by
+/// draw order (`ranks[i]`: where item `i` is first drawn), so a frame changes page about once
+/// per split rather than back and forth (each change ends a batch of draws).
+pub fn build_pages(atlas: &Atlas, items: &[Item], images: Vec<Rgba>, max_page: u32, max_texels: u64, ranks: &[u32]) -> Result<Packed, String> {
     for (it, img) in items.iter().zip(&images) {
         if img.width + 2 * PAD > max_page || img.height + 2 * PAD > max_page {
             return Err(format!("region {} ({}x{}) does not fit a {max_page} page", atlas.regions[it.region].name, img.width, img.height));
         }
     }
-    // Skyline (bottom-left) packing, tallest first; try several page widths and keep the
-    // smallest total area. Regions that do not fit under max_page open another page.
     let sizes: Vec<(u32, u32)> = images.iter().map(|i| (i.width + 2 * PAD, i.height + 2 * PAD)).collect();
-    let area: u64 = sizes.iter().map(|&(w, h)| w as u64 * h as u64).sum();
-    let widest = sizes.iter().map(|s| s.0).max().unwrap_or(16);
-    let mut order: Vec<usize> = (0..items.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse((sizes[i].1, sizes[i].0)));
-    let mut best: Option<(u64, Vec<Placed>, Vec<(u32, u32)>)> = None;
-    let base = (area as f64).sqrt();
-    for k in 0..12 {
-        let width = (((base * (0.85 + 0.05 * k as f64)) as u32).div_ceil(16) * 16).max(widest.div_ceil(16) * 16).min(max_page);
-        let (placed, dims) = skyline(&order, &sizes, width, max_page);
-        let total: u64 = dims.iter().map(|&(w, h)| w as u64 * h as u64).sum();
-        if best.as_ref().is_none_or(|b| total < b.0) {
-            best = Some((total, placed, dims));
+    let all: Vec<usize> = (0..items.len()).collect();
+    let mut placed = pack_group(&all, &sizes, max_page);
+    if ranks.len() == items.len() && page_dims(&placed).iter().any(|&(w, h)| w as u64 * h as u64 > max_texels) {
+        let mut order = all.clone();
+        order.sort_by_key(|&i| (ranks[i], i));
+        let area = |i: usize| sizes[i].0 as f64 * sizes[i].1 as f64;
+        let total: f64 = order.iter().map(|&i| area(i)).sum();
+        for runs in 2..=16 {
+            // Runs of about equal area, in draw order.
+            let mut groups: Vec<Vec<usize>> = vec![Vec::new()];
+            let mut acc = 0.0;
+            for &i in &order {
+                if acc >= total * groups.len() as f64 / runs as f64 && groups.len() < runs && !groups.last().unwrap().is_empty() {
+                    groups.push(Vec::new());
+                }
+                groups.last_mut().unwrap().push(i);
+                acc += area(i);
+            }
+            let mut split: Vec<Placed> = Vec::new();
+            for g in &groups {
+                let first = page_dims(&split).len();
+                split.extend(pack_group(g, &sizes, max_page).into_iter().map(|p| Placed { page: p.page + first, ..p }));
+            }
+            let fits = page_dims(&split).iter().all(|&(w, h)| w as u64 * h as u64 <= max_texels);
+            placed = split;
+            if fits {
+                break;
+            }
         }
     }
-    let (_, placed, dims) = best.unwrap();
-    let page_used: Vec<u32> = dims.iter().map(|d| d.1).collect();
     // Page sizes rounded up to 16 pixels (the GPU's stride alignment).
-    let mut out_pages = Vec::new();
-    for (pi, used_h) in page_used.iter().enumerate() {
-        let used_w = placed.iter().filter(|p| p.page == pi).map(|p| p.x + p.w + PAD).max().unwrap_or(16);
-        out_pages.push(Rgba::new(used_w.div_ceil(16) * 16, used_h.div_ceil(16).max(1) * 16));
-    }
-    let _ = &dims;
+    let mut out_pages: Vec<Rgba> = page_dims(&placed).into_iter().map(|(w, h)| Rgba::new(w, h)).collect();
     for p in &placed {
         out_pages[p.page].blit_padded(&images[p.item], p.x, p.y, PAD);
     }
@@ -142,6 +158,40 @@ pub fn build_images(atlas: &Atlas, items: &[Item], images: Vec<Rgba>, max_page: 
         text.push('\n');
     }
     Ok(Packed { atlas_text: text, pages: out_pages })
+}
+
+/// Skyline (bottom-left) packing of `group` (indices into the padded `sizes`), tallest first;
+/// tries several page widths and keeps the smallest total area. Regions that do not fit under
+/// `max_page` open another page (numbered from 0).
+fn pack_group(group: &[usize], sizes: &[(u32, u32)], max_page: u32) -> Vec<Placed> {
+    let area: u64 = group.iter().map(|&i| sizes[i].0 as u64 * sizes[i].1 as u64).sum();
+    let widest = group.iter().map(|&i| sizes[i].0).max().unwrap_or(16);
+    let mut order = group.to_vec();
+    order.sort_by_key(|&i| std::cmp::Reverse((sizes[i].1, sizes[i].0)));
+    let mut best: Option<(u64, Vec<Placed>)> = None;
+    let base = (area as f64).sqrt();
+    for k in 0..12 {
+        let width = (((base * (0.85 + 0.05 * k as f64)) as u32).div_ceil(16) * 16).max(widest.div_ceil(16) * 16).min(max_page);
+        let (placed, _) = skyline(&order, sizes, width, max_page);
+        let total: u64 = page_dims(&placed).iter().map(|&(w, h)| w as u64 * h as u64).sum();
+        if best.as_ref().is_none_or(|b| total < b.0) {
+            best = Some((total, placed));
+        }
+    }
+    best.map(|b| b.1).unwrap_or_default()
+}
+
+/// Each page's size: what its regions use (padding included), rounded up to 16 pixels.
+fn page_dims(placed: &[Placed]) -> Vec<(u32, u32)> {
+    let pages = placed.iter().map(|p| p.page + 1).max().unwrap_or(0);
+    (0..pages)
+        .map(|pi| {
+            let on = placed.iter().filter(|p| p.page == pi);
+            let w = on.clone().map(|p| p.x + p.w + PAD).max().unwrap_or(16);
+            let h = on.map(|p| p.y + p.h + PAD).max().unwrap_or(16);
+            (w.div_ceil(16) * 16, h.div_ceil(16).max(1) * 16)
+        })
+        .collect()
 }
 
 /// Skyline bottom-left packing of `order` (padded sizes) into pages `width` wide and at most
@@ -226,4 +276,40 @@ fn skyline(order: &[usize], sizes: &[(u32, u32)], width: u32, max_h: u32) -> (Ve
         }
     }
     (placed, dims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 60 regions of 100x100 (about 650k padded texels): over a 300k cap they take three or
+    /// more pages, none over the cap, each holding one run of the draw order.
+    #[test]
+    fn large_pages_split_by_draw_order() {
+        let mut text = String::from("src.png\nsize: 1024,1024\nfilter: Linear,Linear\n");
+        for i in 0..60 {
+            text.push_str(&format!("r{i}\nbounds: 0,0,100,100\n"));
+        }
+        let atlas = Atlas::parse(&text);
+        assert_eq!(atlas.regions.len(), 60);
+        let items: Vec<Item> = (0..60).map(|i| Item { region: i, scale: 1.0, rotated: false, crop: [0, 0, 100, 100] }).collect();
+        let images: Vec<Rgba> = (0..60).map(|_| Rgba::new(100, 100)).collect();
+        // Draw order reversed against the region order, to see the ranks (not the indices) are used.
+        let ranks: Vec<u32> = (0..60).map(|i| 59 - i as u32).collect();
+        let packed = build_pages(&atlas, &items, images, 1024, 300_000, &ranks).unwrap();
+        assert!(packed.pages.len() >= 3, "{} pages", packed.pages.len());
+        assert!(packed.pages.iter().all(|p| p.width as u64 * p.height as u64 <= 300_000));
+        let split = Atlas::parse(&packed.atlas_text);
+        assert_eq!(split.regions.len(), 60);
+        // Per page, the draw-order ranks of its regions form one run, and runs follow the pages.
+        let mut runs: Vec<(u32, u32)> = (0..packed.pages.len()).map(|_| (u32::MAX, 0)).collect();
+        for r in &split.regions {
+            let rank = ranks[r.name[1..].parse::<usize>().unwrap()];
+            let run = &mut runs[r.page as usize];
+            *run = (run.0.min(rank), run.1.max(rank));
+        }
+        for w in runs.windows(2) {
+            assert_eq!(w[0].1 + 1, w[1].0, "{runs:?}");
+        }
+    }
 }
