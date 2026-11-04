@@ -862,9 +862,10 @@ fn load_step() -> Option<i32> {
         }
     }
     let Some(l) = r.loader.take() else { return Some(-22) };
-    // Each lobby starts at the most exact clustering and adapts from there (a light one shown
-    // after a heavy one would otherwise start where the heavy one left it).
-    r.renderer.paths.tolerance = TOLERANCES[0];
+    // Each lobby starts at the bakes' own tolerance (1 px) and adapts from there (a light one
+    // shown after a heavy one would otherwise start where the heavy one left it; live frames on
+    // the watch are heavy, and at 0.75 px a talk drew a quarter more calls).
+    r.renderer.paths.tolerance = TOLERANCES[1];
     r.quality_changed = lv::now_ms();
     r.clip_ab = ClipAb::new();
     r.pack = l.name;
@@ -1088,10 +1089,19 @@ const BUSY_HIGH_MS: u32 = 31;
 const BUSY_LOW_MS: u32 = 20;
 
 /// The most exact clustering the watch keeps up with: one step looser while frames are too
-/// heavy, one step back when there is room, at most every 3 seconds.
+/// heavy, one step back when there is room, at most every 3 seconds. Only frames with a layer
+/// drawn live count (the clustering is theirs; baked frames are light and would step it back
+/// before every talk, which then started at the costliest grouping).
 fn adapt_quality(now: u32) {
     let r = rt();
     if now.wrapping_sub(r.quality_changed) < 3000 {
+        return;
+    }
+    let live = r.lobby.as_ref().is_some_and(|l| {
+        let all = (1u32 << l.layers.len().min(31)) - 1;
+        r.baked_mask & all != all
+    });
+    if !live {
         return;
     }
     let tol = r.renderer.paths.tolerance;
