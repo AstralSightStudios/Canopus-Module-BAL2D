@@ -31,7 +31,14 @@ fn main() {
         let bytes = std::fs::read(&path).unwrap();
         let base = LIVE.load(Ordering::Relaxed);
         PEAK.store(base, Ordering::Relaxed);
-        let (mut lobby, pages) = bal2d_core::Lobby::load(&bytes).unwrap();
+        // The skeletons alone first (the watch parses them before the pages), then the idles.
+        let mut src: &[u8] = &bytes;
+        let (mut lobby, pages) = bal2d_core::Lobby::load_from(&mut src).unwrap();
+        let parsed = LIVE.load(Ordering::Relaxed) - base;
+        let parse_peak = PEAK.load(Ordering::Relaxed) - base;
+        for li in 0..lobby.layers.len() {
+            lobby.load_idle(&mut src, li);
+        }
         let after_load = LIVE.load(Ordering::Relaxed) - base;
         let load_peak = PEAK.load(Ordering::Relaxed) - base;
         let page_bytes: usize = pages.iter().map(|p| p.section_len()).sum();
@@ -47,7 +54,9 @@ fn main() {
         let playing = LIVE.load(Ordering::Relaxed) - base;
         let peak = PEAK.load(Ordering::Relaxed) - base;
         println!(
-            "{path}: lobby {:.0} KB after load (load peak {:.0} KB), {:.0} KB playing (peak {:.0} KB); pages {:.0} KB; total about {:.0} KB",
+            "{path}: skeletons {:.0} KB (parse peak {:.0} KB); lobby {:.0} KB after load (load peak {:.0} KB), {:.0} KB playing (peak {:.0} KB); pages {:.0} KB; total about {:.0} KB",
+            kb(parsed),
+            kb(parse_peak),
             kb(after_load),
             kb(load_peak),
             kb(playing),

@@ -76,6 +76,24 @@ impl Bake {
     }
 }
 
+/// A pack section as the skeleton reader's source (a read error is kept for the caller).
+struct SectionSkel<'a> {
+    r: bal2d_pack::SectionReader<'a>,
+    err: Option<bal2d_pack::PackError>,
+}
+
+impl bal2d_spine::SkelSource for SectionSkel<'_> {
+    fn read(&mut self, out: &mut [u8]) -> Option<usize> {
+        match self.r.read(out) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                self.err = Some(e);
+                None
+            }
+        }
+    }
+}
+
 pub fn read_page(src: &mut dyn Source, page: &Page, out: &mut [u8]) -> Result<(), bal2d_pack::PackError> {
     bal2d_pack::read_section(src, &page.entry, out)
 }
@@ -177,6 +195,8 @@ pub struct Lobby {
     pub idle_entries: Vec<Option<bal2d_pack::Entry>>,
     /// Per layer: time its baked idle has played that its skeleton has not (`update_with`).
     idle_pending: Vec<f32>,
+    /// The intro's timelines are freed (`release_intro`).
+    intro_released: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -203,8 +223,8 @@ impl Lobby {
     /// (memory included) or it does not fit the skeleton (the layer is then animated).
     pub fn load_idle(&mut self, src: &mut dyn Source, layer: usize) -> bool {
         let Some(Some(e)) = self.idle_entries.get(layer) else { return false };
-        let Ok(d) = bal2d_pack::read_section_vec(src, e) else { return false };
-        let Some(bake) = bal2d_pack::IdleBake::decode_owned(d) else { return false };
+        // In pieces: no block of the bake's size (up to 1.4 MB) is needed.
+        let Ok(Some(bake)) = bal2d_pack::IdleBake::read(src, e) else { return false };
         self.idle[layer] = idle::IdleLayer::new(bake, &self.layers[layer].data);
         self.idle[layer].is_some()
     }
@@ -219,9 +239,17 @@ impl Lobby {
         let mut pages = Vec::new();
         for li in 0..h.layer_count as u16 {
             let e = idx.find(bal2d_pack::KIND_SKEL, li, 0).ok_or(LoadError::MissingSection("skeleton", li))?;
-            let buf = bal2d_pack::read_section_vec(src, e).map_err(LoadError::Pack)?;
-            let mut data = read_skeleton(&buf, 1.0).map_err(|e| LoadError::Skeleton(li, e))?;
-            drop(buf);
+            // Parsed as it is inflated: the skeleton (2 MB for a big lobby) is never whole in
+            // memory, so loading needs no block of that size (see `SectionReader`).
+            let mut data = {
+                let mut sk = SectionSkel { r: bal2d_pack::SectionReader::new(src, e).map_err(LoadError::Pack)?, err: None };
+                let len = sk.r.len();
+                let parsed = bal2d_spine::read_skeleton_from(&mut sk, len, 1.0);
+                if let Some(err) = sk.err {
+                    return Err(LoadError::Pack(err));
+                }
+                parsed.map_err(|e| LoadError::Skeleton(li, e))?
+            };
             let e = idx.find(bal2d_pack::KIND_ATLAS, li, 0).ok_or(LoadError::MissingSection("atlas", li))?;
             let buf = bal2d_pack::read_section_vec(src, e).map_err(LoadError::Pack)?;
             let atlas = Atlas::parse(core::str::from_utf8(&buf).unwrap_or(""));
@@ -321,6 +349,7 @@ impl Lobby {
             static_masks: bake.as_ref().map(|b| b.masks.clone()).unwrap_or_default(),
             bake,
             idle_pending: alloc::vec![0.0; layers_len],
+            intro_released: false,
             idle_view: None,
             idle_clip: true,
             hybrid: 0,
@@ -420,6 +449,29 @@ impl Lobby {
         } else {
             Camera { cx: a.cx + (b.cx - a.cx) * t, cy: a.cy + (b.cy - a.cy) * t, scale: 1.0 / size }
         };
+    }
+
+    /// Frees the intro's timelines once nothing plays it any more (the intro has ended and
+    /// mixed out). It plays once per load, and a long one is much of a lobby's memory (CH0334's
+    /// 28.8 s intro: 0.86 MB): the watch loads a baked idle that did not fit into it. Returns
+    /// whether it freed them now.
+    pub fn release_intro(&mut self) -> bool {
+        if self.intro_released || !self.is_idle() {
+            return false;
+        }
+        let main = self.main();
+        let l = &mut self.layers[main];
+        let Some(intro) = l.data.find_animation(&self.interactions.intro) else {
+            self.intro_released = true;
+            return false;
+        };
+        if l.state.uses(intro) {
+            return false;
+        }
+        self.intro_released = true;
+        // Name and duration stay (the phase and the framing look the intro up by name).
+        l.data.animations[intro].timelines = Vec::new();
+        true
     }
 
     /// True once the intro has finished and the idle loop plays on track 0.

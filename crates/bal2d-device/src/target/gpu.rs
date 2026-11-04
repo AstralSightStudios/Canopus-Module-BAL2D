@@ -500,6 +500,10 @@ impl Stream {
         }
         (w[30], w[31]) = (0x4000_0000 | units as u32, 0);
         let at = self.at;
+        // `fits` came first; never past the end (and room for the batch's end stays).
+        if at + 128 + units * 8 + STREAM_END > self.mem.len {
+            return;
+        }
         let dst = &mut self.mem.slice()[at..at + 128 + units * 8];
         for (d, v) in dst[..128].chunks_exact_mut(4).zip(w) {
             d.copy_from_slice(&v.to_le_bytes());
@@ -914,6 +918,10 @@ impl Sink<'_> {
         if pending > 0 && (!same || self.stats.queued >= FLUSH_EVERY || self.stats.split_due() || !fits) {
             self.carry(target, pages);
         }
+        // Ending that batch wrote its end into the stream: whether this draw and its own batch's
+        // end still fit is asked again (asked before, a near-full stream ran 4 bytes past its
+        // end when a page change ended a batch: a panic on Mirage with high-quality pages).
+        let fits = self.stream.as_ref().is_some_and(|st| st.fits(call.path.len()));
         if !fits {
             // Full: the GPU runs what is there before it is written over.
             let t0 = super::lv::now_ms();

@@ -28,15 +28,72 @@ impl core::fmt::Display for ReadError {
 
 type Result<T> = core::result::Result<T, ReadError>;
 
+/// The bytes of a skeleton file, front to back: a slice, or (on the watch) a pack section being
+/// inflated, so the file is never whole in memory.
+pub trait SkelSource {
+    /// The next bytes into `out` (up to its length): `Some(0)` at the end, `None` on an error.
+    fn read(&mut self, out: &mut [u8]) -> Option<usize>;
+}
+
+impl SkelSource for &[u8] {
+    fn read(&mut self, out: &mut [u8]) -> Option<usize> {
+        let n = out.len().min(self.len());
+        out[..n].copy_from_slice(&self[..n]);
+        *self = &self[n..];
+        Some(n)
+    }
+}
+
+/// Bytes the reader parses from at a time (refilled from the source; grown for a longer string).
+const WINDOW: usize = 16 * 1024;
+
 struct Input<'a> {
-    data: &'a [u8],
+    src: &'a mut dyn SkelSource,
+    buf: Vec<u8>,
+    /// The unread bytes are `buf[pos..end]`.
     pos: usize,
+    end: usize,
+    /// Bytes of the file before `buf[0]`, and the file's length.
+    before: usize,
+    len: usize,
     strings: Vec<String>,
 }
 
 impl<'a> Input<'a> {
+    /// Makes `n` unread bytes available from `pos`.
+    #[cold]
+    fn fill(&mut self, n: usize) -> Result<()> {
+        self.buf.copy_within(self.pos..self.end, 0);
+        self.before += self.pos;
+        self.end -= self.pos;
+        self.pos = 0;
+        if n > self.buf.len() {
+            if n > self.len {
+                return Err(ReadError::Eof);
+            }
+            self.buf.resize(n, 0);
+        }
+        while self.end < n {
+            let k = self.src.read(&mut self.buf[self.end..]).ok_or(ReadError::Invalid("skeleton source"))?;
+            if k == 0 {
+                return Err(ReadError::Eof);
+            }
+            self.end += k;
+        }
+        Ok(())
+    }
+
+    /// Bytes of the file read so far.
+    fn consumed(&self) -> usize {
+        self.before + self.pos
+    }
+
+    #[inline]
     fn u8(&mut self) -> Result<u8> {
-        let b = *self.data.get(self.pos).ok_or(ReadError::Eof)?;
+        if self.pos == self.end {
+            self.fill(1)?;
+        }
+        let b = self.buf[self.pos];
         self.pos += 1;
         Ok(b)
     }
@@ -45,8 +102,12 @@ impl<'a> Input<'a> {
         Ok(self.u8()? != 0)
     }
 
+    #[inline]
     fn i32(&mut self) -> Result<i32> {
-        let s = self.data.get(self.pos..self.pos + 4).ok_or(ReadError::Eof)?;
+        if self.end - self.pos < 4 {
+            self.fill(4)?;
+        }
+        let s = &self.buf[self.pos..self.pos + 4];
         self.pos += 4;
         Ok(i32::from_be_bytes([s[0], s[1], s[2], s[3]]))
     }
@@ -74,7 +135,7 @@ impl<'a> Input<'a> {
 
     fn count(&mut self) -> Result<usize> {
         let n = self.varint(true)?;
-        if n < 0 || n as usize > self.data.len() {
+        if n < 0 || n as usize > self.len {
             return Err(ReadError::Invalid("count"));
         }
         Ok(n as usize)
@@ -97,9 +158,12 @@ impl<'a> Input<'a> {
             _ => {}
         }
         let len = (n - 1) as usize;
-        let bytes = self.data.get(self.pos..self.pos + len).ok_or(ReadError::Eof)?;
+        if self.end - self.pos < len {
+            self.fill(len)?;
+        }
+        let s = String::from_utf8_lossy(&self.buf[self.pos..self.pos + len]).into_owned();
         self.pos += len;
-        Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+        Ok(Some(s))
     }
 
     fn string_ref(&mut self) -> Result<Option<String>> {
@@ -167,7 +231,14 @@ struct LinkedMesh {
 
 /// Reads a 4.2 binary skeleton. `scale` multiplies positions, sizes and translations.
 pub fn read_skeleton(bytes: &[u8], scale: f32) -> Result<SkeletonData> {
-    let mut input = Input { data: bytes, pos: 0, strings: Vec::new() };
+    let mut src = bytes;
+    read_skeleton_from(&mut src, bytes.len(), scale)
+}
+
+/// [`read_skeleton`] from a source of the file's `len` bytes, read front to back through a small
+/// window.
+pub fn read_skeleton_from(src: &mut dyn SkelSource, len: usize, scale: f32) -> Result<SkeletonData> {
+    let mut input = Input { src, buf: vec![0; WINDOW.min(len.max(1))], pos: 0, end: 0, before: 0, len, strings: Vec::new() };
     let mut d = SkeletonData::default();
 
     let low = input.i32()?;
@@ -551,7 +622,7 @@ pub fn read_skeleton(bytes: &[u8], scale: f32) -> Result<SkeletonData> {
         let a = read_animation(&mut input, name, &d, scale)?;
         d.animations.push(a);
     }
-    if input.pos != bytes.len() {
+    if input.consumed() != len {
         return Err(ReadError::Invalid("trailing bytes after animations"));
     }
     Ok(d)

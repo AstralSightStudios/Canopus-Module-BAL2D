@@ -193,6 +193,11 @@ impl AnimationState {
         }
     }
 
+    /// Whether any entry (playing, queued or mixing out) plays `animation`.
+    pub fn uses(&self, animation: usize) -> bool {
+        self.entries.iter().flatten().any(|e| e.animation == Some(animation))
+    }
+
     pub fn entry(&self, id: EntryId) -> &TrackEntry {
         self.entries[id as usize].as_ref().expect("live track entry")
     }

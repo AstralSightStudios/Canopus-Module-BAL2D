@@ -444,7 +444,7 @@ pub fn bake(pack: &[u8], max_rate: f32, tolerance: f32) -> (Vec<(u16, IdleBake)>
             eprintln!("layer {li}: {:.0} calls/frame, {:.1} could join the call before (same page, blend, tint, affine)", total_calls as f32 / frames as f32, mergeable as f32 / frames as f32);
         }
         let stream = IdleBake::encode_frames(&calls, shapes.len());
-        let bake = IdleBake { animation: animation as u16, rate, period, start, shapes, meshes: Vec::new(), regions: Default::default(), steady: Vec::new(), colors, live, frames: frames as u16, stream };
+        let bake = IdleBake { animation: animation as u16, rate, period, start, shapes, meshes: Vec::new(), regions: Default::default(), steady: Vec::new(), colors, live, frames: frames as u16, stream: vec![stream] };
         let bytes = bake.encode().len();
         report.layers.push((frames as u16, total_calls as f32 / frames as f32, bake.shapes.len(), bytes));
         out.push((li as u16, bake));

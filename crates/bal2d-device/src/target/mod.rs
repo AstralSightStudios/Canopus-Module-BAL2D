@@ -228,19 +228,17 @@ pub struct Runtime {
     gpu_cool_until: u32,
     gpu_window_resets: u32,
     gpu_window_at: u32,
-    /// GPU features (`trust`): the verdicts, those on, and what the self-test allows of them
-    /// (page formats it found wrong, batched draws, PAD edges, the background blit); frames
-    /// drawn since the last timeout and since the trial began.
-    trust: trust::Trust,
+    /// GPU features (`trust`): those on, and what the self-test allows of them (page formats
+    /// it found wrong, batched draws, PAD edges, the background blit); timeouts with batched
+    /// draws on this boot, and whether they went off for it.
     features: u8,
+    stream_resets: u32,
+    stream_dropped: bool,
     st_formats: u32,
     st_stream: bool,
     st_pad: bool,
     st_blit: bool,
     bake_allowed: bool,
-    clean_frames: u32,
-    trial_frames: u32,
-    trial_resets: u32,
     /// Development (`dev-gpu-timeout`, a hex feature mask): frames with any of these features on
     /// count a timeout, to try the trials where the GPU never times out (Mirage).
     force_timeout: u8,
@@ -332,16 +330,15 @@ pub fn rt() -> &'static mut Runtime {
                 gpu_cool_until: 0,
                 gpu_window_resets: 0,
                 gpu_window_at: 0,
-                trust: trust::Trust { good: 0, bad: 0, trying: 0 },
+                stream_resets: 0,
+                stream_dropped: false,
                 features: 0,
                 st_formats: 0,
                 st_stream: false,
                 st_pad: false,
                 st_blit: false,
                 bake_allowed: false,
-                clean_frames: 0,
-                trial_frames: 0,
-                trial_resets: 0,
+
                 force_timeout: 0,
                 bench: None,
                 perf_traced: 0,
@@ -563,11 +560,8 @@ pub fn status_text() -> String {
     }
     if r.selftest.is_some() {
         text += &alloc::format!("GPU 功能：已开 {}", trust::names(r.features));
-        if r.trust.trying != 0 {
-            text += &alloc::format!("（正在试 {}）", trust::names(r.trust.trying));
-        }
-        if r.trust.bad != 0 {
-            text += &alloc::format!("；会超时 {}", trust::names(r.trust.bad));
+        if r.stream_dropped {
+            text += "；批量绘制超时，本次开机已关";
         }
         text += "\n";
     }
@@ -872,16 +866,17 @@ fn load_step() -> Option<i32> {
             if lobby.idle.get(li).is_some_and(|i| i.is_some()) || skip_idle() & (1 << li.min(31)) != 0 {
                 continue;
             }
-            // As before the pages: each part is a block of its own (the bake, for a moment the
-            // stored section, what is derived), so the largest must find a free block and the
-            // sum leave the headroom free (asking one block for all of it skipped bakes that
-            // fit: CH0334's 950 KB bake wanted a 2.3 MB block).
-            let (raw, stored) = (e.raw_len as usize, e.stored_len as usize);
-            let need = raw + stored + raw / 4;
-            let (free, largest) = fw::heap_info();
-            let fits = (largest as usize) >= raw.max(stored) + 64 * 1024 && (free as usize).saturating_sub(need) >= IDLE_HEADROOM;
+            // Read in pieces: the largest must find a free block, the sum leave the headroom free
+            // (asking one block for all of it skipped bakes that fit). If not now, maybe once
+            // the intro has played and gone (`idles_after_intro`).
+            let fits = idle_fits(e.raw_len as usize, IDLE_HEADROOM);
             let loaded = fits && lobby.load_idle(&mut l.src, li);
-            trace(&alloc::format!("baked idle {li}: {} KB, {}; heap: free {} KB", e.raw_len / 1024, if loaded { "loaded" } else { "skipped" }, heap_free_kb()));
+            trace(&alloc::format!(
+                "baked idle {li}: {} KB, {}; heap: free {} KB",
+                e.raw_len / 1024,
+                if loaded { "loaded" } else if fits { "unreadable" } else { "no room yet" },
+                heap_free_kb()
+            ));
         }
     }
     let Some(l) = r.loader.take() else { return Some(-22) };
@@ -897,6 +892,35 @@ fn load_step() -> Option<i32> {
     r.pages = l.per_layer;
     r.bake = bake;
     Some(0)
+}
+
+/// Reads the baked idles that had no room when the pack loaded, now that the intro's animation
+/// is gone (a big lobby's intro is up to a megabyte: about what a bake takes). One frame takes
+/// the read (a few hundred milliseconds), once per load at most.
+fn idles_after_intro(r: &mut Runtime) {
+    let skip = skip_idle();
+    let Some(lobby) = r.lobby.as_mut() else { return };
+    let missing: Vec<usize> = (0..lobby.layers.len())
+        .filter(|&li| lobby.idle_entries.get(li).is_some_and(|e| e.is_some()) && lobby.idle.get(li).is_some_and(|i| i.is_none()) && skip & (1 << li.min(31)) == 0)
+        .collect();
+    if missing.is_empty() || r.idle_off {
+        return;
+    }
+    let Some(file) = Fs::open(&alloc::format!("{PACK_DIR}/{}", r.pack), canopus_abi::FS_READ) else { return };
+    let mut src = FileSource { file };
+    for li in missing {
+        let Some(Some(e)) = lobby.idle_entries.get(li).copied() else { continue };
+        let t0 = lv::now_ms();
+        let fits = idle_fits(e.raw_len as usize, IDLE_HEADROOM);
+        let loaded = fits && lobby.load_idle(&mut src, li);
+        trace(&alloc::format!(
+            "baked idle {li}: {} KB, {} after the intro ({} ms); heap: free {} KB",
+            e.raw_len / 1024,
+            if loaded { "loaded" } else if fits { "unreadable" } else { "no room" },
+            lv::now_ms().wrapping_sub(t0),
+            heap_free_kb()
+        ));
+    }
 }
 
 /// Frees the baked idles loaded early (they come last, into what is left: what else a pack
@@ -916,6 +940,24 @@ fn page_bytes(p: &bal2d_core::Page) -> usize {
     let bpp = if f != bal2d_pack::PageFormat::Bgra8888 && bad & (1 << f as u32) != 0 { 4 } else { f.bytes_per_pixel() };
     p.header.width as usize * p.header.height as usize * bpp + 64
 }
+
+/// Heap a baked idle of `raw` bytes takes once read: the stream's pieces and what is derived from
+/// it (shapes, outlines), with the decompressor's window and the header's buffer for a moment.
+fn idle_need(raw: usize) -> usize {
+    raw + raw / 4 + 64 * 1024
+}
+
+/// Whether a baked idle of `raw` bytes can be read now with `headroom` left free: it is read in
+/// pieces (`IdleBake::read`), so the largest block it needs is a piece of the stream or the
+/// header, not the whole section.
+fn idle_fits(raw: usize, headroom: usize) -> bool {
+    let (free, largest) = fw::heap_info();
+    (largest as usize) >= raw.min(IDLE_BLOCK) + 64 * 1024 && (free as usize).saturating_sub(idle_need(raw)) >= headroom
+}
+
+/// The largest single block reading a baked idle takes: a piece of its stream
+/// (`bal2d_pack::IDLE_CHUNK`) or its header (up to about 200 KB).
+const IDLE_BLOCK: usize = 384 * 1024;
 
 /// Development (`dev-skip-idle`, a hex layer mask): layers whose baked idle is not loaded (to
 /// time a layer animated live).
@@ -942,19 +984,16 @@ fn early_idle(lobby: &mut Lobby, pages: &[bal2d_core::Page], src: &mut FileSourc
         if skip & (1 << li.min(31)) != 0 {
             continue;
         }
-        // Held for good: the bake and what is derived from it; for a moment also the stored
-        // (compressed) section. Each needs a block of its own, the sum the free total.
-        let (raw, stored) = (e.raw_len as usize, e.stored_len as usize);
-        let kept = raw + raw / 4;
-        let (free, largest) = fw::heap_info();
-        let after = (free as usize).saturating_sub(kept + rest);
-        if after < HEAP_RESERVE as usize + 256 * 1024 || (largest as usize) < raw.max(stored) + 64 * 1024 {
+        // Room for it with what the rest of the pack needs still free.
+        let raw = e.raw_len as usize;
+        if !idle_fits(raw, rest + HEAP_RESERVE as usize + 256 * 1024) {
+            let (free, largest) = fw::heap_info();
             trace(&alloc::format!("baked idle {li}: {} KB, not before the pages (free {} KB, largest {} KB)", raw / 1024, free / 1024, largest / 1024));
             continue;
         }
         let loaded = lobby.load_idle(src, li);
         any |= loaded;
-        trace(&alloc::format!("baked idle {li}: {} KB, {} before the pages; heap: free {} KB", raw / 1024, if loaded { "loaded" } else { "not loaded" }, heap_free_kb()));
+        trace(&alloc::format!("baked idle {li}: {} KB, {} before the pages; heap: free {} KB", raw / 1024, if loaded { "loaded" } else { "unreadable" }, heap_free_kb()));
     }
     any
 }
@@ -1294,14 +1333,10 @@ extern "C" fn frame(timer: *mut c_void) {
             r.fake_auto = t == "auto";
             r.renderer.hangs.fake = u32::from_str_radix(t.trim_start_matches("0x"), 16).unwrap_or(0);
         }
-        r.trust = trust::Trust::load();
-        r.features = r.trust.good;
+        Fs::remove(trust::OLD_FILE);
+        r.features = trust::ON;
         apply_features(r);
-        trace(&alloc::format!(
-            "gpu features: on {}; bad {}",
-            trust::names(r.features),
-            trust::names(r.trust.bad)
-        ));
+        trace(&alloc::format!("gpu features: on {}", trust::names(r.features)));
         r.pace_traced = Fs::read("dev-pacetrace", 4).is_none();
         trace(&alloc::format!("self-test flags {:#x}, region blits {}, baked idle off {}, batched draws {}", t.flags, r.renderer.paths.blits, r.idle_off, !gpu::STREAM_OFF.load(Ordering::Relaxed)));
         r.selftest = Some(t);
@@ -1383,6 +1418,11 @@ extern "C" fn frame(timer: *mut c_void) {
     let t0 = lv::now_ms();
     // Layers that only play their idle loop are drawn from their bakes, not animated.
     let baked = lobby.update_with(dt_ms as f32 / 1000.0, !r.idle_off);
+    if lobby.release_intro() {
+        trace(&alloc::format!("intro played: its animation freed; heap: free {} KB, largest {} KB", heap_free_kb(), largest_block_kb()));
+        idles_after_intro(r);
+    }
+    let Some(lobby) = r.lobby.as_mut() else { return };
     r.idle_active = baked != 0;
     r.baked_mask = baked;
     if lobby.hybrid != 0 && !r.clip_ab.talk_traced {
@@ -1581,8 +1621,7 @@ impl Marks {
     }
 }
 
-/// Timeouts within `GPU_WINDOW_MS` with only trusted features on that turn them all off, and
-/// then (with none on) that make the module rest longer.
+/// Timeouts within `GPU_WINDOW_MS` that make the module rest longer.
 const GPU_STEP_RESETS: u32 = 3;
 const GPU_WINDOW_MS: u32 = 10_000;
 const GPU_COOL_MS: u32 = 1000;
@@ -1614,40 +1653,15 @@ fn apply_features(r: &mut Runtime) {
     }
 }
 
-/// A frame drawn without a timeout: trials start and pass (see `trust`).
-fn trust_tick(r: &mut Runtime) {
-    r.clean_frames += 1;
-    let t = &mut r.trust;
-    if t.trying != 0 {
-        r.trial_frames += 1;
-        if r.trial_frames >= trust::CLEAN_FRAMES {
-            trace(&alloc::format!("gpu trust: {} drew {} frames clean: good", trust::names(t.trying), r.trial_frames));
-            t.good |= t.trying;
-            t.trying = 0;
-            t.save();
-            r.clean_frames = 0;
-        }
-        return;
-    }
-    if r.clean_frames < trust::CLEAN_FRAMES || r.loader.is_some() {
-        return;
-    }
-    let Some(f) = t.next() else { return };
-    // Into the file before it is on: a watch that freezes over it marks it bad when it restarts.
-    t.trying = f;
-    t.save();
-    trace(&alloc::format!("gpu trust: trying {}", trust::names(f)));
-    r.trial_frames = 0;
-    r.trial_resets = 0;
-    r.features |= f;
-    apply_features(r);
-}
-
 /// Counts the frame's GPU timeouts (`gpu::Stats::resets`); the first few go to the log. Each
 /// costs 100 ms with the LVGL thread blocked and loses part of the frame, and a few in a row
-/// froze the watch: the module rests, and turns off the feature under trial, or all of them.
+/// froze the watch: the module rests (longer after several), and batched draws go off for the
+/// boot after a few (see `trust`).
 fn note_resets(r: &mut Runtime) {
-    if r.force_timeout & r.features != 0 {
+    // Only features actually in use (batched draws can be on but unused: option SINGLE).
+    let stream_used = !gpu::STREAM_OFF.load(Ordering::Relaxed) && !r.single;
+    let used = if stream_used { r.features } else { r.features & !trust::STREAM };
+    if r.force_timeout & used != 0 {
         r.renderer.stats.resets += 1;
     }
     let s = r.renderer.stats;
@@ -1665,7 +1679,6 @@ fn note_resets(r: &mut Runtime) {
     }
     let now = lv::now_ms();
     r.gpu_resets += s.resets;
-    r.clean_frames = 0;
     if r.gpu_resets <= 24 {
         let mut waits = alloc::string::String::new();
         for (at, ms) in s.long_waits.iter().take(s.resets as usize) {
@@ -1677,19 +1690,15 @@ fn note_resets(r: &mut Runtime) {
         ));
     }
     r.gpu_cool_until = now.wrapping_add(GPU_COOL_MS);
-    let t = &mut r.trust;
-    if t.trying != 0 {
-        r.trial_resets += s.resets;
-        if r.trial_resets < trust::BAD_RESETS {
+    if r.features & trust::STREAM != 0 && stream_used {
+        r.stream_resets += s.resets;
+        if r.stream_resets >= trust::STREAM_RESETS {
+            trace(&alloc::format!("gpu: {} timeouts with batched draws on: off until the next start", r.stream_resets));
+            r.features &= !trust::STREAM;
+            r.stream_dropped = true;
+            apply_features(r);
             return;
         }
-        trace(&alloc::format!("gpu trust: {} timed out {} times: bad", trust::names(t.trying), r.trial_resets));
-        t.bad |= t.trying;
-        r.features &= !t.trying;
-        t.trying = 0;
-        t.save();
-        apply_features(r);
-        return;
     }
     if now.wrapping_sub(r.gpu_window_at) > GPU_WINDOW_MS {
         r.gpu_window_at = now;
@@ -1701,18 +1710,9 @@ fn note_resets(r: &mut Runtime) {
     }
     r.gpu_window_resets = 0;
     r.gpu_window_at = now;
-    if r.features != 0 {
-        // Trusted ones time out after all: all off, to be tried again one by one.
-        trace(&alloc::format!("gpu trust: timeouts with {} on: all turned off", trust::names(r.features)));
-        r.features = 0;
-        t.good = 0;
-        t.save();
-        apply_features(r);
-    } else {
-        // Nothing left to turn off: a longer rest, and on (the watch is still being tested).
-        trace("gpu timeouts with every feature off: resting 5 s");
-        r.gpu_cool_until = now.wrapping_add(5 * GPU_COOL_MS);
-    }
+    // A longer rest, then on (never paused).
+    trace("gpu timeouts in a row: resting 5 s");
+    r.gpu_cool_until = now.wrapping_add(5 * GPU_COOL_MS);
 }
 
 /// The draws an earlier build left out for hanging the GPU (removed: they are drawn again).
@@ -1813,9 +1813,6 @@ fn clip_ab_window(r: &mut Runtime) {
 fn count_draw(r: &mut Runtime, draw: u32, gpu: u32) {
     clip_ab_frame(r, draw + gpu);
     let s = r.renderer.stats;
-    if s.resets == 0 {
-        trust_tick(r);
-    }
     let w = &mut r.window;
     w.drawn += 1;
     w.draw_ms += draw;

@@ -105,6 +105,10 @@ pub fn build_pages(atlas: &Atlas, items: &[Item], images: Vec<Rgba>, max_page: u
     let sizes: Vec<(u32, u32)> = images.iter().map(|i| (i.width + 2 * PAD, i.height + 2 * PAD)).collect();
     let all: Vec<usize> = (0..items.len()).collect();
     let mut placed = pack_group(&all, &sizes, max_page);
+    // A region larger than the cap gets a page of its own size: the cap is at least that (else
+    // no split fits and the rest is cut into ever more small pages).
+    let biggest = sizes.iter().map(|&(w, h)| w.div_ceil(16) as u64 * 16 * h.div_ceil(16) as u64 * 16).max().unwrap_or(0);
+    let max_texels = max_texels.max(biggest);
     if ranks.len() == items.len() && page_dims(&placed).iter().any(|&(w, h)| w as u64 * h as u64 > max_texels) {
         let mut order = all.clone();
         order.sort_by_key(|&i| (ranks[i], i));

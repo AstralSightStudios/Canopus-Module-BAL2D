@@ -1,17 +1,13 @@
-//! Which GPU features this watch draws without the driver timing out, found on the watch.
+//! The GPU features the watch draws with.
 //!
-//! The real watch's GPU hung (the driver's 100 ms timeout, a GPU reset, parts of frames lost,
-//! the system frozen after a few) once features beyond the oldest drawing were on, while every
-//! self-test probe passed and Mirage showed nothing; even the plainest features timed out once
-//! the later changes to submitting and addressing were in. So frames start exactly as the build
-//! that ran on the watch did (32-bit pages, transparent pattern edges, a driver call per draw,
-//! the background drawn as its slots, the cached PSRAM alias, a submit every 48 draws), and the
-//! features are tried one at a time once frames have run clean for a while: two timeouts during
-//! a trial (one may come anyway) mark that feature bad and turn it off at once, a clean trial
-//! marks it good. The verdicts are kept in a file, and the feature under trial is written there before it
-//! is turned on, so a watch that freezes and restarts during a trial counts it as bad.
-
-use super::host::Fs;
+//! Early builds hung the real watch's GPU (the driver's 100 ms timeout, a GPU reset, parts of
+//! frames lost) and the module tried each feature on the watch, one at a time, keeping the
+//! verdicts in `gpu-trust.bin`. The hangs came from long triangle-soup paths of live layers
+//! (drawn as outlines since), and every Band 10 Pro has the same GPU and firmware, so a release
+//! turns every drawing feature on from the start (as far as the start-up self-test's read-backs
+//! allow): no trial period of 32-bit pages and slower drawing, no per-watch state. Batched draws
+//! alone are not verified on the watch in their current form (the first form hung it): they go
+//! off for the rest of a boot after [`STREAM_RESETS`] timeouts.
 
 /// Native page formats (ARGB8565, ARGB4444, INDEX8 drawn as they are, not widened to BGRA8888).
 pub const NATIVE: u8 = 1;
@@ -21,67 +17,15 @@ pub const STREAM: u8 = 2;
 pub const BAKE: u8 = 4;
 /// PAD pattern edges.
 pub const PAD: u8 = 8;
-/// GPU addresses through PSRAM's non-cached alias (`gpu::UNCACHED`).
+/// GPU addresses through PSRAM's non-cached alias (`gpu::UNCACHED`): off (the watch's
+/// measurement has it at half the speed for textures).
 pub const UNCACHED: u8 = 16;
-pub const ALL: u8 = NATIVE | STREAM | BAKE | PAD | UNCACHED;
-/// The order of the trials: what saves the most first. (The non-cached alias is no trial: the
-/// watch's measurement has it at half the speed for textures.)
-const ORDER: [u8; 4] = [NATIVE, STREAM, BAKE, PAD];
-const FILE: &str = "gpu-trust.bin";
-/// Bumped when the drawing changes enough that old verdicts mean nothing (3: submits sized by
-/// the GPU's measured speed; 4: live draws as outlines — the hangs every verdict before was
-/// polluted by came from long triangle-soup paths of live layers; 5: batched draws written as
-/// the driver writes draws — that verdict alone starts over, the others are kept).
-const VERSION: u8 = 5;
-/// Timeouts during a trial that make the feature bad.
-pub const BAD_RESETS: u32 = 2;
-/// Frames drawn without a timeout before a trial starts, and for one to pass.
-pub const CLEAN_FRAMES: u32 = 120;
-
-#[derive(Clone, Copy, Default, Debug)]
-pub struct Trust {
-    pub good: u8,
-    pub bad: u8,
-    /// The feature under trial (0: none).
-    pub trying: u8,
-}
-
-impl Trust {
-    /// The saved verdicts; a trial still open in the file ended with the watch restarting.
-    pub fn load() -> Trust {
-        let mut t = Trust::default();
-        if let Some(b) = Fs::read(FILE, 8) {
-            if b.len() >= 4 && (b[0] == VERSION || b[0] == 4) {
-                t = Trust { good: b[1] & ALL, bad: b[2] & ALL, trying: b[3] & ALL };
-                if b[0] == 4 {
-                    t.good &= !STREAM;
-                    t.bad &= !STREAM;
-                    if t.trying == STREAM {
-                        t.trying = 0;
-                    }
-                    t.save();
-                }
-            }
-        }
-        if t.trying != 0 {
-            super::trace(&alloc::format!("gpu trust: the watch restarted while trying {}: it counts as bad", names(t.trying)));
-            t.bad |= t.trying;
-            t.good &= !t.trying;
-            t.trying = 0;
-            t.save();
-        }
-        t
-    }
-
-    pub fn save(&self) {
-        Fs::write(FILE, &[VERSION, self.good, self.bad, self.trying]);
-    }
-
-    /// The next feature to try (neither good nor bad yet).
-    pub fn next(&self) -> Option<u8> {
-        ORDER.into_iter().find(|f| (self.good | self.bad) & f == 0)
-    }
-}
+/// What a release draws with.
+pub const ON: u8 = NATIVE | STREAM | BAKE | PAD;
+/// The verdicts file of the builds that tried features one by one (removed at start).
+pub const OLD_FILE: &str = "gpu-trust.bin";
+/// Timeouts with batched draws on, in one boot, that turn them off until the next.
+pub const STREAM_RESETS: u32 = 2;
 
 /// Feature names for the log and the status page.
 pub fn names(mask: u8) -> alloc::string::String {

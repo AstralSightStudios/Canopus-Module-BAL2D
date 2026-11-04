@@ -115,7 +115,12 @@ impl core::fmt::Display for PackError {
 }
 
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
+    crc32_update(0, data)
+}
+
+/// `crc32` of what was checked so far (`crc`) followed by `data`.
+pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    let mut crc = !crc;
     for &b in data {
         crc ^= b as u32;
         for _ in 0..8 {
@@ -123,6 +128,32 @@ pub fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// A decompressor in its initial state, on the heap (it is about 11 KB: not on a watch stack).
+fn decompressor() -> Result<alloc::boxed::Box<miniz_oxide::inflate::core::DecompressorOxide>, PackError> {
+    use miniz_oxide::inflate::core::DecompressorOxide;
+    let layout = core::alloc::Layout::new::<DecompressorOxide>();
+    // SAFETY: an all-zero DecompressorOxide is its documented initial state (State::Start = 0).
+    let state = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut DecompressorOxide };
+    if state.is_null() {
+        return Err(PackError::Corrupt("out of memory"));
+    }
+    let mut state = unsafe { alloc::boxed::Box::from_raw(state) };
+    state.init();
+    Ok(state)
+}
+
+/// Compressed bytes are read in pieces this large: a section is never held compressed whole
+/// (on the watch every large block is one that a broken-up heap may not have).
+const CHUNK: usize = 16 * 1024;
+
+/// A zeroed buffer of `n` bytes, or out of memory.
+fn buffer(n: usize) -> Result<Vec<u8>, PackError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| PackError::Corrupt("out of memory"))?;
+    v.resize(n, 0);
+    Ok(v)
 }
 
 /// Raw deflate into an exactly sized buffer, with the decompressor state on the heap.
@@ -137,15 +168,8 @@ pub fn inflate_prefix(input: &[u8], out: &mut [u8]) -> Result<(), PackError> {
 
 fn inflate_impl(input: &[u8], out: &mut [u8], prefix: bool) -> Result<(), PackError> {
     use miniz_oxide::inflate::TINFLStatus;
-    use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
-    let layout = core::alloc::Layout::new::<DecompressorOxide>();
-    // SAFETY: an all-zero DecompressorOxide is its documented initial state (State::Start = 0).
-    let state = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut DecompressorOxide };
-    if state.is_null() {
-        return Err(PackError::Corrupt("out of memory"));
-    }
-    let mut state = unsafe { alloc::boxed::Box::from_raw(state) };
-    state.init();
+    use miniz_oxide::inflate::core::{decompress, inflate_flags};
+    let mut state = decompressor()?;
     let flags = inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
     let (status, _, written) = decompress(&mut state, input, out, 0, flags);
     match status {
@@ -394,8 +418,10 @@ impl Index {
 }
 
 /// Reads, inflates and checks a section into `out` (exactly `raw_len` bytes). The compressed
-/// bytes are staged in a temporary buffer of `stored_len`.
+/// bytes are read [`CHUNK`] at a time, straight into the decompressor.
 pub fn read_section(src: &mut dyn Source, e: &Entry, out: &mut [u8]) -> Result<(), PackError> {
+    use miniz_oxide::inflate::TINFLStatus;
+    use miniz_oxide::inflate::core::{decompress, inflate_flags};
     if out.len() != e.raw_len as usize {
         return Err(PackError::Corrupt("section size"));
     }
@@ -404,13 +430,32 @@ pub fn read_section(src: &mut dyn Source, e: &Entry, out: &mut [u8]) -> Result<(
             return Err(PackError::Truncated);
         }
     } else {
-        let mut stored = Vec::new();
-        stored.try_reserve_exact(e.stored_len as usize).map_err(|_| PackError::Corrupt("out of memory"))?;
-        stored.resize(e.stored_len as usize, 0);
-        if !src.read_at(e.offset, &mut stored) {
-            return Err(PackError::Truncated);
+        let stored = e.stored_len as usize;
+        let mut state = decompressor()?;
+        let mut chunk = buffer(CHUNK.min(stored))?;
+        let (mut read, mut at, mut len, mut written) = (0usize, 0usize, 0usize, 0usize);
+        loop {
+            if at == len && read < stored {
+                let n = (stored - read).min(chunk.len());
+                if !src.read_at(e.offset + read as u32, &mut chunk[..n]) {
+                    return Err(PackError::Truncated);
+                }
+                (read, at, len) = (read + n, 0, n);
+            }
+            let more = if read < stored { inflate_flags::TINFL_FLAG_HAS_MORE_INPUT } else { 0 };
+            let flags = inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF | more;
+            let (status, used, made) = decompress(&mut state, &chunk[at..len], out, written, flags);
+            at += used;
+            written += made;
+            match status {
+                TINFLStatus::Done => break,
+                TINFLStatus::NeedsMoreInput if read < stored || at < len => {}
+                _ => return Err(PackError::Corrupt("deflate")),
+            }
         }
-        inflate(&stored, out)?;
+        if written != out.len() {
+            return Err(PackError::Corrupt("deflate"));
+        }
     }
     if crc32(out) != e.crc {
         return Err(PackError::Corrupt("section checksum"));
@@ -419,11 +464,116 @@ pub fn read_section(src: &mut dyn Source, e: &Entry, out: &mut [u8]) -> Result<(
 }
 
 pub fn read_section_vec(src: &mut dyn Source, e: &Entry) -> Result<Vec<u8>, PackError> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(e.raw_len as usize).map_err(|_| PackError::Corrupt("out of memory"))?;
-    v.resize(e.raw_len as usize, 0);
+    let mut v = buffer(e.raw_len as usize)?;
     read_section(src, e, &mut v)?;
     Ok(v)
+}
+
+/// Bytes of the decompressor's window (deflate refers back at most this far).
+const WINDOW: usize = 32 * 1024;
+
+/// A section read front to back in pieces, inflated through a [`WINDOW`] of its own: neither the
+/// section nor its compressed bytes are ever whole in memory (a big lobby's skeleton is 2 MB
+/// inflated; parsed straight from here it needs no block of that size). The checksum is checked
+/// as the last byte comes out.
+pub struct SectionReader<'a> {
+    src: &'a mut dyn Source,
+    entry: Entry,
+    /// Compressed bytes read so far, and the piece being decompressed (`chunk[at..len]`).
+    read: usize,
+    chunk: Vec<u8>,
+    at: usize,
+    len: usize,
+    /// None for a section stored as it is.
+    state: Option<alloc::boxed::Box<miniz_oxide::inflate::core::DecompressorOxide>>,
+    window: Vec<u8>,
+    /// Where the decompressor writes next, and the part of the window not yet handed out.
+    win_pos: usize,
+    avail: (usize, usize),
+    ended: bool,
+    produced: usize,
+    crc: u32,
+}
+
+impl<'a> SectionReader<'a> {
+    pub fn new(src: &'a mut dyn Source, e: &Entry) -> Result<SectionReader<'a>, PackError> {
+        let packed = e.stored_len != e.raw_len;
+        let (state, window, chunk) = if packed {
+            (Some(decompressor()?), buffer(WINDOW)?, buffer(CHUNK.min(e.stored_len as usize))?)
+        } else {
+            (None, Vec::new(), Vec::new())
+        };
+        Ok(SectionReader { src, entry: *e, read: 0, chunk, at: 0, len: 0, state, window, win_pos: 0, avail: (0, 0), ended: false, produced: 0, crc: 0 })
+    }
+
+    /// The section's inflated length.
+    pub fn len(&self) -> usize {
+        self.entry.raw_len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entry.raw_len == 0
+    }
+
+    /// The next bytes into `out` (up to its length); 0 once the whole section is out.
+    pub fn read(&mut self, out: &mut [u8]) -> Result<usize, PackError> {
+        use miniz_oxide::inflate::TINFLStatus;
+        use miniz_oxide::inflate::core::{decompress, inflate_flags};
+        let raw = self.entry.raw_len as usize;
+        let want = out.len().min(raw - self.produced);
+        if want == 0 {
+            return Ok(0);
+        }
+        let n = match self.state.as_mut() {
+            None => {
+                if !self.src.read_at(self.entry.offset + self.produced as u32, &mut out[..want]) {
+                    return Err(PackError::Truncated);
+                }
+                want
+            }
+            Some(state) => loop {
+                if self.avail.0 < self.avail.1 {
+                    let n = (self.avail.1 - self.avail.0).min(want);
+                    out[..n].copy_from_slice(&self.window[self.avail.0..self.avail.0 + n]);
+                    self.avail.0 += n;
+                    break n;
+                }
+                if self.ended {
+                    return Err(PackError::Corrupt("deflate"));
+                }
+                let stored = self.entry.stored_len as usize;
+                if self.at == self.len && self.read < stored {
+                    let n = (stored - self.read).min(self.chunk.len());
+                    if !self.src.read_at(self.entry.offset + self.read as u32, &mut self.chunk[..n]) {
+                        return Err(PackError::Truncated);
+                    }
+                    (self.read, self.at, self.len) = (self.read + n, 0, n);
+                }
+                if self.win_pos == WINDOW {
+                    self.win_pos = 0;
+                }
+                // The window wraps: each call writes on from `win_pos` up to its end at most, and
+                // back-references reach into the 32 KB before it (handed out already).
+                let more = if self.read < stored { inflate_flags::TINFL_FLAG_HAS_MORE_INPUT } else { 0 };
+                let (status, used, made) = decompress(state, &self.chunk[self.at..self.len], &mut self.window, self.win_pos, more);
+                self.at += used;
+                self.avail = (self.win_pos, self.win_pos + made);
+                self.win_pos += made;
+                match status {
+                    TINFLStatus::Done => self.ended = true,
+                    TINFLStatus::HasMoreOutput => {}
+                    TINFLStatus::NeedsMoreInput if self.read < stored || self.at < self.len || made > 0 => {}
+                    _ => return Err(PackError::Corrupt("deflate")),
+                }
+            },
+        };
+        self.crc = crc32_update(self.crc, &out[..n]);
+        self.produced += n;
+        if self.produced == raw && self.crc != self.entry.crc {
+            return Err(PackError::Corrupt("section checksum"));
+        }
+        Ok(n)
+    }
 }
 
 /// The first `out.len()` bytes of a section (page headers), reading at most 4 KB.
@@ -652,8 +802,50 @@ pub struct IdleBake {
     /// call with shape [`IDLE_LIVE`] draws run `color` there.
     pub live: Vec<Vec<u16>>,
     pub frames: u16,
-    /// The frames' calls (see [`IdleCursor`]).
-    pub stream: Vec<u8>,
+    /// The frames' calls (see [`IdleCursor`]), in pieces of whole frames of about
+    /// [`IDLE_CHUNK`] bytes (a baked idle is up to 1.4 MB: on the watch no block of that size).
+    pub stream: Vec<Vec<u8>>,
+}
+
+/// Bytes of a piece of [`IdleBake::stream`] (a frame larger than this gets one of its own).
+pub const IDLE_CHUNK: usize = 256 * 1024;
+
+/// Bytes of the whole frames at the start of `d`, up to `max` (at least the first frame when it
+/// is complete; 0 when not even that).
+fn whole_frames(d: &[u8], max: usize) -> usize {
+    let mut at = 0usize;
+    loop {
+        let Some(c) = d.get(at..at + 2) else { break };
+        let n = u16::from_le_bytes([c[0], c[1]]) as usize;
+        let mut p = at + 2;
+        for _ in 0..n {
+            let Some(&flags) = d.get(p + 4) else { return at };
+            p += 5 + 12 + if flags & 2 != 0 { 12 } else { 0 };
+        }
+        if p > d.len() || (p > max && at > 0) {
+            break;
+        }
+        at = p;
+    }
+    at
+}
+
+/// `d` (frames) cut into pieces of whole frames of at most [`IDLE_CHUNK`] bytes.
+fn frame_chunks(mut d: Vec<u8>) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while d.len() > IDLE_CHUNK {
+        let cut = whole_frames(&d, IDLE_CHUNK);
+        if cut == 0 || cut == d.len() {
+            break;
+        }
+        let rest = d.split_off(cut);
+        d.shrink_to_fit();
+        out.push(d);
+        d = rest;
+    }
+    d.shrink_to_fit();
+    out.push(d);
+    out
 }
 
 /// The shape of a call that draws a run of live slots ([`IdleBake::live`]).
@@ -801,18 +993,108 @@ impl IdleBake {
             }
         }
         v.extend_from_slice(&self.frames.to_le_bytes());
-        v.extend_from_slice(&(self.stream.len() as u32).to_le_bytes());
-        v.extend_from_slice(&self.stream);
+        v.extend_from_slice(&(self.stream_len() as u32).to_le_bytes());
+        for c in &self.stream {
+            v.extend_from_slice(c);
+        }
         v
+    }
+
+    /// Bytes of the stream.
+    pub fn stream_len(&self) -> usize {
+        self.stream.iter().map(|c| c.len()).sum()
     }
 
     pub fn decode(d: &[u8]) -> Option<IdleBake> {
         Self::decode_owned(d.to_vec())
     }
 
-    /// `decode`, keeping the section's own buffer as the stream (no second copy of it).
+    /// `decode`, keeping the section's own buffer for the stream's pieces.
     pub fn decode_owned(mut d: Vec<u8>) -> Option<IdleBake> {
-        let mut r = Bytes { d: &d, at: 0 };
+        let (mut bake, at, len) = Self::head(&d)?;
+        if at + len != d.len() {
+            return None;
+        }
+        d.drain(..at);
+        bake.stream = frame_chunks(d);
+        Some(bake)
+    }
+
+    /// Reads a baked idle from a pack section in pieces: the header, then the stream straight
+    /// into pieces of whole frames (neither the section nor the stream is ever one block).
+    pub fn read(src: &mut dyn Source, e: &Entry) -> Result<Option<IdleBake>, PackError> {
+        const STEP: usize = 64 * 1024;
+        let mut r = SectionReader::new(src, e)?;
+        let raw = r.len();
+        let fill = |r: &mut SectionReader, out: &mut [u8]| -> Result<(), PackError> {
+            let mut got = 0;
+            while got < out.len() {
+                let n = r.read(&mut out[got..])?;
+                if n == 0 {
+                    return Err(PackError::Truncated);
+                }
+                got += n;
+            }
+            Ok(())
+        };
+        // The header (shapes, meshes, colours...), read until it parses.
+        let mut head: Vec<u8> = Vec::new();
+        let (mut bake, at, len) = loop {
+            let have = head.len();
+            let want = (have + STEP).min(raw);
+            if want == have {
+                return Ok(None);
+            }
+            head.try_reserve_exact(want - have).map_err(|_| PackError::Corrupt("out of memory"))?;
+            head.resize(want, 0);
+            fill(&mut r, &mut head[have..])?;
+            if let Some(h) = Self::head(&head) {
+                break h;
+            }
+        };
+        if at + len != raw || bake.frames == 0 {
+            return Ok(None);
+        }
+        // The stream: what the header read took in already, then the rest, cut at frames.
+        let mut cur = head.split_off(at);
+        drop(head);
+        let mut left = raw - at - cur.len();
+        let mut chunks = Vec::new();
+        let mut target = IDLE_CHUNK;
+        loop {
+            let room = target.saturating_sub(cur.len()).min(left);
+            if room > 0 {
+                let have = cur.len();
+                cur.try_reserve_exact(room).map_err(|_| PackError::Corrupt("out of memory"))?;
+                cur.resize(have + room, 0);
+                fill(&mut r, &mut cur[have..])?;
+                left -= room;
+            }
+            if left == 0 {
+                chunks.extend(frame_chunks(cur));
+                break;
+            }
+            let cut = whole_frames(&cur, IDLE_CHUNK);
+            if cut == 0 {
+                // A frame longer than a piece: this piece grows to hold it.
+                target += IDLE_CHUNK;
+                continue;
+            }
+            target = IDLE_CHUNK;
+            let rest = cur[cut..].to_vec();
+            cur.truncate(cut);
+            cur.shrink_to_fit();
+            chunks.push(cur);
+            cur = rest;
+        }
+        bake.stream = chunks;
+        Ok(Some(bake))
+    }
+
+    /// The header of a baked idle (everything but the stream, left empty), where the stream
+    /// starts, and its length; None while `d` holds only part of the header (or a bad one).
+    fn head(d: &[u8]) -> Option<(IdleBake, usize, usize)> {
+        let mut r = Bytes { d, at: 0 };
         let version = r.u8()?;
         if version != 3 && version != 4 {
             return None;
@@ -912,16 +1194,10 @@ impl IdleBake {
         }
         let frames = r.u16()?;
         let len = r.u32()? as usize;
-        let at = r.at;
-        if at + len != d.len() || frames == 0 {
+        if frames == 0 {
             return None;
         }
-        d.drain(..at);
-        // The header (shapes, colours, runs) now lives in its own vectors: give its room back
-        // (shrinking leaves the block where it is). Kept, it made a baked idle take about 1.6 to
-        // 2 times its size on the watch.
-        d.shrink_to_fit();
-        Some(IdleBake { animation, rate, period, start, shapes, meshes, regions, steady, colors, live, frames, stream: d })
+        Some((IdleBake { animation, rate, period, start, shapes, meshes, regions, steady, colors, live, frames, stream: Vec::new() }, r.at, len))
     }
 }
 
@@ -955,6 +1231,8 @@ impl Bytes<'_> {
 /// before, so frames come in order; after the last it starts over).
 #[derive(Clone, Debug, Default)]
 pub struct IdleCursor {
+    /// Where the next frame starts: the stream's piece and the byte in it.
+    chunk: usize,
     at: usize,
     /// The frame `next` decodes.
     pub frame: u16,
@@ -968,10 +1246,11 @@ pub struct IdleCursor {
 
 impl IdleCursor {
     pub fn new(shapes: usize) -> IdleCursor {
-        IdleCursor { at: 0, frame: 0, last: alloc::vec![[0; 6]; shapes], seen: alloc::vec![0; shapes], tick: 1 }
+        IdleCursor { chunk: 0, at: 0, frame: 0, last: alloc::vec![[0; 6]; shapes], seen: alloc::vec![0; shapes], tick: 1 }
     }
 
     pub fn rewind(&mut self) {
+        self.chunk = 0;
         self.at = 0;
         self.frame = 0;
         // Nothing appeared in "the frame before" the first one.
@@ -985,8 +1264,15 @@ impl IdleCursor {
             self.rewind();
         }
         out.clear();
-        let d = &bake.stream[..];
-        let mut at = self.at;
+        // Frames never span pieces: one that ends a piece is followed by the next piece.
+        let (mut chunk, mut at) = (self.chunk, self.at);
+        if bake.stream.get(chunk).is_some_and(|c| at >= c.len()) {
+            (chunk, at) = (chunk + 1, 0);
+        }
+        let Some(d) = bake.stream.get(chunk).map(|c| &c[..]) else {
+            self.rewind();
+            return None;
+        };
         let prev = self.tick;
         let tick = prev + 1;
         let ok = (|| -> Option<()> {
@@ -1044,6 +1330,7 @@ impl IdleCursor {
         }
         self.tick = tick;
         let f = self.frame;
+        self.chunk = chunk;
         self.at = at;
         self.frame += 1;
         Some(f)
@@ -1344,7 +1631,7 @@ mod idle_tests {
             vec![call(0, 101, Some([1, 2, 3, 4, 5, 6])), call(1, 31, None)],
         ];
         let stream = IdleBake::encode_frames(&frames, 2);
-        let bake = IdleBake { animation: 3, rate: 30.0, period: 0.1, start: 0.25, shapes: vec![shape(0), shape(1)], meshes: Vec::new(), regions: Default::default(), steady: Vec::new(), colors: vec![0xFFFF_FFFF, 0x8000_00FF], live: vec![vec![4, 5]], frames: 3, stream };
+        let bake = IdleBake { animation: 3, rate: 30.0, period: 0.1, start: 0.25, shapes: vec![shape(0), shape(1)], meshes: Vec::new(), regions: Default::default(), steady: Vec::new(), colors: vec![0xFFFF_FFFF, 0x8000_00FF], live: vec![vec![4, 5]], frames: 3, stream: vec![stream] };
         let back = IdleBake::decode(&bake.encode()).unwrap();
         assert_eq!(back, bake);
         let mut c = IdleCursor::new(2);
@@ -1374,7 +1661,7 @@ mod idle_tests {
         let stream = IdleBake::encode_frames(&[vec![IdleCall { shape: 0, color: 0, m0: [0; 6], m1: None }]], 2);
         let mesh = |att: u32| IdleMesh { attachment: att, uvs: vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.5, 0.5], tris: vec![0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4], solo: vec![0x12] };
         let regions = [vec![[0, 0, 10, 20]], Vec::new(), vec![[5, 5, 6, 6], [-3, 0, 400, 480]]];
-        let bake = IdleBake { animation: 0, rate: 30.0, period: 1.0, start: 0.0, shapes: vec![a.clone(), b], meshes: vec![mesh(2), mesh(9)], regions, steady: vec![0b101, 1], colors: vec![0], live: Vec::new(), frames: 1, stream };
+        let bake = IdleBake { animation: 0, rate: 30.0, period: 1.0, start: 0.0, shapes: vec![a.clone(), b], meshes: vec![mesh(2), mesh(9)], regions, steady: vec![0b101, 1], colors: vec![0], live: Vec::new(), frames: 1, stream: vec![stream] };
         let bytes = bake.encode();
         assert_eq!(bytes[0], 4);
         let back = IdleBake::decode(&bytes).unwrap();
@@ -1386,5 +1673,104 @@ mod idle_tests {
         let old = IdleBake { shapes: vec![a], meshes: Vec::new(), regions: Default::default(), steady: Vec::new(), ..bake };
         assert_eq!(old.encode()[0], 3);
         assert_eq!(IdleBake::decode(&old.encode()).unwrap(), old);
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn pack(data: &[u8]) -> Vec<u8> {
+        let header = Header { screen_width: 336, screen_height: 480, camera_cx: 0.0, camera_cy: 0.0, camera_scale: 1.0, layer_count: 1, page_format: PageFormat::Argb8565 };
+        write(&header, &[Section { kind: KIND_SKEL, layer: 0, index: 0, data: data.to_vec() }], 6)
+    }
+
+    /// 300 KB of text-like data: compressible, with back-references across the window's wrap.
+    fn sample() -> Vec<u8> {
+        let mut v = Vec::new();
+        let mut x = 12345u32;
+        while v.len() < 300_000 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let word = [b"bone_", b"slot_", b"hair_", b"skirt"][(x >> 16) as usize % 4];
+            v.extend_from_slice(word);
+            v.extend_from_slice(&((x >> 8) % 1000).to_le_bytes()[..2]);
+        }
+        v
+    }
+
+    #[test]
+    fn sections_read_whole_or_in_pieces_give_the_same_bytes() {
+        let data = sample();
+        let bytes = pack(&data);
+        let mut src: &[u8] = &bytes;
+        let idx = Index::read(&mut src).unwrap();
+        let e = *idx.find(KIND_SKEL, 0, 0).unwrap();
+        assert!(e.stored_len < e.raw_len, "the sample compresses");
+        assert_eq!(read_section_vec(&mut src, &e).unwrap(), data);
+        for piece in [1usize, 7, 4096, 40_000, 1 << 20] {
+            let mut r = SectionReader::new(&mut src, &e).unwrap();
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; piece];
+            loop {
+                let n = r.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, data, "pieces of {piece}");
+        }
+        // A changed byte is caught by the checksum at the end.
+        let mut bad = bytes.clone();
+        let at = e.offset as usize + e.stored_len as usize / 2;
+        bad[at] ^= 0x10;
+        let mut src: &[u8] = &bad;
+        let mut r = SectionReader::new(&mut src, &e).unwrap();
+        let mut buf = vec![0u8; 8192];
+        let failed = loop {
+            match r.read(&mut buf) {
+                Ok(0) => break false,
+                Ok(_) => {}
+                Err(_) => break true,
+            }
+        };
+        assert!(failed);
+    }
+}
+
+#[cfg(test)]
+mod idle_chunk_tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn a_long_stream_is_read_in_pieces_and_decodes_the_same() {
+        let shapes: Vec<IdleShape> = (0..12).map(|n| IdleShape { slot: n, attachment: n as u32, anchor: [0.0, 0.0], span: [1.0, 1.0], tris: vec![0, 1, 2], clip: 0 }).collect();
+        let frames: Vec<Vec<IdleCall>> = (0..2400)
+            .map(|f| (0..12u16).map(|s| IdleCall { shape: s, color: 0, m0: [f as i16, s as i16, 3, 4, 5, 6], m1: (f % 3 == 0).then_some([1, 2, 3, 4, 5, f as i16]) }).collect())
+            .collect();
+        let stream = IdleBake::encode_frames(&frames, shapes.len());
+        assert!(stream.len() > 2 * IDLE_CHUNK, "{} bytes", stream.len());
+        let bake = IdleBake { animation: 0, rate: 30.0, period: 80.0, start: 0.0, shapes, meshes: Vec::new(), regions: Default::default(), steady: Vec::new(), colors: vec![0], live: Vec::new(), frames: frames.len() as u16, stream: vec![stream] };
+        let bytes = bake.encode();
+        let header = Header { screen_width: 336, screen_height: 480, camera_cx: 0.0, camera_cy: 0.0, camera_scale: 1.0, layer_count: 1, page_format: PageFormat::Argb8565 };
+        let pack = write(&header, &[Section { kind: KIND_IDLE, layer: 0, index: 0, data: bytes.clone() }], 6);
+        let mut src: &[u8] = &pack;
+        let idx = Index::read(&mut src).unwrap();
+        let e = *idx.find(KIND_IDLE, 0, 0).unwrap();
+        let read = IdleBake::read(&mut src, &e).unwrap().unwrap();
+        for b in [IdleBake::decode_owned(bytes).unwrap(), read] {
+            assert!(b.stream.len() >= 3 && b.stream.iter().all(|c| c.len() <= IDLE_CHUNK), "{:?}", b.stream.iter().map(|c| c.len()).collect::<Vec<_>>());
+            assert_eq!(b.encode(), bake.encode());
+            let mut cur = IdleCursor::new(b.shapes.len());
+            let mut out = Vec::new();
+            for round in 0..2 {
+                for (f, want) in frames.iter().enumerate() {
+                    assert_eq!(cur.next(&b, &mut out), Some(f as u16), "round {round}");
+                    assert_eq!(&out, want);
+                }
+            }
+        }
     }
 }

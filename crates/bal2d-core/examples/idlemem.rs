@@ -8,7 +8,7 @@ fn main() {
             let b = &l.bake;
             let tris: usize = b.shapes.iter().map(|s| s.tris.capacity() * 2).sum();
             let mesh: usize = b.meshes.iter().map(|m| m.uvs.capacity() * 4 + m.tris.capacity() * 2).sum();
-            println!("{path} layer {li}: {} shapes, shape triangles {} KB, meshes {} KB, stream {} KB, {}", b.shapes.len(), tris / 1024, mesh / 1024, b.stream.capacity() / 1024, l.sizes());
+            println!("{path} layer {li}: {} shapes, shape triangles {} KB, meshes {} KB, stream {} KB, {}", b.shapes.len(), tris / 1024, mesh / 1024, b.stream.iter().map(|c| c.capacity()).sum::<usize>() / 1024, l.sizes());
         }
     }
 }

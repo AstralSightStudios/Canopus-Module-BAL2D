@@ -19,6 +19,6 @@ pub mod timeline;
 pub mod writer;
 
 pub use atlas::{Atlas, bind_atlas};
-pub use binary::{ReadError, read_skeleton};
+pub use binary::{ReadError, SkelSource, read_skeleton, read_skeleton_from};
 pub use data::*;
 pub use skeleton::{Bone, Physics, Skeleton, Slot};

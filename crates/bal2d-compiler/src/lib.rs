@@ -220,10 +220,11 @@ fn load(input: &LayerInput) -> Result<Layer, String> {
 /// The work atlas may hold this many times the texel budget (its regions at the density they
 /// are drawn at, before the budget scales them down): enough for the bake and for an exact
 /// final resampling, bounded whatever the source pages are.
-/// Largest texture page, in texels (about 1.4 MB in ARGB8565): a standard lobby's texture
-/// (about 2.7 MB) takes two pages, which still find free blocks once the watch's heap is broken
-/// up by lobby switches.
-pub const MAX_PAGE_TEXELS: u32 = 500_000;
+/// Largest texture page, in texels (768 KB in ARGB8565, 1 MB widened to 32 bits): every page
+/// is one block of the watch's heap, and after a while of use (lobby switches, the system's own
+/// allocations) its free memory comes in pieces of a megabyte or two. A standard lobby's
+/// texture (about 2.7 MB) takes four pages, a high-quality one about six.
+pub const MAX_PAGE_TEXELS: u32 = 262_144;
 const WORK_BUDGET: f64 = 4.0;
 /// Work pages live only in memory: no GPU limit on their size.
 const WORK_MAX_PAGE: u32 = 16384;
