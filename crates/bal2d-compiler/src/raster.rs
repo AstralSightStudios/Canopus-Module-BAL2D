@@ -30,6 +30,16 @@ impl Texture {
         Texture { width, height, rgba, straight: false }
     }
 
+    /// Whether texel (x, y) is nothing at all (premultiplied zero: no blend mode changes the
+    /// target there) and whether it is fully opaque.
+    #[inline]
+    pub fn texel_kind(&self, x: usize, y: usize) -> (bool, bool) {
+        let i = (y * self.width + x) * 4;
+        let p = &self.rgba[i..i + 4];
+        let zero = if self.straight { p[3] == 0 } else { p == [0, 0, 0, 0] };
+        (zero, p[3] == 255)
+    }
+
     /// Texel (x, y) as premultiplied floats in 0..=1.
     #[inline]
     fn texel(&self, x: usize, y: usize) -> [f32; 4] {

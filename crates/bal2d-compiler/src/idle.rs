@@ -38,6 +38,8 @@ pub struct IdleReport {
     pub skipped: String,
     /// The most frames a second it was baked at (lowered to keep the pack within its size).
     pub rate: f32,
+    /// What the fill pass left out (`crate::cull`).
+    pub cull: crate::cull::CullReport,
 }
 
 /// One attachment's batch in a pose.
@@ -402,7 +404,7 @@ pub fn bake(pack: &[u8], max_rate: f32, tolerance: f32) -> (Vec<(u16, IdleBake)>
                             }
                             let anchor = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
                             let span = [((hi[0] - lo[0]) * 0.5).max(1.0), ((hi[1] - lo[1]) * 0.5).max(1.0)];
-                            shapes.push(IdleShape { slot: b.key.0, attachment: b.key.1, anchor, span, tris: g.clone() });
+                            shapes.push(IdleShape { slot: b.key.0, attachment: b.key.1, anchor, span, tris: g.clone(), clip: 0 });
                             let id = (shapes.len() - 1) as u16;
                             shape_ids.insert((b.key, g.clone()), id);
                             id
@@ -436,10 +438,29 @@ pub fn bake(pack: &[u8], max_rate: f32, tolerance: f32) -> (Vec<(u16, IdleBake)>
             eprintln!("layer {li}: {:.0} calls/frame, {:.1} could join the call before (same page, blend, tint, affine)", total_calls as f32 / frames as f32, mergeable as f32 / frames as f32);
         }
         let stream = IdleBake::encode_frames(&calls, shapes.len());
-        let bake = IdleBake { animation: animation as u16, rate, period, start, shapes, colors, live, frames: frames as u16, stream };
+        let bake = IdleBake { animation: animation as u16, rate, period, start, shapes, meshes: Vec::new(), regions: Default::default(), colors, live, frames: frames as u16, stream };
         let bytes = bake.encode().len();
         report.layers.push((frames as u16, total_calls as f32 / frames as f32, bake.shapes.len(), bytes));
         out.push((li as u16, bake));
+    }
+    if std::env::var("BAL2D_NO_CULL").is_err() {
+        let mut textures: Vec<Vec<crate::raster::Texture>> = (0..lobby.layers.len()).map(|_| Vec::new()).collect();
+        for p in &pages {
+            let mut section = vec![0u8; p.section_len()];
+            if bal2d_core::read_page(&mut &pack[..], p, &mut section).is_err() {
+                return (out, report);
+            }
+            let img = crate::image::decode_page(p.header.width as u32, p.header.height as u32, p.header.format, &section[8..]);
+            if let Some(l) = textures.get_mut(p.layer as usize) {
+                l.push(crate::raster::Texture::from_premultiplied_vec(img.width as usize, img.height as usize, img.data));
+            }
+        }
+        report.cull = crate::cull::cull(&lobby, &textures, &mut out);
+        for (i, (_, b)) in out.iter().enumerate() {
+            if let Some(l) = report.layers.get_mut(i) {
+                l.3 = b.encode().len();
+            }
+        }
     }
     (out, report)
 }

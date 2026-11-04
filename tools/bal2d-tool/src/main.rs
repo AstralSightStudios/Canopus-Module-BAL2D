@@ -373,6 +373,10 @@ fn compile(args: &[String]) {
     for (li, (frames, calls, shapes, bytes)) in report.idle.layers.iter().enumerate() {
         println!("  idle bake layer {li}: {frames} frames (up to {} fps), {calls:.0} calls/frame, {shapes} shapes, {} KB raw", report.idle.rate, bytes / 1024);
     }
+    let c = &report.idle.cull;
+    if c.fill_before > 0.0 {
+        println!("  idle fill: {:.2} screens/frame -> {:.2} without empty texels -> {:.2} clipped ({:.2} with every layer baked), {} attachments split", c.fill_before, c.fill_after_empty, c.fill_after, c.fill_after_above, c.split_attachments);
+    }
     for l in &report.layers {
         println!(
             "  {}: attachments {} -> {}, regions {} -> {}, texels {:.2} -> {:.2} Mpx, pages {:?}, skel {} B; dropped {} animations, {} timelines; trimmed {} triangles, {} vertices; simplified away {} triangles, {} vertices",

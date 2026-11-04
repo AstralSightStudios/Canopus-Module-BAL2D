@@ -186,6 +186,8 @@ pub struct Runtime {
     quality_changed: u32,
     /// Layers drawn from their baked idle in the current frame (`Lobby::update_with`).
     baked_mask: u32,
+    /// Whether clipping baked shapes pays (`Lobby::idle_clip`), measured per lobby.
+    clip_ab: ClipAb,
     /// The current frame is drawn by LVGL's DRAW_MAIN of the view straight into its layer
     /// (LVGL's frame buffer in SRAM): no buffer of the module's own, no copy of it by LVGL.
     pub direct: bool,
@@ -309,6 +311,7 @@ pub fn rt() -> &'static mut Runtime {
                 quality_changed: 0,
                 pressed: false,
                 baked_mask: 0,
+                clip_ab: ClipAb::new(),
                 direct: false,
                 direct_off: false,
                 single: false,
@@ -863,6 +866,7 @@ fn load_step() -> Option<i32> {
     // after a heavy one would otherwise start where the heavy one left it).
     r.renderer.paths.tolerance = TOLERANCES[0];
     r.quality_changed = lv::now_ms();
+    r.clip_ab = ClipAb::new();
     r.pack = l.name;
     Fs::remove(BANS_FILE);
     r.lobby = l.lobby;
@@ -1378,6 +1382,8 @@ extern "C" fn frame(timer: *mut c_void) {
     w.direct = r.direct;
     let span = now.wrapping_sub(r.window_start);
     if span >= 1000 {
+        clip_ab_window(r);
+        let w = &mut r.window;
         let n = w.frames.max(1);
         let d = w.drawn.max(1);
         r.perf = Perf {
@@ -1668,9 +1674,73 @@ fn note_hangs(r: &mut Runtime) {
     }
 }
 
+/// Clipping baked shapes to what stays visible saves GPU fill and costs CPU; which wins depends
+/// on which of the two the watch waits for. Once a lobby plays nothing but its bakes, one-second
+/// windows alternate it off and on (`WINDOWS` with frames of only baked layers), then the one
+/// with the shorter draw (and GPU wait) per frame stays for that lobby.
+pub struct ClipAb {
+    /// Draw + GPU-wait milliseconds and frames, clipping off and on.
+    sum: [u32; 2],
+    frames: [u32; 2],
+    windows: u32,
+    done: bool,
+}
+
+impl ClipAb {
+    const WINDOWS: u32 = 12;
+
+    const fn new() -> ClipAb {
+        ClipAb { sum: [0; 2], frames: [0; 2], windows: 0, done: false }
+    }
+}
+
+/// A drawn frame for the clipping trial.
+fn clip_ab_frame(r: &mut Runtime, cost: u32) {
+    let Some(lobby) = r.lobby.as_ref() else { return };
+    let all = (1u32 << lobby.layers.len().min(31)) - 1;
+    if r.clip_ab.done || r.baked_mask & all != all {
+        return;
+    }
+    let k = lobby.idle_clip as usize;
+    r.clip_ab.sum[k] += cost;
+    r.clip_ab.frames[k] += 1;
+}
+
+/// A stats window ended: the trial switches sides, or decides.
+fn clip_ab_window(r: &mut Runtime) {
+    let Some(lobby) = r.lobby.as_mut() else { return };
+    if r.clip_ab.done {
+        return;
+    }
+    if !lobby.idle_clips() {
+        r.clip_ab.done = true;
+        return;
+    }
+    let a = &mut r.clip_ab;
+    let k = lobby.idle_clip as usize;
+    // Only windows that drew baked frames count; the first one starts the trial (off).
+    if a.frames[k] == 0 && a.windows == 0 {
+        lobby.idle_clip = false;
+        return;
+    }
+    if a.frames[k] > 0 {
+        a.windows += 1;
+        lobby.idle_clip = !lobby.idle_clip;
+    }
+    if a.windows >= ClipAb::WINDOWS && a.frames[0] > 0 && a.frames[1] > 0 {
+        let (off, on) = (a.sum[0] * 10 / a.frames[0], a.sum[1] * 10 / a.frames[1]);
+        a.done = true;
+        // Clipping must win by a little (0.3 ms): the windows fall on different moments of the
+        // loops, some heavier than others.
+        lobby.idle_clip = on + 3 < off;
+        trace(&alloc::format!("idle clip: off {}.{} ms, on {}.{} ms a frame: {}", off / 10, off % 10, on / 10, on % 10, if lobby.idle_clip { "on" } else { "off" }));
+    }
+}
+
 /// Adds a drawn frame's cost to the stats window (`draw`: building and submitting, `gpu`:
 /// waiting for the GPU to finish).
 fn count_draw(r: &mut Runtime, draw: u32, gpu: u32) {
+    clip_ab_frame(r, draw + gpu);
     let s = r.renderer.stats;
     if s.resets == 0 {
         trust_tick(r);

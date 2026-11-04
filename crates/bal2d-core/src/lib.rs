@@ -159,6 +159,10 @@ pub struct Lobby {
     /// The part of the layer `draw_idle` is drawn for (layer pixels: x0, y0, x1, y1), when only
     /// part of it is (a partial redraw): calls wholly outside build no path. None: all of it.
     pub idle_view: Option<[f32; 4]>,
+    /// Baked shapes are clipped to what stays visible (`bal2d_pack::IdleShape::clip`): less GPU
+    /// fill for some CPU. The watch decides by measuring both (wholly covered calls are left out
+    /// either way).
+    pub idle_clip: bool,
     /// Per layer: the pack section of its baked idle, if it has one.
     pub idle_entries: Vec<Option<bal2d_pack::Entry>>,
     /// Per layer: time its baked idle has played that its skeleton has not (`update_with`).
@@ -307,6 +311,7 @@ impl Lobby {
             bake,
             idle_pending: alloc::vec![0.0; layers_len],
             idle_view: None,
+            idle_clip: true,
             idle,
             idle_entries,
         };
@@ -777,13 +782,20 @@ impl Lobby {
     /// whose top-left is `origin` on the pack's screen. Returns the triangles drawn.
     pub fn draw_idle(&mut self, layer: usize, origin: (f32, f32), size: (f32, f32), page_size: &dyn Fn(u32) -> Option<(f32, f32)>, emit: &mut dyn FnMut(&bal2d_render::Call)) -> u32 {
         let pending = self.idle_pending.get(layer).copied().unwrap_or(0.0);
+        // The layers above drawn from their bakes too: what they always cover can be left out.
+        let above = (layer + 1..self.layers.len()).all(|i| self.layer_idle_ready(i));
         let c = self.camera;
         let cam = (c.cx + (origin.0 + size.0 * 0.5 - self.width * 0.5) / c.scale, c.cy - (origin.1 + size.1 * 0.5 - self.height * 0.5) / c.scale, c.scale);
         let (Some(l), Some(Some(b))) = (self.layers.get(layer), self.idle.get_mut(layer)) else { return 0 };
         let Some(e) = l.state.current(0) else { return 0 };
         let tau = idle::wrap(l.state.entry(e).track_time + pending - b.bake.start, b.bake.period);
         let view = self.idle_view.unwrap_or([0.0, 0.0, size.0, size.1]);
-        b.draw(&l.data, &l.skeleton, cam, tau, origin, size, view, page_size, emit)
+        b.draw(&l.data, &l.skeleton, cam, tau, origin, size, view, above, self.idle_clip, page_size, emit)
+    }
+
+    /// Whether a loaded bake has shapes `idle_clip` would clip.
+    pub fn idle_clips(&self) -> bool {
+        self.idle.iter().flatten().any(|l| l.bake.shapes.iter().any(|s| s.clip & (bal2d_pack::IDLE_CLIP_LATER | bal2d_pack::IDLE_CLIP_ABOVE) != 0))
     }
 
     /// Whether the baked image stands in for its slots now: always, or once the intro is over

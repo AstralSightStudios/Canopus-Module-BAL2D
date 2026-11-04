@@ -583,8 +583,35 @@ pub struct IdleShape {
     /// and the box's half size (at least a texel each way).
     pub anchor: [f32; 2],
     pub span: [f32; 2],
-    /// Triangle numbers within the attachment's own triangle list.
+    /// Triangle numbers within the attachment's own triangle list (or its [`IdleMesh`] when
+    /// the bake has one for it).
     pub tris: Vec<u16>,
+    /// Which of the bake's [`IdleBake::regions`] its calls are clipped to: bit 0 what the
+    /// layer's later calls always cover ([`IDLE_CLIP_LATER`]), bit 1 what the layers above
+    /// always cover, while they are drawn from their bakes too ([`IDLE_CLIP_ABOVE`]); bit 2
+    /// ([`IDLE_BEFORE`]): it is drawn before the slots that make the first region, so a call of
+    /// it meeting none of its rectangles is left out (as is any call meeting none of the second
+    /// region's, while the layers above are drawn from their bakes).
+    pub clip: u8,
+}
+
+pub const IDLE_CLIP_LATER: u8 = 1;
+pub const IDLE_CLIP_ABOVE: u8 = 2;
+pub const IDLE_BEFORE: u8 = 4;
+
+/// Finer triangles for an attachment of a baked idle (its own split evenly), so that parts no
+/// frame shows (fully transparent texels, hidden under opaque pixels drawn later) can be left
+/// out of the shapes: the GPU then fills less. Vertices are texture coordinates like the
+/// attachment's (0..1 of the page); the attachment's own come first, in order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IdleMesh {
+    pub attachment: u32,
+    pub uvs: Vec<f32>,
+    /// Vertex triples, wound like the attachment's.
+    pub tris: Vec<u16>,
+    /// One bit per vertex (LSB first): no two shapes drawn in one frame have it on their
+    /// outlines, so an outline running straight through it may leave it out.
+    pub solo: Vec<u8>,
 }
 
 /// One call of a baked idle frame: shape, tint (index into [`IdleBake::colors`]) and the
@@ -609,6 +636,12 @@ pub struct IdleBake {
     pub period: f32,
     pub start: f32,
     pub shapes: Vec<IdleShape>,
+    /// Finer geometry for some attachments (sorted by attachment; see [`IdleMesh`]).
+    pub meshes: Vec<IdleMesh>,
+    /// What stays visible (screen rectangles x0, y0, x1, y1, pixels, x1 and y1 exclusive) when
+    /// a shape's calls are clipped by [`IdleShape::clip`] 1, 2 and 3: the screen less what is
+    /// always covered by opaque pixels drawn later, in every frame, with a margin. Empty: none.
+    pub regions: [Vec<[i16; 4]>; 3],
     /// Straight RGBA8 tints (R in the low byte).
     pub colors: Vec<u32>,
     /// Runs of slots drawn live, not from the bake (clipped ones, with their clipping slot): a
@@ -682,9 +715,17 @@ impl IdleBake {
         out
     }
 
+    /// The mesh standing in for attachment `att`'s own geometry, if any.
+    pub fn mesh(&self, att: u32) -> Option<&IdleMesh> {
+        self.meshes.binary_search_by_key(&att, |m| m.attachment).ok().map(|i| &self.meshes[i])
+    }
+
+    /// Version 3, or 4 when there are meshes or clipped shapes (older modules then go without
+    /// the bake rather than draw it wrong). Version 4 stores triangle lists as runs.
     pub fn encode(&self) -> Vec<u8> {
+        let v4 = !self.meshes.is_empty() || self.shapes.iter().any(|s| s.clip != 0) || self.regions.iter().any(|r| !r.is_empty());
         let mut v = Vec::new();
-        v.push(3u8);
+        v.push(if v4 { 4u8 } else { 3 });
         v.extend_from_slice(&self.animation.to_le_bytes());
         for f in [self.rate, self.period, self.start] {
             v.extend_from_slice(&f.to_le_bytes());
@@ -696,9 +737,50 @@ impl IdleBake {
             for f in [s.anchor[0], s.anchor[1], s.span[0], s.span[1]] {
                 v.extend_from_slice(&f.to_le_bytes());
             }
-            v.extend_from_slice(&(s.tris.len() as u16).to_le_bytes());
-            for t in &s.tris {
-                v.extend_from_slice(&t.to_le_bytes());
+            if v4 {
+                v.push(s.clip);
+                let mut runs: Vec<(u16, u16)> = Vec::new();
+                for &t in &s.tris {
+                    match runs.last_mut() {
+                        Some((a, n)) if a.wrapping_add(*n) == t && *n < u16::MAX => *n += 1,
+                        _ => runs.push((t, 1)),
+                    }
+                }
+                v.extend_from_slice(&(runs.len() as u16).to_le_bytes());
+                for (a, n) in runs {
+                    v.extend_from_slice(&a.to_le_bytes());
+                    v.extend_from_slice(&n.to_le_bytes());
+                }
+            } else {
+                v.extend_from_slice(&(s.tris.len() as u16).to_le_bytes());
+                for t in &s.tris {
+                    v.extend_from_slice(&t.to_le_bytes());
+                }
+            }
+        }
+        if v4 {
+            v.extend_from_slice(&(self.meshes.len() as u16).to_le_bytes());
+            for m in &self.meshes {
+                v.extend_from_slice(&m.attachment.to_le_bytes());
+                v.extend_from_slice(&((m.uvs.len() / 2) as u16).to_le_bytes());
+                for f in &m.uvs {
+                    v.extend_from_slice(&f.to_le_bytes());
+                }
+                v.extend_from_slice(&((m.tris.len() / 3) as u16).to_le_bytes());
+                for t in &m.tris {
+                    v.extend_from_slice(&t.to_le_bytes());
+                }
+                let mut solo = m.solo.clone();
+                solo.resize(m.uvs.len() / 2 / 8 + 1, 0);
+                v.extend_from_slice(&solo[..m.uvs.len() / 2 / 8 + 1]);
+            }
+            for r in &self.regions {
+                v.extend_from_slice(&(r.len() as u16).to_le_bytes());
+                for q in r {
+                    for c in q {
+                        v.extend_from_slice(&c.to_le_bytes());
+                    }
+                }
             }
         }
         v.extend_from_slice(&(self.colors.len() as u16).to_le_bytes());
@@ -725,7 +807,8 @@ impl IdleBake {
     /// `decode`, keeping the section's own buffer as the stream (no second copy of it).
     pub fn decode_owned(mut d: Vec<u8>) -> Option<IdleBake> {
         let mut r = Bytes { d: &d, at: 0 };
-        if r.u8()? != 3 {
+        let version = r.u8()?;
+        if version != 3 && version != 4 {
             return None;
         }
         let animation = r.u16()?;
@@ -743,12 +826,64 @@ impl IdleBake {
             if !(span[0] > 0.0 && span[1] > 0.0) {
                 return None;
             }
+            let clip = if version == 4 { r.u8()? } else { 0 };
             let k = r.u16()? as usize;
             let mut tris = Vec::with_capacity(k);
-            for _ in 0..k {
-                tris.push(r.u16()?);
+            if version == 4 {
+                for _ in 0..k {
+                    let (a, n) = (r.u16()?, r.u16()?);
+                    if a as usize + n as usize > u16::MAX as usize + 1 {
+                        return None;
+                    }
+                    tris.extend((0..n).map(|i| a + i));
+                }
+                tris.shrink_to_fit();
+            } else {
+                for _ in 0..k {
+                    tris.push(r.u16()?);
+                }
             }
-            shapes.push(IdleShape { slot, attachment, anchor, span, tris });
+            shapes.push(IdleShape { slot, attachment, anchor, span, tris, clip });
+        }
+        let mut meshes = Vec::new();
+        let mut regions: [Vec<[i16; 4]>; 3] = Default::default();
+        if version == 4 {
+            let nm = r.u16()? as usize;
+            meshes.reserve_exact(nm);
+            for _ in 0..nm {
+                let attachment = r.u32()?;
+                let nv = r.u16()? as usize;
+                let mut uvs = Vec::with_capacity(nv * 2);
+                for _ in 0..nv * 2 {
+                    uvs.push(r.f32()?);
+                }
+                let nt = r.u16()? as usize;
+                let mut tris = Vec::with_capacity(nt * 3);
+                for _ in 0..nt * 3 {
+                    let t = r.u16()?;
+                    if t as usize >= nv {
+                        return None;
+                    }
+                    tris.push(t);
+                }
+                let solo = r.d.get(r.at..r.at + nv / 8 + 1)?.to_vec();
+                r.at += nv / 8 + 1;
+                meshes.push(IdleMesh { attachment, uvs, tris, solo });
+            }
+            if !meshes.windows(2).all(|w| w[0].attachment < w[1].attachment) {
+                return None;
+            }
+            for reg in &mut regions {
+                let n = r.u16()? as usize;
+                reg.reserve_exact(n);
+                for _ in 0..n {
+                    let q = [r.u16()? as i16, r.u16()? as i16, r.u16()? as i16, r.u16()? as i16];
+                    if q[2] <= q[0] || q[3] <= q[1] {
+                        return None;
+                    }
+                    reg.push(q);
+                }
+            }
         }
         let nc = r.u16()? as usize;
         let mut colors = Vec::with_capacity(nc);
@@ -776,7 +911,7 @@ impl IdleBake {
         // (shrinking leaves the block where it is). Kept, it made a baked idle take about 1.6 to
         // 2 times its size on the watch.
         d.shrink_to_fit();
-        Some(IdleBake { animation, rate, period, start, shapes, colors, live, frames, stream: d })
+        Some(IdleBake { animation, rate, period, start, shapes, meshes, regions, colors, live, frames, stream: d })
     }
 }
 
@@ -1191,7 +1326,7 @@ mod idle_tests {
 
     #[test]
     fn a_baked_idle_round_trips_and_decodes_frame_after_frame() {
-        let shape = |n: u16| IdleShape { slot: n, attachment: 7 + n as u32, anchor: [10.5, 20.0], span: [4.0, 9.0], tris: vec![0, 2, n] };
+        let shape = |n: u16| IdleShape { slot: n, attachment: 7 + n as u32, anchor: [10.5, 20.0], span: [4.0, 9.0], tris: vec![0, 2, n], clip: 0 };
         let call = |shape: u16, x: i16, m1: Option<[i16; 6]>| IdleCall { shape, color: 1, m0: [x, 2, 3, -4, 5, 6], m1 };
         let frames = vec![
             vec![call(0, 100, None), call(1, -7, Some([9; 6]))],
@@ -1199,7 +1334,7 @@ mod idle_tests {
             vec![call(0, 101, Some([1, 2, 3, 4, 5, 6])), call(1, 31, None)],
         ];
         let stream = IdleBake::encode_frames(&frames, 2);
-        let bake = IdleBake { animation: 3, rate: 30.0, period: 0.1, start: 0.25, shapes: vec![shape(0), shape(1)], colors: vec![0xFFFF_FFFF, 0x8000_00FF], live: vec![vec![4, 5]], frames: 3, stream };
+        let bake = IdleBake { animation: 3, rate: 30.0, period: 0.1, start: 0.25, shapes: vec![shape(0), shape(1)], meshes: Vec::new(), regions: Default::default(), colors: vec![0xFFFF_FFFF, 0x8000_00FF], live: vec![vec![4, 5]], frames: 3, stream };
         let back = IdleBake::decode(&bake.encode()).unwrap();
         assert_eq!(back, bake);
         let mut c = IdleCursor::new(2);
@@ -1220,5 +1355,26 @@ mod idle_tests {
             let b = [m2[0] * tx + m2[1] * ty + m2[2], m2[3] * tx + m2[4] * ty + m2[5]];
             assert!((a[0] - b[0]).abs() < 0.2 && (a[1] - b[1]).abs() < 0.2, "{a:?} {b:?}");
         }
+    }
+
+    #[test]
+    fn meshes_and_clipped_shapes_round_trip_as_version_4() {
+        let mut a = IdleShape { slot: 1, attachment: 9, anchor: [1.0, 2.0], span: [3.0, 4.0], tris: vec![0, 1, 2, 7, 8, 3], clip: IDLE_CLIP_ABOVE };
+        let b = IdleShape { clip: 0, ..a.clone() };
+        let stream = IdleBake::encode_frames(&[vec![IdleCall { shape: 0, color: 0, m0: [0; 6], m1: None }]], 2);
+        let mesh = |att: u32| IdleMesh { attachment: att, uvs: vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.5, 0.5], tris: vec![0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4], solo: vec![0x12] };
+        let regions = [vec![[0, 0, 10, 20]], Vec::new(), vec![[5, 5, 6, 6], [-3, 0, 400, 480]]];
+        let bake = IdleBake { animation: 0, rate: 30.0, period: 1.0, start: 0.0, shapes: vec![a.clone(), b], meshes: vec![mesh(2), mesh(9)], regions, colors: vec![0], live: Vec::new(), frames: 1, stream };
+        let bytes = bake.encode();
+        assert_eq!(bytes[0], 4);
+        let back = IdleBake::decode(&bytes).unwrap();
+        assert_eq!(back, bake);
+        assert_eq!(back.mesh(9).map(|m| m.tris.len()), Some(12));
+        assert!(back.mesh(3).is_none());
+        // Without either, the old version.
+        a.clip = 0;
+        let old = IdleBake { shapes: vec![a], meshes: Vec::new(), regions: Default::default(), ..bake };
+        assert_eq!(old.encode()[0], 3);
+        assert_eq!(IdleBake::decode(&old.encode()).unwrap(), old);
     }
 }

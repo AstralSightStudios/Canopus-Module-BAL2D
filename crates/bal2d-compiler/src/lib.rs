@@ -14,6 +14,7 @@
 
 pub mod image;
 mod bake;
+pub mod cull;
 mod hidden;
 pub mod idle;
 mod prune;
@@ -697,7 +698,7 @@ pub fn compile_progress(
         return compile_once(inputs, opts, interactions, &mut Progress { report, lo: 0.0, hi: 1.0 });
     }
     // A probe compile finds the layers that never show; the final one leaves them out.
-    let probe = Options { bake: false, ..opts.clone() };
+    let probe = Options { bake: false, idle: false, ..opts.clone() };
     let (pack, _) = compile_once(inputs, &probe, interactions.clone(), &mut Progress { report: &mut *report, lo: 0.0, hi: 0.45 })?;
     report(Stage::Analysing, 0.47);
     let hidden = hidden::hidden_layers(&pack)?;
