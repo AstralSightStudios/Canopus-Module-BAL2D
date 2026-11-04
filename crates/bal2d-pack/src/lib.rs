@@ -37,6 +37,8 @@ pub const KIND_BAKE_SLOTS: u32 = 7;
 pub const KIND_CAMERAS: u32 = 8;
 /// A layer's idle loop as ready GPU calls ([`IdleBake`]; section layer = the layer).
 pub const KIND_IDLE: u32 = 9;
+/// What the talks say ([`Dialogue`]): the lines the watch shows in a speech bubble.
+pub const KIND_DIALOGUE: u32 = 10;
 
 /// Page pixel formats (what the GPU samples directly).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1072,6 +1074,113 @@ impl Interactions {
             mixes.push(ClipMix { name: r.s()?, intro: r.f()?, outro: r.f()? });
         }
         Some(Interactions { layer, default_mix, intro, idle, talks, drags, mixes })
+    }
+}
+
+/// One line of a talk, shown in the bubble for `ms` milliseconds.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Line {
+    pub text: String,
+    pub ms: u32,
+    /// An inner thought (the game draws it in parentheses, in a softer bubble).
+    pub thought: bool,
+}
+
+/// The lines of one talk, keyed by its animation's name without the `_M` / `_A` suffix
+/// (`Talk_01` for the pair `Talk_01_M`, `Talk_01_A`).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct TalkLines {
+    pub talk: String,
+    pub lines: Vec<Line>,
+}
+
+/// What the lobby's talks say, from the game's memorial-lobby dialogue table.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Dialogue {
+    pub talks: Vec<TalkLines>,
+}
+
+/// `Talk_01_M` -> `Talk_01`: a talk animation's name without its track suffix.
+pub fn talk_key(anim: &str) -> &str {
+    let base = anim.rsplit('/').next().unwrap_or(anim);
+    match base.rsplit_once('_') {
+        Some((k, s)) if s.eq_ignore_ascii_case("m") || s.eq_ignore_ascii_case("a") => k,
+        _ => base,
+    }
+}
+
+impl Dialogue {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::new());
+        w.0.push(1); // version
+        w.n(self.talks.len());
+        for t in &self.talks {
+            w.s(&t.talk);
+            w.n(t.lines.len());
+            for l in &t.lines {
+                w.0.push(l.thought as u8);
+                w.0.extend_from_slice(&l.ms.min(u16::MAX as u32 * 10).div_ceil(10).to_le_bytes()[..2]);
+                w.s(&l.text);
+            }
+        }
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Dialogue> {
+        let mut r = R(b, 0);
+        if r.u8()? != 1 {
+            return None;
+        }
+        let n = r.n()?;
+        let mut talks = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            let talk = r.s()?;
+            let k = r.n()?;
+            let mut lines = Vec::with_capacity(k.min(64));
+            for _ in 0..k {
+                let thought = r.u8()? != 0;
+                let ms = r.n()? as u32 * 10;
+                lines.push(Line { text: r.s()?, ms, thought });
+            }
+            talks.push(TalkLines { talk, lines });
+        }
+        Some(Dialogue { talks })
+    }
+
+    /// The lines of the talk played by the clip pair (m, a), if the dialogue has them.
+    pub fn lines_for(&self, m: &str, a: &str) -> Option<&[Line]> {
+        let (km, ka) = (talk_key(m), talk_key(a));
+        self.talks
+            .iter()
+            .find(|t| t.talk.eq_ignore_ascii_case(km) || t.talk.eq_ignore_ascii_case(ka))
+            .map(|t| t.lines.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod dialogue_tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn a_dialogue_round_trips_and_finds_its_talks() {
+        let d = Dialogue {
+            talks: vec![
+                TalkLines { talk: "Talk_01".into(), lines: vec![Line { text: "老师，过来这边。\n要和我一起坐吗？".into(), ms: 5300, thought: false }] },
+                TalkLines {
+                    talk: "Talk_02".into(),
+                    lines: vec![Line { text: "（只能更加努力了。）".into(), ms: 8170, thought: true }, Line { text: "现在…".into(), ms: 7000, thought: false }],
+                },
+            ],
+        };
+        let back = Dialogue::decode(&d.encode()).unwrap();
+        assert_eq!(back.talks[0], d.talks[0]);
+        // Durations are kept in 10 ms steps, rounded up.
+        assert_eq!(back.talks[1].lines[0].ms, 8170);
+        assert_eq!(back.lines_for("Talk_02_M", "Talk_02_A").map(|l| l.len()), Some(2));
+        assert_eq!(back.lines_for("Talk_03_M", "Talk_03_A"), None);
+        assert_eq!(talk_key("Talk_01_M"), "Talk_01");
+        assert_eq!(talk_key("Talk_01"), "Talk_01");
     }
 }
 

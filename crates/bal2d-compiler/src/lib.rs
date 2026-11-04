@@ -117,6 +117,9 @@ pub struct Options {
     /// Pack size the idle bake may grow the pack to (it is baked less often a second if the
     /// pack would be larger; packs go to the watch at some 40-60 KB/s).
     pub max_pack_bytes: usize,
+    /// What the talks say (shown in a speech bubble on the watch); only the talks the lobby
+    /// plays are kept.
+    pub dialogue: Option<bal2d_pack::Dialogue>,
 }
 
 impl Default for Options {
@@ -141,6 +144,7 @@ impl Default for Options {
             idle: true,
             idle_tolerance: idle::TOLERANCE,
             max_pack_bytes: 2_000_000,
+            dialogue: None,
         }
     }
 }
@@ -180,6 +184,8 @@ pub struct Report {
     pub hidden_layers: Vec<String>,
     /// The baked idle (see `idle`).
     pub idle: idle::IdleReport,
+    /// Talks whose lines went into the pack.
+    pub dialogue_talks: usize,
 }
 
 struct Layer {
@@ -869,6 +875,18 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
         sections.push(Section { kind: bal2d_pack::KIND_BAKE_SLOTS, layer: 0, index: 0, data: list.encode() });
     }
     sections.push(Section { kind: bal2d_pack::KIND_INTERACTIONS, layer: 0, index: 0, data: inter.encode() });
+    if let Some(d) = &opts.dialogue {
+        let talks: Vec<bal2d_pack::TalkLines> = d
+            .talks
+            .iter()
+            .filter(|t| !t.lines.is_empty() && inter.talks.iter().any(|(m, a)| [m, a].iter().any(|n| bal2d_pack::talk_key(n).eq_ignore_ascii_case(&t.talk))))
+            .cloned()
+            .collect();
+        report.dialogue_talks = talks.len();
+        if !talks.is_empty() {
+            sections.push(Section { kind: bal2d_pack::KIND_DIALOGUE, layer: 0, index: 0, data: bal2d_pack::Dialogue { talks }.encode() });
+        }
+    }
     let name = if opts.name.is_empty() { layers[main].name.clone() } else { opts.name.clone() };
     sections.push(Section { kind: bal2d_pack::KIND_NAME, layer: 0, index: 0, data: name.into_bytes() });
     let framings: Vec<(u8, f32, f32, f32)> = opts

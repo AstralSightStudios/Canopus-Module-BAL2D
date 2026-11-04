@@ -301,6 +301,25 @@ fn compile(args: &[String]) {
         Some("argb8565") => bal2d_pack::PageFormat::Argb8565,
         _ => bal2d_pack::PageFormat::Bgra8888,
     };
+    // `{"talks": [{"talk": "Talk_01", "lines": [{"text": "…", "ms": 5300, "thought": false}]}]}`
+    if let Some(path) = arg(args, "--dialogue") {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let talks = v["talks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| bal2d_pack::TalkLines {
+                talk: t["talk"].as_str().unwrap().to_string(),
+                lines: t["lines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|l| bal2d_pack::Line { text: l["text"].as_str().unwrap().to_string(), ms: l["ms"].as_u64().unwrap() as u32, thought: l["thought"].as_bool().unwrap_or(false) })
+                    .collect(),
+            })
+            .collect();
+        opts.dialogue = Some(bal2d_pack::Dialogue { talks });
+    }
     let inputs: Vec<bal2d_compiler::LayerInput> = skels
         .iter()
         .map(|p| {
@@ -332,6 +351,9 @@ fn compile(args: &[String]) {
     let out = arg(args, "--out").expect("--out");
     std::fs::write(&out, &bytes).unwrap();
     println!("compiled in {:.1}s: {} -> {} bytes ({:.1}%), budget scale {:.3}, camera {:?}", t0.elapsed().as_secs_f32(), original, bytes.len(), bytes.len() as f32 * 100.0 / original as f32, report.budget_scale, report.camera.unwrap());
+    if opts.dialogue.is_some() {
+        println!("dialogue: {} talks with lines", report.dialogue_talks);
+    }
     if !report.hidden_layers.is_empty() {
         println!("  left out {} (never shows: always behind another layer)", report.hidden_layers.join(", "));
     }

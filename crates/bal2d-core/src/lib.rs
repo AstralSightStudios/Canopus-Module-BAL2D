@@ -108,6 +108,8 @@ struct ActiveDrag {
     /// Bone setup local position and current overridden position.
     origin: (f32, f32),
     pos: (f32, f32),
+    /// Nothing played on tracks 1 and 2 at the press (a quick release may then be a tap).
+    was_free: bool,
 }
 
 /// Something the platform may want to react to (voice playback, subtitles).
@@ -120,6 +122,12 @@ pub enum Notice {
 
 /// How long the framing takes to move to another phase's camera (seconds).
 pub const CAMERA_BLEND_S: f32 = 0.6;
+
+/// A press released this soon (seconds) and this close to where it started (screen pixels) is a
+/// tap, even when a drag's trigger delay already ran out (the eye follow starts after 0.1 s,
+/// shorter than many a finger's tap).
+pub const TAP_MAX_S: f32 = 0.35;
+pub const TAP_SLOP_PX: f32 = 14.0;
 
 pub struct Lobby {
     pub layers: Vec<Layer>,
@@ -137,6 +145,8 @@ pub struct Lobby {
     pub width: f32,
     pub height: f32,
     pub name: String,
+    /// Per talk (`interactions.talks`): what it says, for the speech bubble (empty: nothing).
+    pub lines: Vec<Vec<bal2d_pack::Line>>,
     talk_next: usize,
     drag: Option<ActiveDrag>,
     pending_tap: bool,
@@ -260,6 +270,17 @@ impl Lobby {
             Some(e) => String::from_utf8(bal2d_pack::read_section_vec(src, e).map_err(LoadError::Pack)?).unwrap_or_default(),
             None => String::new(),
         };
+        // A pack without it (or one the module cannot read) just shows no bubble.
+        let dialogue = match idx.find(bal2d_pack::KIND_DIALOGUE, 0, 0) {
+            Some(e) => bal2d_pack::read_section_vec(src, e).ok().and_then(|b| bal2d_pack::Dialogue::decode(&b)),
+            None => None,
+        };
+        let lines = interactions
+            .talks
+            .iter()
+            .map(|(m, a)| dialogue.as_ref().and_then(|d| d.lines_for(m, a)).map(|l| l.to_vec()).unwrap_or_default())
+            .collect();
+        drop(dialogue);
         // The baked idle is read on request (`load_idle`): the watch reads it last, if memory
         // is left once everything else is in.
         let idle_entries: Vec<Option<bal2d_pack::Entry>> = (0..layers.len()).map(|li| idx.find(bal2d_pack::KIND_IDLE, li as u16, 0).copied()).collect();
@@ -277,6 +298,7 @@ impl Lobby {
             width: h.screen_width as f32,
             height: h.screen_height as f32,
             name,
+            lines,
             talk_next: 0,
             drag: None,
             pending_tap: false,
@@ -450,6 +472,11 @@ impl Lobby {
         if !self.is_idle() || !self.is_free() || self.interactions.talks.is_empty() {
             return;
         }
+        self.start_talk();
+    }
+
+    /// The next talk, over whatever tracks 1 and 2 play (`tap` checks they are free).
+    fn start_talk(&mut self) {
         let i = self.talk_next % self.interactions.talks.len();
         self.talk_next = i + 1;
         let (m, a) = self.interactions.talks[i].clone();
@@ -535,7 +562,9 @@ impl Lobby {
                             Some(d) if d.bone == bone => d.pos,
                             _ => origin,
                         };
+                        let was_free = self.is_free();
                         self.drag = Some(ActiveDrag {
+                            was_free,
                             cam: self.camera,
                             drag: i,
                             bone,
@@ -577,9 +606,17 @@ impl Lobby {
                         self.tap();
                     }
                     DragPhase::Dragging => {
-                        let drag = self.interactions.drags[d.drag].clone();
-                        self.play_pair(&drag.end_m, &drag.end_a, false);
+                        let (dx, dy) = (d.finger.0 - d.start.0, d.finger.1 - d.start.1);
+                        let slop = TAP_SLOP_PX / d.cam.scale.max(1e-6);
+                        let quick = d.elapsed < TAP_MAX_S && dx * dx + dy * dy <= slop * slop;
                         self.drag = Some(ActiveDrag { phase: DragPhase::Releasing, ..d });
+                        if quick && d.was_free && self.is_idle() && !self.interactions.talks.is_empty() {
+                            // A tap after all: the talk replaces the drag's clips.
+                            self.start_talk();
+                        } else {
+                            let drag = self.interactions.drags[d.drag].clone();
+                            self.play_pair(&drag.end_m, &drag.end_a, false);
+                        }
                     }
                     DragPhase::Releasing => {}
                 }
