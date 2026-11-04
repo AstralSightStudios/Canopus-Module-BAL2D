@@ -154,6 +154,10 @@ pub struct Lobby {
     /// Total animation time (seconds).
     pub time: f32,
     pub bake: Option<Bake>,
+    /// Per layer, per slot: in the pack's background image (`Bake::masks`), kept when the host
+    /// leaves the image out (`bake` None): the baked idle was recorded without those slots, so
+    /// they are then drawn live under it.
+    static_masks: Vec<Vec<bool>>,
     /// Per layer: its idle loop baked into GPU calls (`idle`), once loaded (`load_idle`).
     pub idle: Vec<Option<idle::IdleLayer>>,
     /// The part of the layer `draw_idle` is drawn for (layer pixels: x0, y0, x1, y1), when only
@@ -163,6 +167,12 @@ pub struct Lobby {
     /// fill for some CPU. The watch decides by measuring both (wholly covered calls are left out
     /// either way).
     pub idle_clip: bool,
+    /// Layers drawn this frame partly from their bakes while a talk plays (`update_with`; they
+    /// are posed, and `draw_idle` draws their steady slots from the bake).
+    pub hybrid: u32,
+    /// Clustering tolerance of what a bake's frame draws live (its live runs, a talk's moving
+    /// slots); the watch sets its adaptive one.
+    pub live_tolerance: f32,
     /// Per layer: the pack section of its baked idle, if it has one.
     pub idle_entries: Vec<Option<bal2d_pack::Entry>>,
     /// Per layer: time its baked idle has played that its skeleton has not (`update_with`).
@@ -308,10 +318,13 @@ impl Lobby {
             pending_tap: false,
             notices: Vec::new(),
             time: 0.0,
+            static_masks: bake.as_ref().map(|b| b.masks.clone()).unwrap_or_default(),
             bake,
             idle_pending: alloc::vec![0.0; layers_len],
             idle_view: None,
             idle_clip: true,
+            hybrid: 0,
+            live_tolerance: 1.0,
             idle,
             idle_entries,
         };
@@ -683,6 +696,7 @@ impl Lobby {
         self.update_drag(dt);
         self.update_camera(dt);
         let baked: u32 = if use_bakes { (0..self.layers.len().min(32)).filter(|&i| self.layer_idle_ready(i)).fold(0, |m, i| m | 1 << i) } else { 0 };
+        self.hybrid = if use_bakes { (0..self.layers.len().min(32)).filter(|&i| baked & (1 << i) == 0 && self.layer_hybrid_ready(i)).fold(0, |m, i| m | 1 << i) } else { 0 };
         let main = self.main();
         let drag = self.drag.as_ref().map(|d| (d.bone, d.pos));
         for i in 0..self.layers.len() {
@@ -719,7 +733,7 @@ impl Lobby {
                 }
             }
         }
-        baked
+        baked | self.hybrid
     }
 
     /// Whether layer `layer` plays only its idle loop, as its bake has it: the looping animation
@@ -749,6 +763,25 @@ impl Lobby {
                 e.animation.is_none() && e.mixing_from.is_none() && e.next.is_none()
             }
         })
+    }
+
+    /// Whether the main layer plays a talk over its idle loop as its bake has the loop (track 0
+    /// unmixed, the idle framing, no finger or drag), and the bake has slots the talks leave
+    /// alone: those can be drawn from the bake while the rest is drawn live.
+    pub fn layer_hybrid_ready(&self, layer: usize) -> bool {
+        let (Some(l), Some(Some(b))) = (self.layers.get(layer), self.idle.get(layer)) else { return false };
+        if layer != self.main() || b.bake.steady.is_empty() || self.activity != Some(bal2d_pack::phase::TALK) || self.drag.is_some() || self.pending_tap {
+            return false;
+        }
+        if self.cam_t < 1.0 || self.camera != self.cameras[bal2d_pack::phase::IDLE as usize] {
+            return false;
+        }
+        if self.bake.is_some() && !self.bake_active() {
+            return false;
+        }
+        let Some(e) = l.state.current(0) else { return false };
+        let e = l.state.entry(e);
+        e.animation == Some(b.bake.animation as usize) && e.looped && e.mixing_from.is_none() && e.next.is_none()
     }
 
     /// Every layer can be drawn from its bake (`layer_idle_ready`).
@@ -790,7 +823,17 @@ impl Lobby {
         let Some(e) = l.state.current(0) else { return 0 };
         let tau = idle::wrap(l.state.entry(e).track_time + pending - b.bake.start, b.bake.period);
         let view = self.idle_view.unwrap_or([0.0, 0.0, size.0, size.1]);
-        b.draw(&l.data, &l.skeleton, cam, tau, origin, size, view, above, self.idle_clip, page_size, emit)
+        let hybrid = self.hybrid & (1 << layer.min(31)) != 0;
+        b.live_paths_tolerance(self.live_tolerance);
+        // The background image left out: its slots (the bottom of the draw order, never
+        // moving) drawn live first.
+        let mut tris = 0;
+        if self.bake.is_none() {
+            if let Some(m) = self.static_masks.get(layer).filter(|m| m.iter().any(|&x| x)) {
+                tris += b.draw_slots_live(&l.data, &l.skeleton, cam, size, page_size, emit, m);
+            }
+        }
+        tris + b.draw(&l.data, &l.skeleton, cam, tau, origin, size, view, above, self.idle_clip, hybrid, page_size, emit)
     }
 
     /// Whether a loaded bake has shapes `idle_clip` would clip.

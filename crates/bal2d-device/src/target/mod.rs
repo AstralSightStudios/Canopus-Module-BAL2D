@@ -1097,9 +1097,10 @@ fn adapt_quality(now: u32) {
     if now.wrapping_sub(r.quality_changed) < 3000 {
         return;
     }
+    // (A talk's frame drawn partly from the bake counts as live: its moving slots are grouped.)
     let live = r.lobby.as_ref().is_some_and(|l| {
         let all = (1u32 << l.layers.len().min(31)) - 1;
-        r.baked_mask & all != all
+        (r.baked_mask & !l.hybrid) & all != all
     });
     if !live {
         return;
@@ -1330,6 +1331,10 @@ extern "C" fn frame(timer: *mut c_void) {
     let baked = lobby.update_with(dt_ms as f32 / 1000.0, !r.idle_off);
     r.idle_active = baked != 0;
     r.baked_mask = baked;
+    if lobby.hybrid != 0 && !r.clip_ab.talk_traced {
+        r.clip_ab.talk_traced = true;
+        trace(&alloc::format!("a talk drawn partly from the bake (layers {:#x})", lobby.hybrid));
+    }
     // A talk with lines: its speech bubble (LVGL draws it over the layer).
     let b = bubble::bubble();
     for n in &lobby.notices {
@@ -1694,13 +1699,15 @@ pub struct ClipAb {
     frames: [u32; 2],
     windows: u32,
     done: bool,
+    /// The first talk drawn partly from the bake was logged (per lobby too).
+    talk_traced: bool,
 }
 
 impl ClipAb {
     const WINDOWS: u32 = 12;
 
     const fn new() -> ClipAb {
-        ClipAb { sum: [0; 2], frames: [0; 2], windows: 0, done: false }
+        ClipAb { sum: [0; 2], frames: [0; 2], windows: 0, done: false, talk_traced: false }
     }
 }
 
@@ -1708,7 +1715,7 @@ impl ClipAb {
 fn clip_ab_frame(r: &mut Runtime, cost: u32) {
     let Some(lobby) = r.lobby.as_ref() else { return };
     let all = (1u32 << lobby.layers.len().min(31)) - 1;
-    if r.clip_ab.done || r.baked_mask & all != all {
+    if r.clip_ab.done || (r.baked_mask & !lobby.hybrid) & all != all {
         return;
     }
     let k = lobby.idle_clip as usize;
@@ -1818,6 +1825,7 @@ fn render(r: &mut Runtime, target: &mut gpu::VgBuffer, offset: (i32, i32), clip:
     // A partial redraw: baked calls outside it build no path (a pixel of margin).
     let view = [(clip[0] - offset.0 - 1) as f32, (clip[1] - offset.1 - 1) as f32, (clip[2] - offset.0 + 1) as f32, (clip[3] - offset.1 + 1) as f32];
     lobby.idle_view = (view[0] > 0.0 || view[1] > 0.0 || view[2] < size.0 || view[3] < size.1).then_some(view);
+    lobby.live_tolerance = renderer.paths.tolerance;
     for li in 0..lobby.layers.len() {
         let Some(pages) = pages.get_mut(li) else { break };
         renderer.hangs.layer = li as u32;

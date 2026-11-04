@@ -25,6 +25,10 @@ const QUANT_MARGIN: f32 = 0.06;
 pub const RATE: f32 = 30.0;
 pub const MAX_FRAMES: f32 = 600.0;
 pub const HOLD_RATE: f32 = 12.0;
+/// Most bytes the bakes may take unpacked: the watch holds them in its heap next to the pages
+/// (Neru's 2.6 MB at 30 frames a second never loaded and its idle was drawn live; Hoshino's
+/// 1.45 MB does). Above it the rate is halved, as for a pack over its size.
+pub const MAX_RAW_BYTES: usize = 1_600_000;
 /// Groups a carried-over grouping may have beyond a fresh one before it is redone.
 const SLACK: usize = 0;
 /// Longest the lobby is played looking for the idle loop (seconds).
@@ -40,6 +44,8 @@ pub struct IdleReport {
     pub rate: f32,
     /// What the fill pass left out (`crate::cull`).
     pub cull: crate::cull::CullReport,
+    /// Slots of the main layer the talks leave alone (`crate::steady`).
+    pub steady: usize,
 }
 
 /// One attachment's batch in a pose.
@@ -438,10 +444,25 @@ pub fn bake(pack: &[u8], max_rate: f32, tolerance: f32) -> (Vec<(u16, IdleBake)>
             eprintln!("layer {li}: {:.0} calls/frame, {:.1} could join the call before (same page, blend, tint, affine)", total_calls as f32 / frames as f32, mergeable as f32 / frames as f32);
         }
         let stream = IdleBake::encode_frames(&calls, shapes.len());
-        let bake = IdleBake { animation: animation as u16, rate, period, start, shapes, meshes: Vec::new(), regions: Default::default(), colors, live, frames: frames as u16, stream };
+        let bake = IdleBake { animation: animation as u16, rate, period, start, shapes, meshes: Vec::new(), regions: Default::default(), steady: Vec::new(), colors, live, frames: frames as u16, stream };
         let bytes = bake.encode().len();
         report.layers.push((frames as u16, total_calls as f32 / frames as f32, bake.shapes.len(), bytes));
         out.push((li as u16, bake));
+    }
+    // Slots the talks leave alone stay on the main layer's bake during a talk.
+    if std::env::var("BAL2D_NO_STEADY").is_err() {
+        if let Some((main, steady)) = crate::steady::steady_slots(pack) {
+            if let Some((_, b)) = out.iter_mut().find(|(li, _)| *li as usize == main) {
+                let mut bits = vec![0u8; steady.len().div_ceil(8)];
+                for (i, &k) in steady.iter().enumerate() {
+                    if k {
+                        bits[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                report.steady = steady.iter().filter(|&&k| k).count();
+                b.steady = bits;
+            }
+        }
     }
     if std::env::var("BAL2D_NO_CULL").is_err() {
         let mut textures: Vec<Vec<crate::raster::Texture>> = (0..lobby.layers.len()).map(|_| Vec::new()).collect();

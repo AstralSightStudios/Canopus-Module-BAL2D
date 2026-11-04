@@ -642,6 +642,10 @@ pub struct IdleBake {
     /// a shape's calls are clipped by [`IdleShape::clip`] 1, 2 and 3: the screen less what is
     /// always covered by opaque pixels drawn later, in every frame, with a margin. Empty: none.
     pub regions: [Vec<[i16; 4]>; 3],
+    /// One bit per slot (LSB first; empty: none): slots the lobby's talks leave where the idle
+    /// loop has them, drawn from the bake during a talk while the rest is drawn live (the main
+    /// layer only).
+    pub steady: Vec<u8>,
     /// Straight RGBA8 tints (R in the low byte).
     pub colors: Vec<u32>,
     /// Runs of slots drawn live, not from the bake (clipped ones, with their clipping slot): a
@@ -723,7 +727,7 @@ impl IdleBake {
     /// Version 3, or 4 when there are meshes or clipped shapes (older modules then go without
     /// the bake rather than draw it wrong). Version 4 stores triangle lists as runs.
     pub fn encode(&self) -> Vec<u8> {
-        let v4 = !self.meshes.is_empty() || self.shapes.iter().any(|s| s.clip != 0) || self.regions.iter().any(|r| !r.is_empty());
+        let v4 = !self.meshes.is_empty() || self.shapes.iter().any(|s| s.clip != 0) || self.regions.iter().any(|r| !r.is_empty()) || !self.steady.is_empty();
         let mut v = Vec::new();
         v.push(if v4 { 4u8 } else { 3 });
         v.extend_from_slice(&self.animation.to_le_bytes());
@@ -782,6 +786,8 @@ impl IdleBake {
                     }
                 }
             }
+            v.extend_from_slice(&(self.steady.len() as u16).to_le_bytes());
+            v.extend_from_slice(&self.steady);
         }
         v.extend_from_slice(&(self.colors.len() as u16).to_le_bytes());
         for c in &self.colors {
@@ -847,6 +853,7 @@ impl IdleBake {
         }
         let mut meshes = Vec::new();
         let mut regions: [Vec<[i16; 4]>; 3] = Default::default();
+        let mut steady = Vec::new();
         if version == 4 {
             let nm = r.u16()? as usize;
             meshes.reserve_exact(nm);
@@ -884,6 +891,9 @@ impl IdleBake {
                     reg.push(q);
                 }
             }
+            let n = r.u16()? as usize;
+            steady = r.d.get(r.at..r.at + n)?.to_vec();
+            r.at += n;
         }
         let nc = r.u16()? as usize;
         let mut colors = Vec::with_capacity(nc);
@@ -911,7 +921,7 @@ impl IdleBake {
         // (shrinking leaves the block where it is). Kept, it made a baked idle take about 1.6 to
         // 2 times its size on the watch.
         d.shrink_to_fit();
-        Some(IdleBake { animation, rate, period, start, shapes, meshes, regions, colors, live, frames, stream: d })
+        Some(IdleBake { animation, rate, period, start, shapes, meshes, regions, steady, colors, live, frames, stream: d })
     }
 }
 
@@ -1334,7 +1344,7 @@ mod idle_tests {
             vec![call(0, 101, Some([1, 2, 3, 4, 5, 6])), call(1, 31, None)],
         ];
         let stream = IdleBake::encode_frames(&frames, 2);
-        let bake = IdleBake { animation: 3, rate: 30.0, period: 0.1, start: 0.25, shapes: vec![shape(0), shape(1)], meshes: Vec::new(), regions: Default::default(), colors: vec![0xFFFF_FFFF, 0x8000_00FF], live: vec![vec![4, 5]], frames: 3, stream };
+        let bake = IdleBake { animation: 3, rate: 30.0, period: 0.1, start: 0.25, shapes: vec![shape(0), shape(1)], meshes: Vec::new(), regions: Default::default(), steady: Vec::new(), colors: vec![0xFFFF_FFFF, 0x8000_00FF], live: vec![vec![4, 5]], frames: 3, stream };
         let back = IdleBake::decode(&bake.encode()).unwrap();
         assert_eq!(back, bake);
         let mut c = IdleCursor::new(2);
@@ -1364,7 +1374,7 @@ mod idle_tests {
         let stream = IdleBake::encode_frames(&[vec![IdleCall { shape: 0, color: 0, m0: [0; 6], m1: None }]], 2);
         let mesh = |att: u32| IdleMesh { attachment: att, uvs: vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.5, 0.5], tris: vec![0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4], solo: vec![0x12] };
         let regions = [vec![[0, 0, 10, 20]], Vec::new(), vec![[5, 5, 6, 6], [-3, 0, 400, 480]]];
-        let bake = IdleBake { animation: 0, rate: 30.0, period: 1.0, start: 0.0, shapes: vec![a.clone(), b], meshes: vec![mesh(2), mesh(9)], regions, colors: vec![0], live: Vec::new(), frames: 1, stream };
+        let bake = IdleBake { animation: 0, rate: 30.0, period: 1.0, start: 0.0, shapes: vec![a.clone(), b], meshes: vec![mesh(2), mesh(9)], regions, steady: vec![0b101, 1], colors: vec![0], live: Vec::new(), frames: 1, stream };
         let bytes = bake.encode();
         assert_eq!(bytes[0], 4);
         let back = IdleBake::decode(&bytes).unwrap();
@@ -1373,7 +1383,7 @@ mod idle_tests {
         assert!(back.mesh(3).is_none());
         // Without either, the old version.
         a.clip = 0;
-        let old = IdleBake { shapes: vec![a], meshes: Vec::new(), regions: Default::default(), ..bake };
+        let old = IdleBake { shapes: vec![a], meshes: Vec::new(), regions: Default::default(), steady: Vec::new(), ..bake };
         assert_eq!(old.encode()[0], 3);
         assert_eq!(IdleBake::decode(&old.encode()).unwrap(), old);
     }

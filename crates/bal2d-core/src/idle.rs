@@ -46,6 +46,14 @@ pub struct IdleLayer {
     cells: [Vec<u32>; 3],
     /// Work counters (tools): vertices placed, calls clipped, calls left out as covered.
     pub work: [u32; 4],
+    /// Per slot: drawn from the bake during a talk (`IdleBake::steady`, less the live runs'
+    /// slots); empty when the bake has none. A talk's frame draws the rest live, in runs of
+    /// consecutive slots of the draw order (`hybrid_runs`, positions), interleaved with the
+    /// baked calls by draw order (`pos_of`).
+    steady: Vec<bool>,
+    pos_of: Vec<u16>,
+    hybrid_runs: Vec<(u16, u16)>,
+    hybrid_skip: Vec<bool>,
     path: Vec<i16>,
     /// Per vertex of the attachment being drawn: summed positions (path units) and count, then
     /// the averaged position.
@@ -145,6 +153,18 @@ impl IdleLayer {
         }
         all.shrink_to_fit();
         outline.shrink_to_fit();
+        // Slots that stay on the bake during a talk: not those of live runs.
+        let mut steady: Vec<bool> = Vec::new();
+        if !bake.steady.is_empty() {
+            steady = (0..data.slots.len()).map(|i| bake.steady.get(i / 8).is_some_and(|b| b >> (i % 8) & 1 != 0)).collect();
+            for run in &bake.live {
+                for &sl in run {
+                    if let Some(x) = steady.get_mut(sl as usize) {
+                        *x = false;
+                    }
+                }
+            }
+        }
         let live_skip: Vec<Vec<bool>> = bake
             .live
             .iter()
@@ -175,6 +195,10 @@ impl IdleLayer {
             clip: ClipScratch::default(),
             cells: core::array::from_fn(|i| cells_of(&bake.regions[i])),
             work: [0; 4],
+            steady,
+            pos_of: Vec::new(),
+            hybrid_runs: Vec::new(),
+            hybrid_skip: Vec::new(),
             path: Vec::new(),
             acc: Vec::new(),
             fixed: Vec::new(),
@@ -229,6 +253,11 @@ impl IdleLayer {
         true
     }
 
+    /// The clustering tolerance of what is drawn live (`Lobby::live_tolerance`).
+    pub fn live_paths_tolerance(&mut self, t: f32) {
+        self.live_paths.tolerance = t;
+    }
+
     /// Memory held besides the bake, by part (for tools).
     pub fn sizes(&self) -> alloc::string::String {
         alloc::format!(
@@ -273,7 +302,8 @@ impl IdleLayer {
     /// `sk` (posed) and `cam` (skeleton -> target, as `Paths::draw` takes it) are for the live
     /// runs. `above`: every layer above is drawn from its bake this frame (what they always
     /// cover can be clipped away); `clip`: clip the shapes marked for it (else only calls wholly
-    /// covered are left out).
+    /// covered are left out); `hybrid`: a talk plays, `sk` is posed, and only the steady slots
+    /// come from the bake (`IdleBake::steady`), the rest is drawn live.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
@@ -286,9 +316,11 @@ impl IdleLayer {
         view: [f32; 4],
         above: bool,
         clip: bool,
+        hybrid: bool,
         page_size: &dyn Fn(u32) -> Option<(f32, f32)>,
         emit: &mut dyn FnMut(&Call),
     ) -> u32 {
+        let hybrid = hybrid && !self.steady.is_empty();
         // The visible rectangles in path units of this target.
         let k = bal2d_render::PATH_SCALE;
         for (out, reg) in self.rects.iter_mut().zip(&self.bake.regions) {
@@ -298,9 +330,10 @@ impl IdleLayer {
                 [f(q[0], origin.0), f(q[1], origin.1), f(q[2], origin.0), f(q[3], origin.1)]
             }));
         }
-        let clip_mask = bal2d_pack::IDLE_CLIP_LATER | if above { bal2d_pack::IDLE_CLIP_ABOVE } else { 0 };
+        // In a talk's frame the layer's own later calls may be live and move: no "later" cover.
+        let clip_mask = if hybrid { 0 } else { bal2d_pack::IDLE_CLIP_LATER } | if above { bal2d_pack::IDLE_CLIP_ABOVE } else { 0 };
         // The region a shape's calls must meet to show (index into `rects`), by its bits.
-        let has: [bool; 3] = core::array::from_fn(|i| !self.bake.regions[i].is_empty());
+        let has: [bool; 3] = core::array::from_fn(|i| !self.bake.regions[i].is_empty() && !(hybrid && i != 1));
         let shows_in = move |clip: u8| -> Option<usize> {
             let before = clip & bal2d_pack::IDLE_BEFORE != 0 && has[0];
             match (before, above && has[1]) {
@@ -320,8 +353,49 @@ impl IdleLayer {
         // Calls wholly outside the part drawn (path units) build no path.
         let (vx0, vy0, lx, ly) = (path_coord(view[0]), path_coord(view[1]), path_coord(view[2]), path_coord(view[3]));
         let mut triangles = 0;
+        // A talk's frame: the runs of slots drawn live, by draw-order position.
+        let mut next_run = 0;
+        if hybrid {
+            self.pos_of.clear();
+            self.pos_of.resize(data.slots.len(), u16::MAX);
+            self.hybrid_runs.clear();
+            let mut open: Option<u16> = None;
+            for (p, &slot) in sk.draw_order.iter().enumerate() {
+                if let Some(x) = self.pos_of.get_mut(slot as usize) {
+                    *x = p as u16;
+                }
+                let live = !self.steady.get(slot as usize).copied().unwrap_or(false);
+                match (live, open) {
+                    (true, None) => open = Some(p as u16),
+                    (false, Some(a)) => {
+                        self.hybrid_runs.push((a, p as u16));
+                        open = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(a) = open {
+                self.hybrid_runs.push((a, sk.draw_order.len() as u16));
+            }
+        }
         let mut i = 0;
         while i < self.cur.len() {
+            if hybrid {
+                if self.cur[i].shape == bal2d_pack::IDLE_LIVE {
+                    i += 1;
+                    continue;
+                }
+                let slot = self.bake.shapes.get(self.cur[i].shape as usize).map_or(0, |s| s.slot);
+                let p = self.pos_of.get(slot as usize).copied().unwrap_or(u16::MAX);
+                while next_run < self.hybrid_runs.len() && self.hybrid_runs[next_run].0 < p {
+                    triangles += self.draw_run(data, sk, cam, size, page_size, emit, next_run);
+                    next_run += 1;
+                }
+                if !self.steady.get(slot as usize).copied().unwrap_or(false) {
+                    i += 1;
+                    continue;
+                }
+            }
             if self.cur[i].shape == bal2d_pack::IDLE_LIVE {
                 let run = self.cur[i].color as usize;
                 i += 1;
@@ -502,7 +576,40 @@ impl IdleLayer {
                 emit(&Call { page, blend, color, path, bounds: [lo[0], lo[1], hi[0], hi[1]], matrix: *m, rect: None, tag: 1 << 31 | c.shape as u32 });
             }
         }
+        while hybrid && next_run < self.hybrid_runs.len() {
+            triangles += self.draw_run(data, sk, cam, size, page_size, emit, next_run);
+            next_run += 1;
+        }
+
         triangles
+    }
+
+    /// Draws live the slots `only` marks (as the draw list builds them). Returns its triangles.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_slots_live(&mut self, data: &SkeletonData, sk: &Skeleton, cam: (f32, f32, f32), size: (f32, f32), page_size: &dyn Fn(u32) -> Option<(f32, f32)>, emit: &mut dyn FnMut(&Call), only: &[bool]) -> u32 {
+        self.hybrid_skip.clear();
+        self.hybrid_skip.extend(only.iter().map(|&x| !x));
+        bal2d_render::build_masked(data, sk, &mut self.live_list, Some(&self.hybrid_skip));
+        let before = self.live_paths.triangles;
+        self.live_paths.draw(0, &self.live_list, cam, size, page_size, |c| emit(c));
+        self.live_paths.triangles - before
+    }
+
+    /// Draws live the slots of a talk frame's run `k` (`hybrid_runs`). Returns its triangles.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_run(&mut self, data: &SkeletonData, sk: &Skeleton, cam: (f32, f32, f32), size: (f32, f32), page_size: &dyn Fn(u32) -> Option<(f32, f32)>, emit: &mut dyn FnMut(&Call), k: usize) -> u32 {
+        let (a, b) = self.hybrid_runs[k];
+        self.hybrid_skip.clear();
+        self.hybrid_skip.resize(data.slots.len(), true);
+        for &slot in &sk.draw_order[a as usize..b as usize] {
+            if let Some(x) = self.hybrid_skip.get_mut(slot as usize) {
+                *x = false;
+            }
+        }
+        bal2d_render::build_masked(data, sk, &mut self.live_list, Some(&self.hybrid_skip));
+        let before = self.live_paths.triangles;
+        self.live_paths.draw(0, &self.live_list, cam, size, page_size, |c| emit(c));
+        self.live_paths.triangles - before
     }
 }
 

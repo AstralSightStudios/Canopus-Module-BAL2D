@@ -16,6 +16,7 @@ pub mod image;
 mod bake;
 pub mod cull;
 mod hidden;
+mod steady;
 pub mod idle;
 mod prune;
 mod simplify;
@@ -922,13 +923,16 @@ fn compile_once(inputs: &[LayerInput], opts: &Options, interactions: Option<Inte
         let (bakes, mut rep) = idle::bake(&probe, rate, opts.idle_tolerance);
         rep.rate = rate;
         let mut with = sections.clone();
+        let mut raw = 0;
         for (li, b) in bakes {
-            with.push(Section { kind: bal2d_pack::KIND_IDLE, layer: li, index: 0, data: b.encode() });
+            let data = b.encode();
+            raw += data.len();
+            with.push(Section { kind: bal2d_pack::KIND_IDLE, layer: li, index: 0, data });
         }
         report.idle = rep;
         progress.at(Stage::Writing, 0.97);
         let bytes = bal2d_pack::write(&header, &with, 9);
-        if bytes.len() <= opts.max_pack_bytes || rate <= idle::RATE / 4.0 + 0.01 {
+        if (bytes.len() <= opts.max_pack_bytes && raw <= idle::MAX_RAW_BYTES) || rate <= idle::RATE / 4.0 + 0.01 {
             break bytes;
         }
         rate *= 0.5;

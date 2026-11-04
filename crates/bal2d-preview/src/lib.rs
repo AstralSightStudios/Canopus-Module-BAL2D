@@ -126,7 +126,14 @@ impl PackPreview {
             if mask & (1 << li) == 0 {
                 continue;
             }
-            if self.use_idle && self.lobby.layer_idle_ready(li) {
+            // A talk's frame: the steady slots from the bake, the rest live (as the watch).
+            let hybrid = self.use_idle && !self.lobby.layer_idle_ready(li) && self.lobby.layer_hybrid_ready(li);
+            if hybrid {
+                self.lobby.hybrid |= 1 << li.min(31);
+            } else {
+                self.lobby.hybrid &= !(1 << li.min(31));
+            }
+            if self.use_idle && (self.lobby.layer_idle_ready(li) || hybrid) {
                 let pages = &self.pages[li];
                 let size = |p: u32| pages.get(p as usize).map(|t| (t.width as f32, t.height as f32));
                 self.lobby.draw_idle(li, (0.0, 0.0), (w as f32, h as f32), &size, &mut |call| {
