@@ -41,7 +41,7 @@ BAL2D 是一个 Canopus 模块（`ba_l2d`）。它让小米手环 10 Pro（固�
 
 ### 在线角色库与对话气泡
 
-- **在线角色库**（“导入角色”页最上方）：点“载入角色列表”，插件下载第三方社区整理的大厅清单（约 280 个记忆大厅，按中文名、韩文名或 ID 搜索），点某一行的“下载并导入”即可：插件在手机上下载这个大厅的 `.skel`、`.atlas` 和图集用到的全部 `.png`（有背景骨骼的大厅，如星野、明里、柚子，一并下载），按当前的编译设置编译并预览；连着手表且“下载后直接安装到手表”开着（默认）时直接安装。手动添加文件的方式保持不变。
+- **在线角色库**（“导入角色”页最上方）：点“载入角色列表”，插件下载第三方社区整理的大厅清单（约 280 个记忆大厅，按中文名、韩文名或 ID 搜索），点某一行的“下载并导入”即可：插件在手机上下载这个大厅的 `.skel`、`.atlas` 和图集用到的全部 `.png`（有背景骨骼的大厅，如星野、明里、柚子，一并下载），按当前的编译设置编译并预览；连着手表且“下载后直接安装到手表”开着（默认）时直接安装。想先调整画面范围就点旁边的“下载并取景”：只下载素材并打开取景器，不编译也不安装，调整好后点“编译并预览”“安装到手表”。手动添加文件的方式保持不变。
 - **素材来源**：大厅素材来自社区仓库 [asdfdsa12/BA-Spine-Viewer-Asset](https://github.com/asdfdsa12/BA-Spine-Viewer-Asset)（清单为 [asdfdsa12/BA-Spine-Viewer](https://github.com/asdfdsa12/BA-Spine-Viewer) 的 `memorial/Characters.json`），中文名来自 [SchaleDB](https://schaledb.com)，大厅与学生的对应关系及对话台词来自 [electricgoat/ba-data](https://github.com/electricgoat/ba-data) 的游戏数据表（`MemoryLobbyExcelTable`、`CharacterDialogExcelTable`）。这些都是第三方仓库，由手机直接从它们（或下面的 CDN 线路）下载；本项目不托管、不转存、也不分发其中任何文件，素材仅限个人使用。
 - **下载线路**：“自动”依次尝试 jsDelivr（cdn）、jsDelivr（fastly）、GitHub 直连，记住本次会话里成功的那一条；也可以固定为 jsDelivr 或 GitHub 直连，或选“自定义”填一个加在 GitHub 原始链接前的代理前缀（如 `https://ghfast.top/`，失败时再走自动线路）。中国大陆访问 `raw.githubusercontent.com` 常常不通，一般用 jsDelivr 或自定义前缀。JSON 表格按 gzip 下载（对话表约 2.3 MB，解压后约 15 MB，边解压边解析，只保留记忆大厅台词）。
 - **对话气泡**：编译设置里的“气泡文字”可选简体中文（默认）、繁體中文、日本語、English 或关闭。角色包里写入大厅会播放的每段对话的台词（每句的显示时长、是否是内心独白），手表在对话时显示气泡。简体中文由游戏繁体中文（台服）台词逐字转换，字表取自 [OpenCC](https://github.com/BYVoid/OpenCC) 的 `TSCharacters.txt`（Apache-2.0，见 `plugins/astrobox-bal2d-import/src/ts_chars.txt` 与 `scripts/gen_ts_table.py`）；国际服数据表里还没有的新角色用日服台词。手动导入的大厅按骨骼、图集文件名或图集里的贴图页名找到对应学生，同样带台词；离线时照常编译，只是没有气泡。对话表每次打开插件只下载一次。

@@ -51,6 +51,7 @@ const EV_LANG: &str = "input:lang";
 const EV_LIB_LOAD: &str = "action:lib.load";
 const EV_LIB_QUERY: &str = "input:lib.query";
 const EV_LIB_GET: &str = "action:lib.get.";
+const EV_LIB_FRAME: &str = "action:lib.frame.";
 const EV_LIB_ROUTE: &str = "input:lib.route";
 const EV_LIB_PREFIX: &str = "input:lib.prefix";
 const EV_LIB_AUTO: &str = "action:lib.auto";
@@ -206,6 +207,7 @@ pub async fn on_event(event: &str, payload: &str) {
         }
         EV_LIB_AUTO => state::with_state(|s| s.lib.auto_install = !s.lib.auto_install),
         e if e.starts_with(EV_LIB_GET) => download_lobby(&e[EV_LIB_GET.len()..]).await,
+        e if e.starts_with(EV_LIB_FRAME) => download_for_framing(&e[EV_LIB_FRAME.len()..]).await,
         EV_ZOOM => {
             state::with_state(|s| {
                 s.zoom = value.parse().unwrap_or(100);
@@ -499,15 +501,15 @@ async fn load_library() {
     }
 }
 
-/// One click in the online library: downloads the lobby's files into the asset list (replacing
-/// it), names the pack after the student, builds it with the current settings and, if the
-/// watch is connected and the toggle is on, installs it.
-async fn download_lobby(id: &str) {
+/// Downloads a library lobby's files into the asset list (replacing it) and names the pack after
+/// the student. Returns the entry once the files are in; `lib.active` stays set (the caller
+/// clears it when its own steps are done).
+async fn fetch_lobby(id: &str) -> Option<library::LibEntry> {
     let s = state::snapshot();
     if s.busy || s.transfer.is_some() || s.lib.loading || s.lib.active.is_some() {
-        return;
+        return None;
     }
-    let Some(entry) = s.lib.entries.iter().find(|e| e.id == id).cloned() else { return };
+    let entry = s.lib.entries.iter().find(|e| e.id == id).cloned()?;
     state::with_state(|s| {
         s.busy = true;
         s.lib.active = Some(entry.id.clone());
@@ -525,7 +527,7 @@ async fn download_lobby(id: &str) {
                 s.lib.progress = None;
             });
             state::set_status(format!("{e}。可以在“下载线路”里换一条线路再试。"), true);
-            return;
+            return None;
         }
     };
     let mut assets = Vec::new();
@@ -543,6 +545,13 @@ async fn download_lobby(id: &str) {
         s.busy = false;
         s.lib.progress = None;
     });
+    Some(entry)
+}
+
+/// One click in the online library: downloads the lobby, builds it with the current settings
+/// and, if the watch is connected and the toggle is on, installs it.
+async fn download_lobby(id: &str) {
+    let Some(entry) = fetch_lobby(id).await else { return };
     if state::snapshot().hello.is_none() {
         state::with_state(|s| s.lib.active = None);
         state::set_status(format!("已下载“{}”的素材。连接手表后点“编译并预览”。", entry.name), false);
@@ -561,6 +570,22 @@ async fn download_lobby(id: &str) {
         }
     } else {
         state::set_status(format!("已编译“{}”。确认预览后点“安装到手表”。", entry.name), false);
+    }
+}
+
+/// The other library button: downloads the lobby and opens the framing editor on it, without
+/// building or installing (the user frames it, then builds and installs as for their own files).
+async fn download_for_framing(id: &str) {
+    let Some(entry) = fetch_lobby(id).await else { return };
+    if state::snapshot().hello.is_none() {
+        state::with_state(|s| s.lib.active = None);
+        state::set_status(format!("已下载“{}”的素材。连接手表后在下方“取景”里打开取景器（取景按手表的屏幕比例进行）。", entry.name), false);
+        return;
+    }
+    open_framing().await;
+    state::with_state(|s| s.lib.active = None);
+    if state::snapshot().framing.is_some() {
+        state::set_status(format!("已下载“{}”，取景器在下方。调整好后点“编译并预览”，再点“安装到手表”。", entry.name), false);
     }
 }
 
@@ -986,7 +1011,13 @@ fn library_card(s: &UiState) -> View {
                         )
                         .child(text(&sub, 12, tone::MUTED).class("rt-truncate")),
                 )
-                .child(button(if active { "处理中…" } else { "下载并导入" }, &format!("{EV_LIB_GET}{}", e.id), "soft").disabled_if(blocked))
+                .child(if active {
+                    button("处理中…", &format!("{EV_LIB_GET}{}", e.id), "soft").disabled_if(true)
+                } else {
+                    row()
+                        .child(button("下载并取景", &format!("{EV_LIB_FRAME}{}", e.id), "ghost").disabled_if(blocked))
+                        .child(button("下载并导入", &format!("{EV_LIB_GET}{}", e.id), "soft").disabled_if(blocked))
+                })
         })
         .collect();
     let height = (rows.len().max(1) as u32 * 68).min(420);
@@ -1005,6 +1036,7 @@ fn library_card(s: &UiState) -> View {
         return c.child(text("没有匹配的大厅。", 13, tone::MUTED));
     }
     c.child(View::new(Kind::ScrollArea, None).prop("type", "auto").prop("scrollbars", "vertical").height(height).child(stack(8).children(rows)))
+        .child(text("“下载并导入”按默认取景（头部居中）直接编译；想先调整画面范围，点“下载并取景”，调整好再编译安装。", 12, tone::MUTED))
         .maybe(s.hello.is_none().then(|| text("未连接手表时只下载素材；连接后点“编译并预览”。", 12, tone::MUTED)))
 }
 
@@ -1376,10 +1408,12 @@ mod tests {
         s.lib.entries.push(library::LibEntry { id: "Hoshino_home".into(), name: "星野".into(), character: Some(10005), extras: vec!["Hoshino_home_background".into()], ..Default::default() });
         let (ev, json) = page_events(&s);
         assert_eq!(ev.iter().filter(|e| e.starts_with(EV_LIB_GET)).count(), LIB_ROWS);
+        assert_eq!(ev.iter().filter(|e| e.starts_with(EV_LIB_FRAME)).count(), LIB_ROWS);
         assert!(json.contains("SCROLL_AREA") && json.contains("Lobbyillust_Icon_CH0000_01.png") && json.contains("共 81 个大厅"));
         s.lib.query = "星野".into();
         let (ev, json) = page_events(&s);
         assert_eq!(ev.iter().filter(|e| e.starts_with(EV_LIB_GET)).collect::<Vec<_>>(), [&format!("{EV_LIB_GET}Hoshino_home")]);
+        assert_eq!(ev.iter().filter(|e| e.starts_with(EV_LIB_FRAME)).collect::<Vec<_>>(), [&format!("{EV_LIB_FRAME}Hoshino_home")]);
         assert!(json.contains("含背景层"));
         // The custom prefix field shows only for the custom route.
         assert!(!ev.iter().any(|e| e == EV_LIB_PREFIX));
