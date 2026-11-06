@@ -674,6 +674,12 @@ pub struct Hangs {
 
 
 impl Hangs {
+    /// Frees the records (they grow while a pack is drawn; kept, they would split the pack's
+    /// memory when it goes). The development setting stays.
+    pub fn release(&mut self) {
+        *self = Hangs { fake: self.fake, ..Hangs::default() };
+    }
+
     /// The wait just made (`ms`) was for the last submit, or (`both`) for it and the one being
     /// made: a timeout there makes its draws suspects, or names the culprit when it held a lone
     /// suspect. True when it timed out (or `fake` says so).
@@ -1043,6 +1049,7 @@ impl Renderer {
             *v = Vec::new();
         }
         self.stream = None;
+        self.hangs.release();
     }
 
     /// Sizes the per-batch buffers for the largest batch up front: nothing large is allocated

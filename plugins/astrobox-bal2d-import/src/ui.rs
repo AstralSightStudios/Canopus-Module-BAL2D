@@ -26,7 +26,6 @@ const EV_INSTALL: &str = "action:install";
 const EV_CANCEL: &str = "action:cancel";
 const EV_SELECT: &str = "action:pack.select.";
 const EV_DELETE: &str = "action:pack.delete.";
-const EV_OVERLAY: &str = "action:overlay";
 const EV_FLUENT: &str = "action:fluent";
 const EV_DIRECT: &str = "action:direct";
 const EV_LOG: &str = "action:export-log";
@@ -285,20 +284,16 @@ pub async fn on_event(event: &str, payload: &str) {
                 }
             }
         }
-        EV_OVERLAY => {
-            let current = state::snapshot().hello.map(|h| h.options).unwrap_or(0);
-            watch::set_options(current ^ bal2d_proto::options::OVERLAY).await;
-        }
         EV_FLUENT => {
-            let current = state::snapshot().hello.map(|h| h.options).unwrap_or(0);
+            let current = state::snapshot().hello.map(|h| h.options).unwrap_or(bal2d_proto::options::DEFAULT);
             watch::set_options(current ^ bal2d_proto::options::FLUENT).await;
         }
         EV_DIRECT => {
-            let current = state::snapshot().hello.map(|h| h.options).unwrap_or(0);
+            let current = state::snapshot().hello.map(|h| h.options).unwrap_or(bal2d_proto::options::DEFAULT);
             watch::set_options(current ^ bal2d_proto::options::CLASSIC).await;
         }
         EV_SINGLE => {
-            let current = state::snapshot().hello.map(|h| h.options).unwrap_or(0);
+            let current = state::snapshot().hello.map(|h| h.options).unwrap_or(bal2d_proto::options::DEFAULT);
             watch::set_options(current ^ bal2d_proto::options::SINGLE).await;
         }
         EV_LOG => watch::fetch_log().await,
@@ -1194,11 +1189,10 @@ fn watch_tab(s: &UiState) -> View {
                 String::new()
             }
         ),
-        Some(st) if st.flags & 2 == 0 => "当前没有显示：表盘没有角色图层且未开启全屏显示。".into(),
+        Some(st) if st.flags & 2 == 0 => "当前没有显示：这个表盘没有角色图层（在“表盘图层”页给表盘加入）。".into(),
         Some(_) => "角色暂停中（熄屏或不在表盘上）。".into(),
         None => "读取中…".into(),
     };
-    let overlay = h.options & bal2d_proto::options::OVERLAY != 0;
     let fluent = h.options & bal2d_proto::options::FLUENT != 0;
     let direct = h.options & bal2d_proto::options::CLASSIC == 0;
     let batched = h.options & bal2d_proto::options::SINGLE == 0;
@@ -1213,9 +1207,9 @@ fn watch_tab(s: &UiState) -> View {
                         .child(
                             text(
                                 if fluent {
-                                    "流畅优先：开。每帧只留约十二分之一的时间给手表系统，动画更快；如果蓝牙连接变慢、断开或手表操作卡顿，请关闭。"
+                                    "流畅优先：开。每帧只留约十二分之一的时间给手表系统，动画更快（默认）；如果蓝牙连接变慢、断开或手表操作卡顿，请关闭。"
                                 } else {
-                                    "流畅优先：关。每帧留约六分之一的时间给手表系统和蓝牙（默认）。"
+                                    "流畅优先：关。每帧留约六分之一的时间给手表系统和蓝牙。"
                                 },
                                 13,
                                 tone::TEXT,
@@ -1257,20 +1251,6 @@ fn watch_tab(s: &UiState) -> View {
                         .child(button(if batched { "关闭" } else { "开启" }, EV_SINGLE, "soft")),
                 ),
         )
-        .child(
-        card()
-            .child(heading("显示方式"))
-            .child(text(
-                "加入了角色图层的表盘会在图层位置显示角色，表盘上的时间等组件照常叠在上面。没有角色图层的表盘：",
-                13,
-                tone::MUTED,
-            ))
-            .child(
-                row()
-                    .child(text(if overlay { "全屏显示在表盘最上层（覆盖表盘内容）" } else { "不显示角色" }, 14, tone::TEXT).grow())
-                    .child(button(if overlay { "改为不显示" } else { "改为全屏显示" }, EV_OVERLAY, "soft")),
-            ),
-    )
 }
 
 fn face_tab(s: &UiState) -> View {

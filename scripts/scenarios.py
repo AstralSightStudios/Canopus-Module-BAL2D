@@ -299,7 +299,7 @@ class Run:
         self.check("deleting a character removes it from the watch", gone, out.strip())
 
     def app_page(self):
-        """The watch app (last launcher page): its status, and "next character"."""
+        """The watch app (last launcher page): its status, and the character list."""
         before = self.stats()
         self.dev.launcher_to_end()
         self.dev.tap(55, 288, 4)  # the app's icon on this emulator's launcher
@@ -310,12 +310,19 @@ class Run:
         h = self.stats()
         self.check("nothing is drawn while an app covers the watchface", g and h and h["frames"] - g["frames"] <= 2,
                    f"{g} -> {h}")
-        self.dev.tap(168, 112, 1)  # 下一个角色
-        time.sleep(10)
-        self.dev.wake()
+        # The character list: rows from y 116, 74 apart. A row shows "加载中…" at once; the load
+        # starts 0.4 s later. Tap the first row, or the second when the first is shown already.
+        after = None
+        for row in (0, 1):
+            self.dev.tap(168, 116 + 74 * row + 32, 0.3)
+            self.shot(f"app-page-row{row}-tapped")
+            time.sleep(10)
+            self.dev.wake()
+            after = self.stats()
+            if before and after and after["pack"] != before["pack"]:
+                break
         self.shot("app-page-next")
-        after = self.stats()
-        self.check("the app's 'next character' switches the pack", before and after and after["pack"] != before["pack"],
+        self.check("tapping a character in the app's list switches the pack", before and after and after["pack"] != before["pack"],
                    f"{before} -> {after}")
         # Back to the watchface: the home button only goes back as far as the launcher here; two
         # back swipes (app -> launcher -> watchface) close the app.

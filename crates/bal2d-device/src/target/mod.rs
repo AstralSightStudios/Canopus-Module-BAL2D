@@ -32,10 +32,13 @@ const IDLE_HEADROOM: usize = 768 * 1024;
 pub const PACK_DIR: &str = "packs";
 /// The file name of the pack to show (in `PACK_DIR`).
 pub const CURRENT_FILE: &str = "packs/current.txt";
-/// `bal2d_proto::options` bits, one byte.
+/// `bal2d_proto::options` bits: `[OPTIONS_VERSION, bits]`.
 pub const OPTIONS_FILE: &str = "options.bin";
+/// Options files of earlier builds (one byte, everything off by default) are not read: a watch
+/// starts from `options::DEFAULT` (smoothness first, direct drawing) once.
+const OPTIONS_VERSION: u8 = 2;
 /// Development: show on the top layer when this file exists in the module directory (the same
-/// as `options::OVERLAY`).
+/// as `options::OVERLAY`, which only the link CLI sets).
 const OVERLAY_FLAG: &str = "overlay.flag";
 
 /// Set by the Connect endpoint: the pack to show changed.
@@ -88,9 +91,21 @@ pub fn options_changed() {
     OPTIONS_DIRTY.store(true, Ordering::Release);
 }
 
-/// The persisted options byte.
+/// The persisted options byte (`options::DEFAULT` until something is saved).
 pub fn options() -> u8 {
-    Fs::read(OPTIONS_FILE, 4).and_then(|b| b.first().copied()).unwrap_or(0)
+    match Fs::read(OPTIONS_FILE, 4) {
+        Some(b) if b.len() >= 2 && b[0] == OPTIONS_VERSION => b[1],
+        _ => bal2d_proto::options::DEFAULT,
+    }
+}
+
+/// Saves the options and lets the frame loop pick them up.
+pub fn save_options(o: u8) -> bool {
+    let ok = Fs::write(OPTIONS_FILE, &[OPTIONS_VERSION, o]);
+    if ok {
+        options_changed();
+    }
+    ok
 }
 /// Development: hold the screen on (recordings) when this file exists.
 const KEEPAWAKE_FLAG: &str = "keepawake.flag";
@@ -147,7 +162,17 @@ pub struct Runtime {
     loader: Option<Loader>,
     /// The next load leaves the baked idles until after the pages.
     late_idles: bool,
-    /// Show full screen above watchfaces without a BAL2D layer.
+    /// A character picked on the app page and when its loading starts (`choose_pack`).
+    switch_to: Option<(String, u32)>,
+    /// Loads after running out of memory so far (`MEM_RETRIES`), whether this one leaves the
+    /// optional parts out, and when it may start.
+    mem_retries: u8,
+    light: bool,
+    load_after: u32,
+    /// Loading waits for a view (logged once).
+    view_waited: bool,
+    /// Development (`options::OVERLAY`, `overlay.flag`): show full screen above watchfaces
+    /// without a BAL2D layer.
     overlay: bool,
     /// `options::FLUENT` (read with the overlay option when the options change).
     fluent: bool,
@@ -289,6 +314,11 @@ pub fn rt() -> &'static mut Runtime {
                 load_tried: false,
                 loader: None,
                 late_idles: false,
+                switch_to: None,
+                mem_retries: 0,
+                light: false,
+                load_after: 0,
+                view_waited: false,
                 overlay: false,
                 fluent: false,
                 connect: 1,
@@ -439,16 +469,16 @@ pub fn status() -> [u32; 8] {
 
 /// The shown character's name for the app page.
 pub fn pack_title() -> String {
-    match rt().lobby.as_ref() {
+    let r = rt();
+    match r.lobby.as_ref() {
         Some(l) if !l.name.is_empty() => l.name.clone(),
-        Some(_) => rt().pack.clone(),
+        Some(_) => r.pack.clone(),
+        None if r.boot_error == -2 => "还没有角色".into(),
+        None if r.boot_error != 0 => "没能显示角色".into(),
+        None if waiting_for_view() => "等待角色图层".into(),
         None if pick_pack().is_some() => "正在加载…".into(),
         None => "还没有角色".into(),
     }
-}
-
-pub fn overlay_on() -> bool {
-    options() & bal2d_proto::options::OVERLAY != 0
 }
 
 pub fn fluent_on() -> bool {
@@ -461,40 +491,57 @@ pub fn direct_on() -> bool {
 
 /// Flips direct drawing (app page button).
 pub fn toggle_direct() {
-    let o = options() ^ bal2d_proto::options::CLASSIC;
-    if Fs::write(OPTIONS_FILE, &[o]) {
-        options_changed();
-    }
+    save_options(options() ^ bal2d_proto::options::CLASSIC);
 }
 
 /// Flips "smoothness first" (app page button).
 pub fn toggle_fluent() {
-    let o = options() ^ bal2d_proto::options::FLUENT;
-    if Fs::write(OPTIONS_FILE, &[o]) {
-        options_changed();
-    }
+    save_options(options() ^ bal2d_proto::options::FLUENT);
 }
 
-/// Shows the next installed pack (app page button).
-pub fn next_pack() {
-    let files = connect::pack_files();
-    if files.is_empty() {
+/// After a character is picked on the app page, loading starts this much later: the page shows
+/// the loading state first (the first loading step, parsing, holds the UI task for a while).
+const SWITCH_DELAY_MS: u32 = 400;
+
+/// Shows the pack `file` (app page list): the page shows it loading at once, the load starts
+/// `SWITCH_DELAY_MS` later. Picking the pack already shown (and loaded) does nothing.
+pub fn choose_pack(file: &str) {
+    let r = rt();
+    let shown = r.lobby.is_some() && r.pack == file && r.switch_to.is_none() && !RELOAD.load(Ordering::Acquire);
+    if shown {
         return;
     }
-    let current = pick_pack();
-    let at = current.and_then(|c| files.iter().position(|f| *f == c));
-    let next = &files[at.map_or(0, |i| (i + 1) % files.len())];
-    if Fs::write(CURRENT_FILE, next.as_bytes()) {
-        request_reload();
-    }
+    r.switch_to = Some((file.into(), lv::now_ms().wrapping_add(SWITCH_DELAY_MS)));
+    trace(&alloc::format!("app page: switching to {file}"));
 }
 
-/// Flips "full screen on watchfaces without a BAL2D layer" (app page button).
-pub fn toggle_overlay() {
-    let o = options() ^ bal2d_proto::options::OVERLAY;
-    if Fs::write(OPTIONS_FILE, &[o]) {
-        options_changed();
+/// The pack file being switched to or loaded (the app page marks it loading), if any.
+pub fn switching() -> Option<String> {
+    let r = rt();
+    if let Some((f, _)) = &r.switch_to {
+        return Some(f.clone());
     }
+    let loading = RELOAD.load(Ordering::Acquire) || r.loader.is_some() || (r.lobby.is_none() && r.boot_error == 0 && !waiting_for_view());
+    if loading { pick_pack() } else { None }
+}
+
+/// Loading waits for a watchface with a character layer (see `frame`).
+fn waiting_for_view() -> bool {
+    let r = rt();
+    !r.load_tried && r.loader.is_none() && !view::view().attached()
+}
+
+/// Starts the switch the app page asked for, once its delay is over.
+fn start_switch(now: u32) {
+    let r = rt();
+    let Some((file, at)) = &r.switch_to else { return };
+    if (now.wrapping_sub(*at) as i32) < 0 {
+        return;
+    }
+    if Fs::write(CURRENT_FILE, file.as_bytes()) {
+        request_reload();
+    }
+    r.switch_to = None;
 }
 
 pub fn status_text() -> String {
@@ -573,6 +620,9 @@ pub fn status_text() -> String {
     if r.loader.is_some() {
         text += "正在加载角色…\n";
     }
+    if r.light && r.lobby.is_some() {
+        text += "内存紧张：这次没有加载待机预烘焙和背景烘焙（动画照常，耗电略多）\n";
+    }
     if let Some(t) = r.selftest {
         text += &selftest_text(t.flags);
         let failed = probe_names(selftest::probe::ALL & !t.passed);
@@ -590,7 +640,7 @@ pub fn status_text() -> String {
         0 => {}
         -2 => text += "手表上还没有角色\n",
         -22 | -5 => text += "角色包无法读取，请在手机上重新安装\n",
-        -12 => text += "内存不足：请用“标准”画质重新编译，或关闭其他占内存的应用\n",
+        -12 => text += "内存不足（已自动释放内存并重试）：可以换个角色再换回来，或用“标准”画质重新编译\n",
         e => text += &alloc::format!("加载失败（{e}）\n"),
     }
     if r.perf.errors != 0 {
@@ -600,7 +650,7 @@ pub fn status_text() -> String {
         text += "此固件不支持从手机导入\n";
     }
     if r.boot_error == -2 || v.mode == view::Mode::None {
-        text += "在手机 AstroBox 的「BA 记忆大厅导入器」插件中导入角色，并给表盘加入角色图层（或打开全屏显示）。\n";
+        text += "在手机 AstroBox 的「BA 记忆大厅导入器」插件中导入角色，并给表盘加入角色图层。\n";
     }
     text
 }
@@ -730,17 +780,32 @@ fn load_step() -> Option<i32> {
         let Some(name) = pick_pack() else { return Some(-2) };
         trace(&alloc::format!("loading {name}; heap: free {} KB, largest {} KB", heap_free_kb(), largest_block_kb()));
         let Some(file) = Fs::open(&alloc::format!("{PACK_DIR}/{name}"), canopus_abi::FS_READ) else { return Some(-5) };
-        let early_allowed = !core::mem::take(&mut r.late_idles);
+        let early_allowed = !core::mem::take(&mut r.late_idles) && !r.light;
         r.loader = Some(Loader { name, src: FileSource { file }, t0: lv::now_ms(), lobby: None, pages: Vec::new(), per_layer: Vec::new(), next: 0, early: false, early_allowed });
         return None;
     };
     let Some(lobby) = l.lobby.as_ref() else {
+        // Room for the parse first (it cannot fail softly).
+        let skel_raw: usize = match bal2d_pack::Index::read(&mut l.src) {
+            Ok(idx) => idx.entries.iter().filter(|e| e.kind == bal2d_pack::KIND_SKEL).map(|e| e.raw_len as usize).sum(),
+            Err(e) => {
+                trace(&alloc::format!("load {}: {e:?}", l.name));
+                return Some(-22);
+            }
+        };
+        let (free, largest) = fw::heap_info();
+        let need = parse_need(skel_raw);
+        if dev_out_of_memory() || (free as usize) < need + HEAP_RESERVE as usize || largest < PARSE_BLOCK {
+            trace(&alloc::format!("parse: about {} KB do not fit; heap: free {} KB, largest {} KB", need / 1024, free / 1024, largest / 1024));
+            return Some(-12);
+        }
         match Lobby::load_from(&mut l.src) {
             Ok((mut lobby, pages)) => {
                 // The background image is drawn with a blit: without a working one (self-test)
                 // or before the watch has shown it draws it without timeouts (`trust`), the
-                // baked slots are drawn as they are.
-                if !r.bake_allowed {
+                // baked slots are drawn as they are. A load after running out of memory leaves
+                // it out too (`light`).
+                if !r.bake_allowed || r.light {
                     lobby.bake = None;
                 }
                 trace(&alloc::format!("parsed in {} ms; {} pages; heap: free {} KB, largest {} KB", lv::now_ms().wrapping_sub(l.t0), pages.len(), heap_free_kb(), largest_block_kb()));
@@ -858,9 +923,11 @@ fn load_step() -> Option<i32> {
         return Some(-12);
     }
     // The baked idle last, only into memory to spare (it is an optimization: without it the
-    // layer is animated). Reading a compressed section holds it twice for a moment.
+    // layer is animated). Reading a compressed section holds it twice for a moment. Not in a
+    // load after running out of memory (`light`): maybe once the intro is gone.
+    let light = r.light;
     let Some(l) = r.loader.as_mut() else { return Some(-22) };
-    if let Some(lobby) = l.lobby.as_mut() {
+    if let Some(lobby) = l.lobby.as_mut().filter(|_| !light) {
         for li in 0..lobby.layers.len() {
             let Some(Some(e)) = lobby.idle_entries.get(li).copied() else { continue };
             if lobby.idle.get(li).is_some_and(|i| i.is_some()) || skip_idle() & (1 << li.min(31)) != 0 {
@@ -1011,26 +1078,68 @@ fn ensure_layer_file() {
     Fs::write(NAME, &v);
 }
 
-/// Drops the shown pack (its pages free their GPU memory); the next frame loads the current one.
-fn unload() {
-    let r = rt();
+/// Frees everything of the shown (or half-loaded) pack and everything allocated while it was
+/// shown: the pages, the working buffers, the effects, the talk's bubble, the draw records. What
+/// stays from a pack's time in the middle of the heap splits its memory when it goes (Mirage: the
+/// largest free block after the first switch was 4.2 of 9.8 MB free), and the next pack's pages
+/// need large blocks.
+fn release_pack(r: &mut Runtime) {
     // The GPU is done with the pages and buffers before they go.
     r.renderer.finish();
     r.lobby = None;
     r.pages = Vec::new();
     r.bake = None;
-    // The working buffers sized for this pack go too: allocated after its pages, they would
-    // stay above the freed memory and split it (the next pack's pages need large blocks).
+    r.loader = None;
     r.list = bal2d_render::DrawList::default();
     r.renderer.release();
+    r.layer_buffer = None;
+    r.direct_passed = Vec::new();
     r.pack = String::new();
-    r.load_tried = false;
-    r.loader = None;
-    r.boot_error = 0;
     r.fx = fx::Fx::new();
     bubble::bubble().clear();
+}
+
+/// Drops the shown pack (its pages free their GPU memory); the next frame loads the current one.
+fn unload() {
+    let r = rt();
+    release_pack(r);
+    r.load_tried = false;
+    r.boot_error = 0;
+    r.mem_retries = 0;
+    r.light = false;
+    r.load_after = 0;
     view::view().set_hidden(true);
-    trace(&alloc::format!("unloaded; heap: free {} KB", heap_free_kb()));
+    trace(&alloc::format!("unloaded; heap: free {} KB, largest {} KB", heap_free_kb(), largest_block_kb()));
+}
+
+/// Loads after running out of memory: everything is freed and the load tried again this many
+/// times, the last without the optional parts (baked idles, background image).
+const MEM_RETRIES: u8 = 2;
+/// The pause before such a retry (the system gets to free what it held for a moment too).
+const MEM_RETRY_WAIT_MS: u32 = 600;
+
+/// The heap a pack's skeletons take while they are parsed, from their sections' size (measured:
+/// CH0334 2148 KB -> 2624 KB, Hoshino 859 -> 1919, Neru 865 -> 1773, Hina 166 -> 588), and the
+/// largest single block the parse asks for (up to 336 KB). The parse cannot fail softly (the
+/// firmware resets the watch when a large allocation fails), so it starts only with this room.
+fn parse_need(skel_raw: usize) -> usize {
+    skel_raw + skel_raw / 4 + 900 * 1024
+}
+const PARSE_BLOCK: u32 = 512 * 1024;
+
+/// Development (`dev-oom`, a count): that many loads run out of memory before the parse (to try
+/// the retries on Mirage, whose heap is roomier than the watch's).
+fn dev_out_of_memory() -> bool {
+    const FILE: &str = "dev-oom";
+    let Some(b) = Fs::read(FILE, 8) else { return false };
+    let n: u32 = core::str::from_utf8(&b).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
+    if n == 0 {
+        Fs::remove(FILE);
+        return false;
+    }
+    let left = alloc::format!("{}", n - 1);
+    Fs::write(FILE, left.as_bytes());
+    true
 }
 
 /// Starts the runtime: loads the pack, allocates the target, starts the frame timer.
@@ -1047,6 +1156,8 @@ pub fn start() -> i32 {
     if r.target.is_none() {
         r.target = gpu::Target::new(r.screen.0.max(1) as u32, r.screen.1.max(1) as u32);
     }
+    // The view's and the bubble's own state too (made on first use, it would land in a pack's).
+    let _ = (view::view(), bubble::bubble());
     // The pack is loaded on the first frame, outside the Supervisor's stage callback.
     r.timer = unsafe { lvx_timer_create(frame, FRAME_MS, core::ptr::null_mut()) };
     if r.timer.is_null() {
@@ -1235,6 +1346,7 @@ extern "C" fn frame(timer: *mut c_void) {
         r.status_at = now;
         app::refresh();
     }
+    start_switch(now);
     // Duty-cycle limit. The first call after a frame comes right after LVGL has redrawn the
     // screen with it (the timer then runs every millisecond): that measures what a frame costs
     // beyond its own work (mostly waiting for the panel's TE pulse and transfer; in direct mode
@@ -1343,14 +1455,54 @@ extern "C" fn frame(timer: *mut c_void) {
         return;
     }
     if !r.load_tried {
+        if (now.wrapping_sub(r.load_after) as i32) < 0 {
+            return;
+        }
+        // The view first, and no pack before there is one to show it in (nothing could be seen;
+        // the system keeps the memory). What attaching allocates (LVGL's event lists, the touch
+        // proxy) then sits below the pack's memory: attached while a pack was shown (Mirage: the
+        // watchface came up after the first load), it split the pack's memory once it went
+        // (largest free block 5.3 of 9.8 MB).
+        if r.loader.is_none() {
+            ensure_attached(now);
+            let r = rt();
+            if !view::view().attached() {
+                if !r.view_waited {
+                    r.view_waited = true;
+                    trace("no character layer yet: loading waits for one");
+                }
+                return;
+            }
+        }
         let Some(rc) = load_step() else { return };
         let r = rt();
         r.load_tried = true;
+        if rc == -12 && r.mem_retries < MEM_RETRIES {
+            // Out of memory: everything goes, a moment's pause, the load again (the baked idles
+            // after the pages; the last time without the optional parts).
+            r.mem_retries += 1;
+            release_pack(r);
+            r.late_idles = true;
+            r.light = r.mem_retries >= MEM_RETRIES;
+            r.load_tried = false;
+            r.load_after = now.wrapping_add(MEM_RETRY_WAIT_MS);
+            trace(&alloc::format!(
+                "out of memory: freed everything, retry {} of {}{}; heap: free {} KB, largest {} KB",
+                r.mem_retries,
+                MEM_RETRIES,
+                if r.light { " without baked idles and background" } else { "" },
+                heap_free_kb(),
+                largest_block_kb()
+            ));
+            return;
+        }
         if rc != 0 {
             r.loader = None;
             r.boot_error = rc;
         }
         trace(&alloc::format!("load result: {rc}"));
+        // The app page shows the result at once.
+        r.status_at = now.wrapping_sub(1000);
         return;
     }
     if !screen_on() {

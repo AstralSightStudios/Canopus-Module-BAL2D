@@ -204,7 +204,34 @@ impl View {
         !self.obj.is_null()
     }
 
-    /// Places the touch proxy over `rect` (screen coordinates), creating it on first use.
+    /// Makes the touch proxy (no size until placed). Done when the marker is attached, before a
+    /// pack loads: made later, it would stay in the middle of the pack's memory when it goes.
+    fn make_touch(&mut self) {
+        if !self.touch.is_null() || self.mode != Mode::Marker || self.obj.is_null() {
+            return;
+        }
+        let parent = unsafe { core::ptr::read_volatile((self.obj as *const *mut c_void).add(1)) };
+        if parent.is_null() {
+            return;
+        }
+        let t = unsafe { lvx_image_create(parent) };
+        if t.is_null() {
+            return;
+        }
+        unsafe {
+            lv::clear_flag(t, flag::SCROLLABLE | flag::SCROLL_CHAIN | flag::GESTURE_BUBBLE | flag::EVENT_BUBBLE | flag::CLICK_FOCUSABLE);
+            lv::add_flag(t, flag::CLICKABLE | flag::PRESS_LOCK);
+            for code in [event::PRESSED, event::PRESSING, event::RELEASED, event::PRESS_LOST] {
+                lv::on_event(t, proxy_event, code, code as usize);
+            }
+            lv::on_event(t, proxy_deleted, EVENT_DELETE, 0);
+            lvx_object_set_size(t, 0, 0);
+        }
+        self.touch = t;
+        self.touch_rect = (0, 0, 0, 0);
+    }
+
+    /// Places the touch proxy over `rect` (screen coordinates), making it if it is not there.
     pub fn place_touch(&mut self, rect: (i32, i32, i32, i32)) {
         // Below the system edge (a head at the very top keeps only its lower part).
         let top = rect.1.max(SYSTEM_EDGE_PX);
@@ -212,28 +239,9 @@ impl View {
         if self.mode == Mode::None || self.obj.is_null() || rect.2 <= 0 || rect.3 <= 0 {
             return;
         }
+        self.make_touch();
         if self.touch.is_null() {
-            let parent = unsafe { core::ptr::read_volatile((self.obj as *const *mut c_void).add(1)) };
-            if parent.is_null() {
-                return;
-            }
-            let t = unsafe { lvx_image_create(parent) };
-            if t.is_null() {
-                return;
-            }
-            unsafe {
-                lv::clear_flag(
-                    t,
-                    flag::SCROLLABLE | flag::SCROLL_CHAIN | flag::GESTURE_BUBBLE | flag::EVENT_BUBBLE | flag::CLICK_FOCUSABLE,
-                );
-                lv::add_flag(t, flag::CLICKABLE | flag::PRESS_LOCK);
-                for code in [event::PRESSED, event::PRESSING, event::RELEASED, event::PRESS_LOST] {
-                    lv::on_event(t, proxy_event, code, code as usize);
-                }
-                lv::on_event(t, proxy_deleted, EVENT_DELETE, 0);
-            }
-            self.touch = t;
-            self.touch_rect = (0, 0, 0, 0);
+            return;
         }
         if rect == self.touch_rect {
             return;
@@ -545,6 +553,7 @@ impl View {
         self.hook_events(found);
         self.obj = found;
         self.mode = Mode::Marker;
+        self.make_touch();
         self.screen = screen;
         self.pages_len = 0;
         self.paged_over();

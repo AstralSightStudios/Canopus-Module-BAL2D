@@ -327,10 +327,14 @@ impl Bubble {
     }
 
     /// Gone at once (the pack is unloaded, the watchface left).
+    /// Ends any talk and frees what talks allocated (their lines, the tail images): called when
+    /// the pack goes, so nothing of it stays in the middle of the freed memory.
     pub fn clear(&mut self) {
-        self.lines.clear();
         self.phase = Phase::Hidden;
         self.remove();
+        self.lines = Vec::new();
+        self.talk_tail = None;
+        self.think_tail = None;
     }
 
     pub fn active(&self) -> bool {

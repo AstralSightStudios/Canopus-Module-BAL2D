@@ -56,17 +56,19 @@ pub mod caps {
 
 /// `OPTIONS` bits (persisted by the module).
 pub mod options {
-    /// Watchfaces without a BAL2D layer show the lobby full screen above the watchface.
+    /// Development only (the link CLI and the Mirage scripts; no setting in the plugin or on the
+    /// watch): watchfaces without a BAL2D layer show the lobby full screen above the watchface.
     pub const OVERLAY: u8 = 1;
-    /// Smoothness first: the watch keeps about a tenth of each frame idle instead of a third (or
-    /// half for very heavy frames). Faster animation; whether the phone link and the watch's own
-    /// UI stay responsive with that little is what it is for finding out on a real watch.
+    /// Smoothness first (on by default): the watch keeps about a twelfth of each frame idle
+    /// instead of a sixth. Faster animation.
     pub const FLUENT: u8 = 2;
     /// Draw every frame into the module's own buffer, which LVGL then copies to the screen (the
-    /// way before direct drawing): for comparing the two on a real watch.
+    /// way before direct drawing; off by default): for comparing the two.
     pub const CLASSIC: u8 = 4;
     /// Every draw through the driver one by one (no batched command streams): for comparing.
     pub const SINGLE: u8 = 8;
+    /// What a watch starts with: smoothness first, direct drawing, batched draws.
+    pub const DEFAULT: u8 = FLUENT;
 }
 
 /// The firmware a module build runs on (`HELLO`): the phone compiles packs for it.

@@ -2,7 +2,7 @@
   "name": "BA 记忆大厅导入器",
   "icon": "icon.png",
   "version": "0.1.0",
-  "description": "把蔚蓝档案记忆大厅（Spine）编译成手表可播放的角色包（含对话台词气泡），通过 CanopusConnect 传到手表上的 BAL2D 模块，并可给表盘加入角色图层。素材可以是你自己从游戏中提取的文件，也可以在在线角色库里一键下载：素材来自第三方社区仓库 asdfdsa12/BA-Spine-Viewer-Asset，中文名来自 SchaleDB，对话台词来自 electricgoat/ba-data，简体转换字表来自 OpenCC。插件本身不包含、也不托管任何游戏素材；素材仅限个人使用。",
+  "description": "把蔚蓝档案记忆大厅（Spine）编译成手表可播放的角色包（含对话台词气泡），通过 CanopusConnect 传到手表上的 BAL2D 模块，并可给表盘加入角色图层。素材可以是你自己从游戏中提取的文件，也可以在在线角色库里一键下载：素材来自第三方社区仓库 asdfdsa12/BA-Spine-Viewer-Asset，中文名来自 SchaleDB，对话台词来自 electricgoat/ba-data，简体转换字表来自 OpenCC。插件本身不包含、也不托管任何游戏素材（图标借用了游戏标题 logo 里的光环）；素材仅限个人使用。",
   "author": "Searchstars",
   "website": "",
   "entry": "astrobox_plugin_bal2d_import.wasm",

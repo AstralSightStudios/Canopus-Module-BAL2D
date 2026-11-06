@@ -15,7 +15,7 @@ use canopus_abi::{CONNECT_BINARY, CanopusContext, ContextV1, FS_CREATE, FS_READ,
 use canopus_runtime::connect::{self, Delivery};
 
 use super::host::{File, Fs};
-use super::{CURRENT_FILE, OPTIONS_FILE, PACK_DIR};
+use super::{CURRENT_FILE, PACK_DIR};
 use crate::module::context;
 
 const ERR_BUSY: i32 = -16;
@@ -66,6 +66,15 @@ pub fn pack_files() -> Vec<String> {
         }
     }
     v
+}
+
+/// The character name the phone gave a pack file (its `.name` file), else the file's stem.
+pub fn pack_name(file: &str) -> String {
+    let stem = file.trim_end_matches(".bal2d");
+    Fs::read(&format!("{PACK_DIR}/{stem}.name"), 256)
+        .map(|b| String::from_utf8_lossy(&b).trim().into())
+        .filter(|n: &String| !n.is_empty())
+        .unwrap_or_else(|| stem.into())
 }
 
 fn file_of(id: u32) -> Option<String> {
@@ -125,6 +134,9 @@ impl Store for DeviceStore {
 
     fn stage_finish(&mut self) -> Result<(), Status> {
         self.write_pending(true)?;
+        // The write buffer goes (a transfer happens while a pack is shown: kept, it would stay
+        // in the middle of the pack's memory once the pack goes).
+        self.pending = Vec::new();
         if let Some(mut file) = self.stage.take() {
             file.sync();
         }
@@ -150,7 +162,7 @@ impl Store for DeviceStore {
 
     fn stage_abort(&mut self) {
         self.stage = None;
-        self.pending.clear();
+        self.pending = Vec::new();
         Fs::remove(STAGE);
     }
 
@@ -175,10 +187,7 @@ impl Store for DeviceStore {
         pack_files()
             .into_iter()
             .map(|file| {
-                let stem = file.trim_end_matches(".bal2d");
-                let name = Fs::read(&format!("{PACK_DIR}/{stem}.name"), 256)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_else(|| stem.into());
+                let name = pack_name(&file);
                 let size = Fs::stat(&format!("{PACK_DIR}/{file}")).map(|s| s.size as u32).unwrap_or(0);
                 PackInfo { id: file_id(&file), size, name }
             })
@@ -198,7 +207,7 @@ impl Store for DeviceStore {
     }
 
     fn set_options(&mut self, options: u8) -> Result<(), Status> {
-        if Fs::write(OPTIONS_FILE, &[options]) { Ok(()) } else { Err(Status::Io) }
+        if super::save_options(options) { Ok(()) } else { Err(Status::Io) }
     }
 
     fn stats(&mut self) -> Option<bal2d_proto::Stats> {
@@ -279,10 +288,15 @@ pub fn start(screen: (i32, i32)) -> i32 {
             ctx,
             receiver: Receiver::new(platform),
             store: DeviceStore { stage: None, pending: Vec::new(), screen: (platform.width, platform.height) },
-            outbox: VecDeque::new(),
+            // At their final size now, before any pack: made on the first message (while a pack
+            // is shown), the queue and the timer would split the pack's memory once it goes.
+            outbox: VecDeque::with_capacity(OUTBOX_MAX),
             timer: -1,
             last_activity_ms: 0,
         });
+    }
+    if let Some(ep) = endpoint() {
+        ep.ensure_timer();
     }
     match connect::listen(ctx, on_message, core::ptr::null_mut()) {
         Ok(()) => 0,
