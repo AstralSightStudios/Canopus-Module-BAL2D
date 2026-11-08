@@ -6,9 +6,10 @@ icon.png.
 
 The halo (ring Fill-19, blades Fill-21 and Fill-23) is copied path for path from the Japanese
 title logo, https://commons.wikimedia.org/wiki/File:Blue_Archive_JP_logo.svg (Commons: public
-domain, trademarked; taken from Yostar's site). Framing follows LyraPlayer's icons: the launcher
-circle leaves a 3 px transparent margin (alpha 143 at x=3 on the centre row), the plugin icon is a
-full-bleed circle with a sync badge in a frosted cap at the bottom.
+domain, trademarked; taken from Yostar's site). Flat colours, no gradients or glow: a white ring and
+blue blades on navy. Framing follows LyraPlayer's icons: the launcher circle leaves a 3 px
+transparent margin (alpha 143 at x=3 on the centre row), the plugin icon is a full-bleed circle with
+a sync badge in a cap across the bottom.
 
     scripts/make-appicon.py
 """
@@ -18,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Logo units (the SVG's viewBox). The blade Fill-21 sits in a translate(181.3363, 0) group.
-RING = (0.0, "M327.076,114.61c-3.241-3.397-6.308-6.945-9.174-10.647c-6.095-7.965-11.258-16.735-14.084-26.089"
+RING_PATH = (0.0, "M327.076,114.61c-3.241-3.397-6.308-6.945-9.174-10.647c-6.095-7.965-11.258-16.735-14.084-26.089"
         "c-1.435-4.648-2.219-9.459-1.96-14.128c0-1.175,0.223-2.314,0.346-3.465c0.265-1.117,0.418-2.268,0.816-3.341"
         "c0.624-2.2,1.658-4.245,2.874-6.151c1.162-1.951,2.751-3.61,4.403-5.179c1.706-1.529,3.634-2.83,5.666-3.978"
         "c4.117-2.233,8.738-3.677,13.485-4.576c9.536-1.796,19.573-1.496,29.399-0.09c19.724,2.895,38.871,10.049,56.478,19.743"
@@ -40,7 +41,6 @@ BLADES = [
      "c8.704,5.391,17.463,10.689,26.104,16.181C460.785,141.235,478.017,152.309,494.929,163.919"),
 ]
 CENTRE, REACH = (367.8, 125.8), 149.7  # smallest circle around the whole halo
-CROSS = (389.4, 101.0)                 # where the blades cross
 BOLD = 2.3                             # dilation: the logo's 3.3-unit ring would be a 1.3 px hairline
 
 
@@ -48,11 +48,10 @@ def rgb(h):
     return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
 
 
-INK, BLUE = rgb("2b2b2b"), rgb("128afa")  # the logo's two colours
-WHITE = (1.0, 1.0, 1.0)
-SKY = [(0.0, rgb("74cdff")), (0.55, rgb("3fb1f8")), (1.0, rgb("1a87e8"))]  # top to bottom
-RIM, NAVY = rgb("1f86e0"), rgb("1d4f8c")
-CAP = [(0.0, WHITE), (0.5, rgb("e4f5ff")), (1.0, rgb("7fcdfb"))]  # frosted cap, top to bottom
+NAVY = rgb("253a5c")   # the circle
+RING = rgb("f2f4f7")   # the logo's ink ring, light on the dark circle
+BLADE = rgb("3aa0ff")  # the logo's blue (#128afa), lifted to read on navy
+CAP = rgb("31496f")    # the plugin badge's cap
 
 # Size, circle radius (LyraPlayer's plugin icon has alpha 197 at x=0), halo diameter / circle
 # diameter, halo lift (circle radii), sync badge.
@@ -62,14 +61,6 @@ PLUGIN = (256, 256 / 2 - 0.23, 0.84, 0.17, True)
 
 def mix(a, b, t):
     return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
-
-
-def ramp(stops, t):
-    t = max(0.0, min(1.0, t))
-    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
-        if t <= t1:
-            return mix(c0, c1, (t - t0) / (t1 - t0))
-    return stops[-1][1]
 
 
 def flatten(d, dx, steps=24):
@@ -147,21 +138,6 @@ def shape(path, n, place, bold):
     return acc
 
 
-def blur(a, n, r):
-    for _ in range(3):
-        for horizontal in (True, False):
-            out = [0.0] * (n * n)
-            for line in range(n):
-                idx = [line * n + k for k in range(n)] if horizontal else [k * n + line for k in range(n)]
-                pre = [0.0]
-                for i in idx:
-                    pre.append(pre[-1] + a[i])
-                for k, i in enumerate(idx):
-                    out[i] = (pre[min(n, k + r + 1)] - pre[max(0, k - r)]) / (2 * r + 1)
-            a = out
-    return a
-
-
 def sync_arrows(R):
     """Two arcs with chevron heads around (0, 0), in px: the badge's strokes."""
     ra, head, lines = 0.155 * R, 0.075 * R, []
@@ -188,44 +164,26 @@ def render(n, R, fill, lift, badge):
     s = fill * R / REACH  # px per logo unit
     hx, hy = c, c - lift * R
     place = lambda x, y: (hx + (x - CENTRE[0]) * s, hy + (y - CENTRE[1]) * s)
-    ring = shape(RING, n, place, BOLD * s)
+    ring = shape(RING_PATH, n, place, BOLD * s)
     blades = union(shape(BLADES[0], n, place, BOLD * s), shape(BLADES[1], n, place, BOLD * s))
-    glow = blur(union(ring, blades), n, max(1, round(0.043 * R)))
-    qx, qy = place(*CROSS)
     strokes, bw, by = (sync_arrows(R), 0.052 * R, 0.69 * R) if badge else ([], 0, 0)
     px = []
     for j in range(n):
         for i in range(n):
             x, y = i + 0.5 - c, j + 0.5 - c
-            d = math.hypot(x, y)
-            alpha = max(0.0, min(1.0, R + 0.5 - d))
+            alpha = max(0.0, min(1.0, R + 0.5 - math.hypot(x, y)))
             if alpha == 0:
                 px.append((0, 0, 0, 0))
                 continue
-            u, v, k = x / R, y / R, j * n + i
-            # Sky lit from the middle, with faint light ripples from the blades' crossing.
-            col = ramp(SKY, (v + 1) / 2)
-            col = mix(col, WHITE, 0.95 * math.exp(-(u * u + (v + 0.02) ** 2) / 0.55))
-            rr = math.hypot(i + 0.5 - qx, j + 0.5 - qy) / (0.236 * R)
-            col = mix(col, WHITE, 0.26 * max(0.0, 1 - abs(rr % 1 - 0.5) * 6) * min(1.0, rr / 1.5))
-            # The halo, on a soft white glow.
-            col = mix(col, WHITE, 0.85 * min(1.0, glow[k] * 2))
-            col = mix(col, INK, ring[k])
-            col = mix(col, BLUE, blades[k])
+            k = j * n + i
+            col = mix(mix(NAVY, RING, ring[k]), BLADE, blades[k])
             if badge:
-                # Frosted cap (a big circle's top), bright at its edge, holding the sync arrows.
+                # A cap (a big circle's top) holding the sync arrows.
                 edge = 1.67 * R - math.hypot(x, y - 2.06 * R)
-                if edge > -1:
-                    a = max(0.0, min(1.0, edge + 0.5))
-                    col = mix(col, ramp(CAP, (v - 0.39) / 0.61), 0.88 * a)
-                    col = mix(col, WHITE, 0.9 * math.exp(-(edge / (0.012 * R)) ** 2))
+                col = mix(col, CAP, max(0.0, min(1.0, edge + 0.5)))
                 if abs(x) < 0.3 * R and abs(y - by) < 0.3 * R:
                     dd = min(seg_dist(x, y - by, p, q) for p, q in strokes)
-                    col = mix(col, NAVY, max(0.0, min(1.0, bw / 2 + 0.5 - dd)))
-            # Glass: darker rim, soft highlight across the top.
-            col = mix(col, RIM, 0.85 * max(0.0, (d / R - 0.86) / 0.14) ** 2)
-            hl = (v + 0.62) / 0.42
-            col = mix(col, WHITE, 0.25 * max(0.0, 1 - (u * u * 1.6 + hl * hl)))
+                    col = mix(col, RING, max(0.0, min(1.0, bw / 2 + 0.5 - dd)))
             px.append((round(col[0] * 255), round(col[1] * 255), round(col[2] * 255), round(alpha * 255)))
     return px
 
